@@ -1,0 +1,8 @@
+**/bin/
+**/obj/
+.idea/
+TestResults/
+artifacts/
+reports/
+*.user
+*.suo

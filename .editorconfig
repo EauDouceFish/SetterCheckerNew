@@ -1,0 +1,53 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{cs,csproj,props,json,slnx}]
+indent_style = space
+indent_size = 4
+
+[*.cs]
+csharp_new_line_before_open_brace = all
+csharp_prefer_braces = true:warning
+csharp_style_namespace_declarations = block_scoped:warning
+csharp_style_var_for_built_in_types = false:suggestion
+csharp_style_var_when_type_is_apparent = false:suggestion
+csharp_style_var_elsewhere = false:suggestion
+dotnet_style_qualification_for_field = true:suggestion
+dotnet_style_qualification_for_property = true:suggestion
+dotnet_style_qualification_for_method = true:suggestion
+dotnet_style_qualification_for_event = true:suggestion
+
+dotnet_naming_rule.instance_fields_use_m_prefix.severity = warning
+dotnet_naming_rule.instance_fields_use_m_prefix.symbols = instance_fields
+dotnet_naming_rule.instance_fields_use_m_prefix.style = m_prefix
+dotnet_naming_symbols.instance_fields.applicable_kinds = field
+dotnet_naming_symbols.instance_fields.applicable_accessibilities = *
+dotnet_naming_symbols.instance_fields.required_modifiers =
+dotnet_naming_style.m_prefix.required_prefix = m_
+dotnet_naming_style.m_prefix.capitalization = camel_case
+
+dotnet_naming_rule.constants_use_pascal_case.severity = warning
+dotnet_naming_rule.constants_use_pascal_case.symbols = constants
+dotnet_naming_rule.constants_use_pascal_case.style = pascal_case
+dotnet_naming_symbols.constants.applicable_kinds = field
+dotnet_naming_symbols.constants.applicable_accessibilities = *
+dotnet_naming_symbols.constants.required_modifiers = const
+dotnet_naming_style.pascal_case.capitalization = pascal_case
+
+dotnet_naming_rule.static_fields_use_s_prefix.severity = warning
+dotnet_naming_rule.static_fields_use_s_prefix.symbols = static_fields
+dotnet_naming_rule.static_fields_use_s_prefix.style = s_prefix
+dotnet_naming_symbols.static_fields.applicable_kinds = field
+dotnet_naming_symbols.static_fields.applicable_accessibilities = *
+dotnet_naming_symbols.static_fields.required_modifiers = static
+dotnet_naming_style.s_prefix.required_prefix = s_
+dotnet_naming_style.s_prefix.capitalization = camel_case
+
+[*.md]
+indent_style = space
+indent_size = 2

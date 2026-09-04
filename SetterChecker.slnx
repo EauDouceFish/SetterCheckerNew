@@ -1,0 +1,9 @@
+<Solution>
+    <Folder Name="/Src/">
+        <Project Path="Src/SetterChecker.Cli/SetterChecker.Cli.csproj" />
+        <Project Path="Src/SetterChecker.Core/SetterChecker.Core.csproj" />
+    </Folder>
+    <Folder Name="/Tests/">
+        <Project Path="Tests/SetterChecker.Core.Tests/SetterChecker.Core.Tests.csproj" />
+    </Folder>
+</Solution>

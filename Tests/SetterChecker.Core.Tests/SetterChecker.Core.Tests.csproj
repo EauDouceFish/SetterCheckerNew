@@ -1,0 +1,5 @@
+<Project Sdk="MSTest.Sdk/4.4.0">
+    <ItemGroup>
+        <ProjectReference Include="../../Src/SetterChecker.Core/SetterChecker.Core.csproj" />
+    </ItemGroup>
+</Project>
