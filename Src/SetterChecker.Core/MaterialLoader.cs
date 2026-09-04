@@ -33,6 +33,7 @@ namespace SetterChecker.Core
             ValidateRequest(request);
             string assemblyDefinitionPath = Path.GetFullPath(request.AssemblyDefinitionPath);
             string projectRoot = FindProjectRoot(assemblyDefinitionPath);
+            string reportRoot = FindReportRoot(assemblyDefinitionPath, projectRoot);
             string assemblyName = ReadAssemblyName(assemblyDefinitionPath);
             string responsePath = FindRootResponse(projectRoot, assemblyName);
             IReadOnlyList<CompilerResponse> responses = ReadResponseClosure(
@@ -43,13 +44,19 @@ namespace SetterChecker.Core
                 responses,
                 request.Jobs,
                 cancellationToken).ConfigureAwait(false);
+            IReadOnlyDictionary<string, ISourceGenerator[]> generatorsByAnalyzerSet =
+                LoadGeneratorSets(responses);
+            IReadOnlyDictionary<CompilerReference, PortableExecutableReference> metadataReferences =
+                CreateMetadataReferences(responses, request.Jobs, cancellationToken);
             bool enableCompilerParallel = responses.Count == 1 && request.Jobs > 1;
             SourceAssemblyMaterial[] sourceAssemblies = responses
                 .Select(response => BuildSourceAssembly(
                     response,
-                    assemblyName,
+                    reportRoot,
                     enableCompilerParallel,
                     trees,
+                    metadataReferences,
+                    generatorsByAnalyzerSet[AnalyzerSetKey(response.AnalyzerPaths)],
                     cancellationToken))
                 .OrderBy(assembly => assembly.Name, StringComparer.Ordinal)
                 .ToArray();
@@ -65,13 +72,15 @@ namespace SetterChecker.Core
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Order(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
-            ExternalAssemblyMaterial[] externalAssemblies = ResolveExternalAssemblies(
+            ExternalAssemblyMaterial[] externalAssemblies = await ResolveExternalAssembliesAsync(
                 projectRoot,
                 externalAssemblyPaths,
                 responses.Single(response => string.Equals(
                     response.AssemblyName,
                     assemblyName,
-                    StringComparison.Ordinal)));
+                    StringComparison.Ordinal)),
+                request.Jobs,
+                cancellationToken).ConfigureAwait(false);
             string[] analyzerPaths = responses
                 .SelectMany(response => response.AnalyzerPaths)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -82,10 +91,29 @@ namespace SetterChecker.Core
 
             return new MaterialSet(
                 projectRoot,
+                reportRoot,
                 sourceAssemblies,
                 externalAssemblies,
                 analyzerPaths,
                 stopwatch.Elapsed);
+        }
+
+        // 从输入程序集定义向上找到包含 package.json 的目标包目录。
+        private static string FindReportRoot(string assemblyDefinitionPath, string projectRoot)
+        {
+            DirectoryInfo? directory = new FileInfo(assemblyDefinitionPath).Directory;
+
+            while (directory != null && IsUnderDirectory(directory.FullName, projectRoot))
+            {
+                if (File.Exists(Path.Combine(directory.FullName, "package.json")))
+                {
+                    return directory.FullName;
+                }
+
+                directory = directory.Parent;
+            }
+
+            throw new AnalysisException($"程序集定义不属于一个有 package.json 的 Unity 包：{assemblyDefinitionPath}");
         }
 
         // 核对源码依赖参考文件与重新建立的源码程序集身份完全一致。
@@ -124,19 +152,35 @@ namespace SetterChecker.Core
         }
 
         // 把只有声明的外部参考文件连接到 Unity 当前真实输出文件。
-        private static ExternalAssemblyMaterial[] ResolveExternalAssemblies(
+        private static async Task<ExternalAssemblyMaterial[]> ResolveExternalAssembliesAsync(
             string projectRoot,
             IReadOnlyList<string> referencePaths,
-            CompilerResponse rootResponse)
+            CompilerResponse rootResponse,
+            int jobs,
+            CancellationToken cancellationToken)
         {
             UnityRuntimeSelection? unityRuntime = FindUnityRuntime(
                 referencePaths,
                 rootResponse.ParseOptions);
-            ExternalAssemblyMaterial[] assemblies = referencePaths
-                .Select(path => new ExternalAssemblyMaterial(
-                    path,
-                    FindImplementationPaths(projectRoot, path, unityRuntime)))
-                .ToArray();
+            ExternalAssemblyMaterial[] assemblies = new ExternalAssemblyMaterial[referencePaths.Count];
+            ParallelOptions options = new()
+            {
+                CancellationToken = cancellationToken,
+                MaxDegreeOfParallelism = jobs,
+            };
+
+            await Parallel.ForEachAsync(
+                Enumerable.Range(0, referencePaths.Count),
+                options,
+                (index, _) =>
+                {
+                    string path = referencePaths[index];
+                    assemblies[index] = new ExternalAssemblyMaterial(
+                        path,
+                        FindImplementationPaths(projectRoot, path, unityRuntime));
+
+                    return ValueTask.CompletedTask;
+                }).ConfigureAwait(false);
             string[] knownPaths = assemblies
                 .SelectMany(assembly => assembly.ImplementationPaths)
                 .Concat(unityRuntime?.AssemblyPaths ?? Array.Empty<string>())
@@ -144,14 +188,36 @@ namespace SetterChecker.Core
                 .ToArray();
             IReadOnlyDictionary<string, IReadOnlyList<string>> pathsByAssemblyName =
                 IndexAssemblyPaths(knownPaths);
+            ExternalAssemblyMaterial[] resolved = new ExternalAssemblyMaterial[assemblies.Length];
 
-            return assemblies
-                .Select(assembly => assembly with
+            await Parallel.ForEachAsync(
+                Enumerable.Range(0, assemblies.Length),
+                options,
+                (index, _) =>
                 {
-                    ImplementationPaths = FollowForwardedAssemblies(
-                        assembly.ImplementationPaths,
-                        pathsByAssemblyName),
-                })
+                    ExternalAssemblyMaterial assembly = assemblies[index];
+                    resolved[index] = assembly with
+                    {
+                        ImplementationPaths = FollowForwardedAssemblies(
+                            assembly.ImplementationPaths,
+                            pathsByAssemblyName),
+                    };
+
+                    return ValueTask.CompletedTask;
+                }).ConfigureAwait(false);
+
+            HashSet<string> implementationPaths = resolved
+                .SelectMany(assembly => assembly.ImplementationPaths)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            ExternalAssemblyMaterial[] runtimeDependencies = (unityRuntime?.AssemblyPaths
+                    ?? Array.Empty<string>())
+                .Where(path => !implementationPaths.Contains(path))
+                .Select(path => new ExternalAssemblyMaterial(path, new[] { path }))
+                .ToArray();
+
+            return resolved
+                .Concat(runtimeDependencies)
+                .OrderBy(assembly => assembly.ReferencePath, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         }
 
@@ -463,11 +529,17 @@ namespace SetterChecker.Core
                 throw new AnalysisException($"Unity 当前运行目录不存在：{runtimeDirectory}");
             }
 
+            string managedDirectory = Path.Combine(dataDirectory, "Managed");
             string[] assemblyPaths = Directory.EnumerateFiles(
                     runtimeDirectory,
                     "*.dll",
                     SearchOption.AllDirectories)
+                .Concat(Directory.EnumerateFiles(
+                    managedDirectory,
+                    "*.dll",
+                    SearchOption.TopDirectoryOnly))
                 .Select(Path.GetFullPath)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Order(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
@@ -799,30 +871,57 @@ namespace SetterChecker.Core
             return trees;
         }
 
+        // 并行建立可由多个源码程序集安全共用的不可变元数据参考。
+        private static IReadOnlyDictionary<CompilerReference, PortableExecutableReference>
+            CreateMetadataReferences(
+            IReadOnlyList<CompilerResponse> responses,
+            int jobs,
+            CancellationToken cancellationToken)
+        {
+            CompilerReference[] inputs = responses
+                .SelectMany(response => response.References)
+                .Distinct()
+                .ToArray();
+            PortableExecutableReference[] references = new PortableExecutableReference[inputs.Length];
+
+            Parallel.For(
+                0,
+                inputs.Length,
+                new ParallelOptions
+                {
+                    CancellationToken = cancellationToken,
+                    MaxDegreeOfParallelism = jobs,
+                },
+                index => references[index] = MetadataReference.CreateFromFile(
+                    inputs[index].Path,
+                    inputs[index].Properties));
+
+            return Enumerable.Range(0, inputs.Length)
+                .ToDictionary(index => inputs[index], index => references[index]);
+        }
+
         // 用已解析源码和原始编译选项建立程序集编译内容。
         private static SourceAssemblyMaterial BuildSourceAssembly(
             CompilerResponse response,
-            string rootAssemblyName,
+            string reportRoot,
             bool enableCompilerParallel,
             IReadOnlyDictionary<string, SyntaxTree> trees,
+            IReadOnlyDictionary<CompilerReference, PortableExecutableReference> metadataReferences,
+            IReadOnlyList<ISourceGenerator> generators,
             CancellationToken cancellationToken)
         {
             SyntaxTree[] assemblyTrees = response.SourcePaths
                 .Select(path => trees[SourceKey(response.AssemblyName, path)])
                 .ToArray();
             PortableExecutableReference[] references = response.References
-                .Select(reference => MetadataReference.CreateFromFile(
-                    reference.Path,
-                    reference.Properties))
+                .Select(reference => metadataReferences[reference])
                 .ToArray();
             CSharpCompilation compilation = CSharpCompilation.Create(
                 response.AssemblyName,
                 assemblyTrees,
                 references,
                 response.CompilationOptions.WithConcurrentBuild(enableCompilerParallel));
-            ISourceGenerator[] generators = LoadGenerators(response.AnalyzerPaths);
-
-            if (generators.Length > 0)
+            if (generators.Count > 0)
             {
                 AdditionalText[] additionalTexts = response.AdditionalFilePaths
                     .Select(path => (AdditionalText)new DiskAdditionalText(path))
@@ -850,11 +949,34 @@ namespace SetterChecker.Core
                 compilation = (CSharpCompilation)generatedCompilation;
             }
 
+            string[] reportSourcePaths = response.SourcePaths
+                .Where(path => IsUnderDirectory(path, reportRoot))
+                .ToArray();
+
             return new SourceAssemblyMaterial(
                 response.AssemblyName,
-                string.Equals(response.AssemblyName, rootAssemblyName, StringComparison.Ordinal),
+                reportSourcePaths.Length > 0,
                 compilation,
-                response.SourcePaths);
+                response.SourcePaths,
+                reportSourcePaths);
+        }
+
+        // 让编译参数相同的源码程序集共用一次分析器加载结果。
+        private static IReadOnlyDictionary<string, ISourceGenerator[]> LoadGeneratorSets(
+            IReadOnlyList<CompilerResponse> responses)
+        {
+            return responses
+                .GroupBy(response => AnalyzerSetKey(response.AnalyzerPaths), StringComparer.Ordinal)
+                .ToDictionary(
+                    group => group.Key,
+                    group => LoadGenerators(group.First().AnalyzerPaths),
+                    StringComparer.Ordinal);
+        }
+
+        // 把一组已排序的分析器路径转换成一次运行内的查找键。
+        private static string AnalyzerSetKey(IReadOnlyList<string> analyzerPaths)
+        {
+            return string.Join('\0', analyzerPaths);
         }
 
         // 从 Unity 声明的分析器文件中读取 C# 源码生成器。

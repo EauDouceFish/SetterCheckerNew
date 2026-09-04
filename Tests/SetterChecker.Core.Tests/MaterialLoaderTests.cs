@@ -26,6 +26,8 @@ namespace SetterChecker.Core.Tests
                 result.SourceAssemblies.Select(assembly => assembly.Name).ToArray());
             Assert.IsTrue(result.SourceAssemblies.Single(assembly =>
                 assembly.Name == "khengine.runtime").IsReportAssembly);
+            Assert.IsFalse(result.SourceAssemblies.Single(assembly =>
+                assembly.Name == "Dependency").IsReportAssembly);
             CollectionAssert.AreEqual(
                 new[] { project.ExternalAssemblyPath },
                 result.ExternalAssemblies.Select(assembly => assembly.ReferencePath).ToArray());
@@ -82,7 +84,8 @@ namespace SetterChecker.Core.Tests
             MaterialSet result = await new MaterialLoader().LoadAsync(new MaterialRequest(
                 project.AssemblyDefinitionPath,
                 2));
-            ExternalAssemblyMaterial external = result.ExternalAssemblies.Single();
+            ExternalAssemblyMaterial external = result.ExternalAssemblies.Single(assembly =>
+                assembly.ReferencePath == project.ExternalReferencePath);
 
             Assert.AreEqual(project.ExternalReferencePath, external.ReferencePath);
             CollectionAssert.AreEqual(
@@ -119,7 +122,8 @@ namespace SetterChecker.Core.Tests
             MaterialSet result = await new MaterialLoader().LoadAsync(new MaterialRequest(
                 project.AssemblyDefinitionPath,
                 2));
-            ExternalAssemblyMaterial external = result.ExternalAssemblies.Single();
+            ExternalAssemblyMaterial external = result.ExternalAssemblies.Single(assembly =>
+                assembly.ReferencePath == project.ExternalAssemblyPath);
 
             CollectionAssert.AreEqual(
                 new[] { project.ExternalAssemblyPath, project.ForwardTargetPath },

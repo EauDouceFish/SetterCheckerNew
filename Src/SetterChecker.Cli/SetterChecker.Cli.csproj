@@ -1,6 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
     <PropertyGroup>
         <OutputType>Exe</OutputType>
+        <ServerGarbageCollection>true</ServerGarbageCollection>
+        <TieredCompilation>false</TieredCompilation>
     </PropertyGroup>
     <ItemGroup>
         <ProjectReference Include="../SetterChecker.Core/SetterChecker.Core.csproj" />

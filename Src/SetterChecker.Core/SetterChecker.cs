@@ -3,6 +3,31 @@ using Microsoft.CodeAnalysis.CSharp;
 namespace SetterChecker.Core
 {
     /// <summary>
+    /// 按固定顺序运行已经完成的分析模块。
+    /// </summary>
+    public sealed class SetterChecker
+    {
+        // 依次读取材料并建立函数总表。
+        /// <summary>
+        /// 运行当前已经完成的分析步骤。
+        /// </summary>
+        public async Task<(MaterialSet Material, MethodCatalogResult Catalog)> AnalyzeAsync(
+            MaterialRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            MaterialSet material = await new MaterialLoader().LoadAsync(
+                request,
+                cancellationToken).ConfigureAwait(false);
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(
+                material,
+                request.Jobs,
+                cancellationToken).ConfigureAwait(false);
+
+            return (material, catalog);
+        }
+    }
+
+    /// <summary>
     /// 表示分析不能继续时的明确错误。
     /// </summary>
     public sealed class AnalysisException : Exception
@@ -29,7 +54,8 @@ namespace SetterChecker.Core
         string Name,
         bool IsReportAssembly,
         CSharpCompilation Compilation,
-        IReadOnlyList<string> SourcePaths);
+        IReadOnlyList<string> SourcePaths,
+        IReadOnlyList<string> ReportSourcePaths);
 
     /// <summary>
     /// 表示一个编译引用及其真实函数内容所在文件。
@@ -43,6 +69,7 @@ namespace SetterChecker.Core
     /// </summary>
     public sealed record MaterialSet(
         string ProjectRoot,
+        string ReportRoot,
         IReadOnlyList<SourceAssemblyMaterial> SourceAssemblies,
         IReadOnlyList<ExternalAssemblyMaterial> ExternalAssemblies,
         IReadOnlyList<string> AnalyzerPaths,

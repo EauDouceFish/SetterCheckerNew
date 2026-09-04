@@ -3,9 +3,15 @@ using SetterChecker.Core;
 
 namespace SetterChecker.Cli
 {
+    /// <summary>
+    /// 提供 SetterChecker 的命令行入口。
+    /// </summary>
     internal static class Program
     {
         // 读取命令行并运行当前已经完成的分析模块。
+        /// <summary>
+        /// 解析命令行参数并运行 SetterChecker。
+        /// </summary>
         public static async Task<int> Main(string[] arguments)
         {
             Console.OutputEncoding = Encoding.UTF8;
@@ -13,14 +19,18 @@ namespace SetterChecker.Cli
             try
             {
                 (string projectPath, int jobs) = ParseArguments(arguments);
-                MaterialSet material = await new MaterialLoader().LoadAsync(
-                    new MaterialRequest(projectPath, jobs));
+                (MaterialSet material, MethodCatalogResult catalog) = await new SetterChecker.Core.SetterChecker()
+                    .AnalyzeAsync(new MaterialRequest(projectPath, jobs));
 
                 Console.WriteLine($"源码程序集：{material.SourceAssemblies.Count}");
                 Console.WriteLine($"源码文件：{material.SourceAssemblies.Sum(item => item.SourcePaths.Count)}");
                 Console.WriteLine($"外部编译文件：{material.ExternalAssemblies.Count}");
                 Console.WriteLine($"分析器文件：{material.AnalyzerPaths.Count}");
                 Console.WriteLine($"材料读取耗时：{material.Elapsed.TotalMilliseconds:F0} 毫秒");
+                Console.WriteLine($"已建立源码函数：{catalog.Methods.Count}");
+                Console.WriteLine($"已建立全部类型：{catalog.Types.Count}");
+                Console.WriteLine($"khengine 可报告函数：{catalog.Methods.Count(method => method.IsReportable)}");
+                Console.WriteLine($"函数总表耗时：{catalog.Elapsed.TotalMilliseconds:F0} 毫秒");
 
                 return 0;
             }

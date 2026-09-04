@@ -1,5 +1,6 @@
 <Project Sdk="MSTest.Sdk/4.4.0">
     <ItemGroup>
+        <PackageReference Include="Mono.Cecil" />
         <ProjectReference Include="../../Src/SetterChecker.Core/SetterChecker.Core.csproj" />
     </ItemGroup>
 </Project>
