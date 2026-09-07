@@ -72,6 +72,7 @@ namespace SetterChecker.Core
         string ReportRoot,
         IReadOnlyList<SourceAssemblyMaterial> SourceAssemblies,
         IReadOnlyList<ExternalAssemblyMaterial> ExternalAssemblies,
+        IReadOnlyList<string> AssemblyLookupPaths,
         IReadOnlyList<string> AnalyzerPaths,
         TimeSpan Elapsed);
 }

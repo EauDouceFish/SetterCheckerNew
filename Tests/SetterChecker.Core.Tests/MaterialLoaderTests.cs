@@ -130,6 +130,25 @@ namespace SetterChecker.Core.Tests
                 external.ImplementationPaths.ToArray());
         }
 
+        // 检查外部程序集的普通间接依赖只进入查找表而不被提前分析。
+        /// <summary>
+        /// 验证不是编译直接引用的基类程序集也能参与后续函数关系闭合。
+        /// </summary>
+        [TestMethod]
+        public async Task LoadAsyncKeepsTransitiveDependencyAsLookupOnly()
+        {
+            using TestProject project = TestProject.CreateWithTransitiveExternalDependency();
+
+            MaterialSet result = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+
+            CollectionAssert.DoesNotContain(
+                result.ExternalAssemblies.SelectMany(assembly => assembly.ImplementationPaths).ToArray(),
+                project.ForwardTargetPath);
+            CollectionAssert.Contains(result.AssemblyLookupPaths.ToArray(), project.ForwardTargetPath);
+        }
+
         // 检查类型转交目标必须符合转交记录中的程序集身份。
         /// <summary>
         /// 验证同名路径不能替代身份不同的转交目标。

@@ -72,7 +72,7 @@ namespace SetterChecker.Core
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Order(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
-            ExternalAssemblyMaterial[] externalAssemblies = await ResolveExternalAssembliesAsync(
+            ExternalMaterialResolution external = await ResolveExternalAssembliesAsync(
                 projectRoot,
                 externalAssemblyPaths,
                 responses.Single(response => string.Equals(
@@ -93,7 +93,8 @@ namespace SetterChecker.Core
                 projectRoot,
                 reportRoot,
                 sourceAssemblies,
-                externalAssemblies,
+                external.Assemblies,
+                external.LookupPaths,
                 analyzerPaths,
                 stopwatch.Elapsed);
         }
@@ -152,7 +153,7 @@ namespace SetterChecker.Core
         }
 
         // 把只有声明的外部参考文件连接到 Unity 当前真实输出文件。
-        private static async Task<ExternalAssemblyMaterial[]> ResolveExternalAssembliesAsync(
+        private static async Task<ExternalMaterialResolution> ResolveExternalAssembliesAsync(
             string projectRoot,
             IReadOnlyList<string> referencePaths,
             CompilerResponse rootResponse,
@@ -184,6 +185,7 @@ namespace SetterChecker.Core
             string[] knownPaths = assemblies
                 .SelectMany(assembly => assembly.ImplementationPaths)
                 .Concat(unityRuntime?.AssemblyPaths ?? Array.Empty<string>())
+                .Concat(FindSiblingAssemblyPaths(assemblies))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
             IReadOnlyDictionary<string, IReadOnlyList<string>> pathsByAssemblyName =
@@ -206,20 +208,54 @@ namespace SetterChecker.Core
                     return ValueTask.CompletedTask;
                 }).ConfigureAwait(false);
 
-            HashSet<string> implementationPaths = resolved
-                .SelectMany(assembly => assembly.ImplementationPaths)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            ExternalAssemblyMaterial[] runtimeDependencies = (unityRuntime?.AssemblyPaths
-                    ?? Array.Empty<string>())
-                .Where(path => !implementationPaths.Contains(path))
-                .Select(path => new ExternalAssemblyMaterial(path, new[] { path }))
-                .ToArray();
-
-            return resolved
-                .Concat(runtimeDependencies)
-                .OrderBy(assembly => assembly.ReferencePath, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
+            return new ExternalMaterialResolution(
+                resolved.OrderBy(
+                        assembly => assembly.ReferencePath,
+                        StringComparer.OrdinalIgnoreCase)
+                    .ToArray(),
+                knownPaths.Order(StringComparer.OrdinalIgnoreCase).ToArray());
         }
+
+        // 将编译引用所在目录的托管文件加入按需查找候选而不提前分析。
+        private static IEnumerable<string> FindSiblingAssemblyPaths(
+            IEnumerable<ExternalAssemblyMaterial> assemblies)
+        {
+            return assemblies.SelectMany(assembly => assembly.ImplementationPaths)
+                .Select(Path.GetDirectoryName)
+                .Where(path => path != null)
+                .Cast<string>()
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .SelectMany(path => Directory.EnumerateFiles(path, "*.dll", SearchOption.TopDirectoryOnly))
+                .Where(IsManagedAssembly)
+                .Select(Path.GetFullPath);
+        }
+
+        // 判断动态链接库是否含有可由 Cecil 读取的托管元数据。
+        private static bool IsManagedAssembly(string path)
+        {
+            using FileStream stream = File.OpenRead(path);
+            using PEReader portableExecutable = new(stream);
+
+            return portableExecutable.HasMetadata;
+        }
+
+        // 把一条程序集引用转换为可核对的完整身份。
+        private static AssemblyReferenceIdentity ReadAssemblyReference(
+            MetadataReader metadata,
+            AssemblyReferenceHandle handle)
+        {
+            AssemblyReference reference = metadata.GetAssemblyReference(handle);
+
+            return new AssemblyReferenceIdentity(
+                metadata.GetString(reference.Name),
+                reference.Version,
+                reference.Culture.IsNil ? string.Empty : metadata.GetString(reference.Culture),
+                reference.PublicKeyOrToken.IsNil
+                    ? ImmutableArray<byte>.Empty
+                    : metadata.GetBlobBytes(reference.PublicKeyOrToken).ToImmutableArray(),
+                (reference.Flags & AssemblyFlags.PublicKey) != 0);
+        }
+
 
         // 按 Unity 明确的输出位置寻找一份参考文件的真实实现。
         private static IReadOnlyList<string> FindImplementationPaths(
@@ -338,7 +374,7 @@ namespace SetterChecker.Core
                 }
 
                 paths.Add(path);
-                foreach (ForwardedAssemblyIdentity identity in ReadForwardedAssemblies(path))
+                foreach (AssemblyReferenceIdentity identity in ReadForwardedAssemblies(path))
                 {
                     pending.Enqueue(FindForwardedAssembly(
                         path,
@@ -351,12 +387,12 @@ namespace SetterChecker.Core
         }
 
         // 读取一份托管文件中的全部类型转交目标程序集名称。
-        private static IReadOnlyList<ForwardedAssemblyIdentity> ReadForwardedAssemblies(string path)
+        private static IReadOnlyList<AssemblyReferenceIdentity> ReadForwardedAssemblies(string path)
         {
             using FileStream stream = File.OpenRead(path);
             using PEReader portableExecutable = new(stream);
             MetadataReader metadata = portableExecutable.GetMetadataReader();
-            Dictionary<string, ForwardedAssemblyIdentity> identities = new(
+            Dictionary<string, AssemblyReferenceIdentity> identities = new(
                 StringComparer.OrdinalIgnoreCase);
 
             foreach (ExportedTypeHandle handle in metadata.ExportedTypes)
@@ -376,16 +412,9 @@ namespace SetterChecker.Core
                 {
                     AssemblyReference reference = metadata.GetAssemblyReference(
                         (AssemblyReferenceHandle)implementation);
-                    ForwardedAssemblyIdentity identity = new(
-                        metadata.GetString(reference.Name),
-                        reference.Version,
-                        reference.Culture.IsNil
-                            ? string.Empty
-                            : metadata.GetString(reference.Culture),
-                        reference.PublicKeyOrToken.IsNil
-                            ? ImmutableArray<byte>.Empty
-                            : metadata.GetBlobBytes(reference.PublicKeyOrToken).ToImmutableArray(),
-                        (reference.Flags & AssemblyFlags.PublicKey) != 0);
+                    AssemblyReferenceIdentity identity = ReadAssemblyReference(
+                        metadata,
+                        (AssemblyReferenceHandle)implementation);
 
                     identities[identity.Key] = identity;
                 }
@@ -399,7 +428,7 @@ namespace SetterChecker.Core
         // 在转交文件明确可达的位置寻找唯一目标程序集。
         private static string FindForwardedAssembly(
             string forwardingPath,
-            ForwardedAssemblyIdentity identity,
+            AssemblyReferenceIdentity identity,
             IReadOnlyDictionary<string, IReadOnlyList<string>> pathsByAssemblyName)
         {
             DirectoryInfo directory = new(Path.GetDirectoryName(forwardingPath)!);
@@ -454,7 +483,7 @@ namespace SetterChecker.Core
         private static void AddCandidate(
             ISet<string> candidates,
             string path,
-            ForwardedAssemblyIdentity identity)
+            AssemblyReferenceIdentity identity)
         {
             if (File.Exists(path) && MatchesIdentity(path, identity))
             {
@@ -465,7 +494,7 @@ namespace SetterChecker.Core
         // 检查候选文件是否符合类型转交记录中的完整程序集身份。
         private static bool MatchesIdentity(
             string path,
-            ForwardedAssemblyIdentity identity)
+            AssemblyReferenceIdentity identity)
         {
             AssemblyName candidate = AssemblyName.GetAssemblyName(path);
             byte[] candidateKey = identity.UsesFullPublicKey
@@ -1075,7 +1104,11 @@ namespace SetterChecker.Core
             IReadOnlyList<string> ReferenceRoots,
             IReadOnlyList<string> AssemblyPaths);
 
-        private sealed record ForwardedAssemblyIdentity(
+        private sealed record ExternalMaterialResolution(
+            IReadOnlyList<ExternalAssemblyMaterial> Assemblies,
+            IReadOnlyList<string> LookupPaths);
+
+        private sealed record AssemblyReferenceIdentity(
             string Name,
             Version Version,
             string Culture,
