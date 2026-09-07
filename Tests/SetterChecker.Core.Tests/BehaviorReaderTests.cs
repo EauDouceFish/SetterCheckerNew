@@ -6,6 +6,72 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class BehaviorReaderTests
     {
+        // 验证函数参数和返回值经过类型转交后仍定位同一真实声明。
+        /// <summary>
+        /// 参考库中的泛型嵌套类型与运行库中的定义不能按程序集名称误判不同。
+        /// </summary>
+        [TestMethod]
+        public async Task ReadAsyncResolvesForwardedParameterAndReturnTypes()
+        {
+            using TestProject project = TestProject.CreateWithForwardedMethodSignature();
+            MaterialSet material = await new MaterialLoader().LoadAsync(
+                new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry consumer = catalog.Types.Single(type => type.AssemblyPath == project.ExternalAssemblyPath
+                && type.FullName == "SignatureConsumer");
+            MethodEntry root = catalog.GetMethods(consumer).Single(method => method.Name == "Run");
+
+            BehaviorReadResult result = await new BehaviorReader().ReadAsync(material, catalog, new[] { root }, 2);
+
+            CollectionAssert.AreEqual(new[] { ".ctor", "GetEnumerator", "Accept" },
+                result.Methods.Single().Calls.Select(call => call.Target.Name).ToArray());
+        }
+
+        // 验证本地定义标记与外部引用来源在行为事实中完整保留。
+        /// <summary>
+        /// 同名类型在本地保留定义并向外转交时，函数、对象和字段仍可区分。
+        /// </summary>
+        [TestMethod]
+        public async Task ReadAsyncPreservesLocalTokensAndExternalReferenceScope()
+        {
+            using TestProject project = TestProject.CreateWithDefinitionAndSameFileForwarder();
+            MaterialSet material = await new MaterialLoader().LoadAsync(
+                new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            catalog.RequireClosedHierarchy(catalog.Types.Single(type =>
+                type.FullName == "SameFileForwardingConsumer.ExternalDerived"));
+            TypeEntry localEntry = catalog.Types.Single(type => type.AssemblyPath == project.ExternalReferencePath
+                && type.FullName == "SameFileForwarding.Entry");
+            MethodEntry constructor = catalog.GetMethods(localEntry).Single(method => method.Name == ".ctor");
+            foreach ((string typeName, string methodName, bool isLocal) in new[]
+            {
+                ("SameFileForwarding.LocalDerived", "FieldLocal", true),
+                ("SameFileForwardingConsumer.ExternalDerived", "FieldExternal", false),
+            })
+            {
+                TypeEntry type = catalog.Types.Single(candidate => candidate.FullName == typeName);
+                MethodEntry root = catalog.GetMethods(type).Single(method => method.Name == methodName);
+                MethodBehavior behavior = (await new BehaviorReader().ReadAsync(
+                    material, catalog, new[] { root }, 2)).Methods.Single();
+                BehaviorValue created = behavior.Values.Single(value => value.Kind == BehaviorValueKind.NewObject
+                    && value.Type!.DefinitionId == localEntry.LogicalId);
+                BehaviorCall call = behavior.Calls.Single(candidate => candidate.Target.Name == ".ctor"
+                    && candidate.Target.DeclaringTypeDefinitionId == localEntry.LogicalId);
+                BehaviorMemberReference field = behavior.Writes.Single(write => write.Kind == BehaviorWriteKind.Field).Member!;
+
+                Assert.AreEqual(isLocal ? localEntry.Id : null, created.Type!.KnownTypeId);
+                Assert.AreEqual(isLocal ? localEntry.Id : null, call.Target.KnownDeclaringTypeId);
+                Assert.AreEqual(isLocal ? constructor.MetadataToken : null, call.Target.KnownMetadataToken);
+                Assert.AreEqual(isLocal ? constructor.MetadataToken : 0x0A000000,
+                    isLocal ? call.Target.ReferenceMetadataToken : call.Target.ReferenceMetadataToken & unchecked((int)0xFF000000));
+                Assert.AreEqual(isLocal ? localEntry.Id : null, field.KnownDeclaringTypeId);
+                Assert.AreEqual(localEntry.AssemblyIdentity, call.Target.TargetAssemblyIdentity);
+                Assert.AreEqual(localEntry.AssemblyIdentity, field.TargetAssemblyIdentity);
+                Assert.AreEqual(root.AssemblyPath, call.Target.ReferringAssemblyPath);
+                Assert.AreEqual(root.AssemblyPath, field.ReferringAssemblyPath);
+            }
+        }
+
         // 验证大正数并行上限不会让分块运算溢出或改变结果。
         /// <summary>
         /// 验证工作数量仅作为上限，实际少量函数不受整数乘法溢出影响。
@@ -749,7 +815,7 @@ namespace SetterChecker.Core.Tests
             }
         }
 
-        // 验证相同签名匿名函数仍保留各自物理身份和捕获来源。
+        // 验证相同签名匿名函数仍指向不同生成函数并保存闭包来源。
         /// <summary>
         /// 验证控制流匿名函数不会退化为无法区分的逻辑函数名。
         /// </summary>
@@ -773,20 +839,26 @@ namespace SetterChecker.Core.Tests
             BehaviorValue[] functions = behavior.Values.Where(value =>
                     value.Kind == BehaviorValueKind.Function)
                 .ToArray();
-            int parameterValueId = behavior.Values.Single(value =>
-                value.Kind == BehaviorValueKind.Parameter
-                && value.ParameterIndex == 0).Id;
-
             Assert.HasCount(2, functions);
-            Assert.AreEqual(2, functions.Select(value => value.Method!.KnownMethodId).Distinct().Count());
-            Assert.IsTrue(functions.All(value => FlowsFrom(
-                behavior,
-                value.Id,
-                parameterValueId,
-                new HashSet<int>())));
+            Assert.AreEqual(
+                2,
+                functions.Select(value =>
+                        $"{value.Method!.DeclaringTypeDefinitionId}|{value.Method.Name}|"
+                            + string.Join('|', value.Method.ParameterTypeIds))
+                    .Distinct(StringComparer.Ordinal)
+                    .Count());
+            Assert.IsTrue(functions.All(value =>
+                ResolveManagedMethod(catalog, value.Method!).MetadataToken > 0));
+            BehaviorValue parameter = behavior.Values.Single(value =>
+                value.Kind == BehaviorValueKind.Parameter
+                && value.ParameterIndex == 0);
+            Assert.IsTrue(behavior.Writes.Any(write =>
+                write.Member?.DeclaringTypeDefinitionId
+                    == functions[0].Method!.DeclaringTypeDefinitionId
+                && ReachesAtPoint(behavior, write.ValueId, parameter.Id)));
         }
 
-        // 验证局部函数绑定保留精确函数身份和外层参数来源。
+        // 验证局部函数绑定保留实际生成函数和闭包字段来源。
         /// <summary>
         /// 验证局部函数不会在绑定成委托时丢失捕获关系。
         /// </summary>
@@ -815,13 +887,18 @@ namespace SetterChecker.Core.Tests
                 functions.Length,
                 string.Join(" | ", behavior.Values.Select(value =>
                     $"{value.Id}:{value.Kind}:{value.Reference}")));
-            BehaviorValue function = functions[0];
-            int parameterValueId = behavior.Values.Single(value =>
+            BehaviorValue function = functions.Single();
+            BehaviorMethodReference target = function.Method
+                ?? throw new InvalidOperationException("局部函数值缺少生成函数引用。");
+            BehaviorValue parameter = behavior.Values.Single(value =>
                 value.Kind == BehaviorValueKind.Parameter
-                && value.ParameterIndex == 0).Id;
+                && value.ParameterIndex == 0);
 
-            Assert.IsNotNull(function.Method!.KnownMethodId);
-            AssertValueFlowsFrom(behavior, function.Id, parameterValueId);
+            Assert.IsTrue(ResolveManagedMethod(catalog, target).MetadataToken > 0);
+            Assert.IsTrue(behavior.Writes.Any(write =>
+                write.Member?.DeclaringTypeDefinitionId
+                    == target.DeclaringTypeDefinitionId
+                && ReachesAtPoint(behavior, write.ValueId, parameter.Id)));
         }
 
         // 验证源码与托管转换都保留结构化目标类型。
@@ -975,10 +1052,29 @@ namespace SetterChecker.Core.Tests
                 value.Kind == BehaviorValueKind.Parameter
                 && value.ParameterIndex == 0).Id;
 
-            AssertValueFlowsFrom(
-                behavior,
-                behavior.Returns.Single().ValueId!.Value,
-                parameterValueId);
+            BehaviorCall inputCall = behavior.Calls.Single(call =>
+                call.Arguments.Any(argument => FlowsFrom(
+                    behavior,
+                    argument.ValueId,
+                    parameterValueId,
+                    new HashSet<int>())));
+            BehaviorCall resultCall = behavior.Calls.Single(call =>
+                call.ResultValueId.HasValue
+                && FlowsFrom(
+                    behavior,
+                    behavior.Returns.Single().ValueId!.Value,
+                    call.ResultValueId.Value,
+                    new HashSet<int>()));
+
+            Assert.IsTrue(inputCall.Position <= resultCall.Position);
+            Assert.IsNotNull(inputCall.ReceiverValueId);
+            Assert.IsNotNull(resultCall.ReceiverValueId);
+            BehaviorValue inputReceiver = behavior.Values.Single(value => value.Id == inputCall.ReceiverValueId);
+            BehaviorValue resultReceiver = behavior.Values.Single(value => value.Id == resultCall.ReceiverValueId);
+            Assert.AreEqual(BehaviorValueKind.Address, inputReceiver.Kind);
+            Assert.AreEqual(BehaviorValueKind.Address, resultReceiver.Kind);
+            Assert.HasCount(1, inputReceiver.InputValueIds);
+            CollectionAssert.AreEqual(inputReceiver.InputValueIds.ToArray(), resultReceiver.InputValueIds.ToArray());
         }
 
         // 验证最小整数不会与托管指令解析的内部哨兵混淆。
@@ -1034,7 +1130,7 @@ namespace SetterChecker.Core.Tests
                 exception.Id);
         }
 
-        // 验证 new T() 保留泛型类型身份供后续闭合实际构造函数。
+        // 验证 new T() 保留编译后创建调用的泛型类型身份。
         /// <summary>
         /// 验证类型参数对象创建不会被当成未知源码值。
         /// </summary>
@@ -1055,18 +1151,20 @@ namespace SetterChecker.Core.Tests
                 catalog,
                 new[] { method },
                 2)).Methods.Single();
-            BehaviorValue created = behavior.Values.Single(value =>
-                value.Kind == BehaviorValueKind.NewObject);
+            BehaviorCall creation = behavior.Calls.Single(call =>
+                call.Target.Name == "CreateInstance");
 
-            Assert.IsNotNull(created.Type);
-            StringAssert.Contains(created.Type.Id, "!!0");
+            CollectionAssert.AreEqual(
+                new[] { "!!0" },
+                creation.Target.GenericArgumentTypeIds.ToArray());
+            Assert.IsNotNull(creation.ResultValueId);
             AssertValueFlowsFrom(
                 behavior,
                 behavior.Returns.Single().ValueId!.Value,
-                created.Id);
+                creation.ResultValueId.Value);
         }
 
-        // 验证元组结果保留每个元素的输入来源。
+        // 验证元组构造调用保留每个元素的输入来源。
         /// <summary>
         /// 验证真实项目使用的元组值能进入后续数据流。
         /// </summary>
@@ -1087,21 +1185,22 @@ namespace SetterChecker.Core.Tests
                 catalog,
                 new[] { method },
                 2)).Methods.Single();
-            BehaviorValue tuple = behavior.Values.Single(value =>
-                value.Reference == "tuple");
+            BehaviorCall tuple = behavior.Calls.Single(call =>
+                call.Kind == BehaviorCallKind.ObjectCreation);
 
-            Assert.HasCount(2, tuple.InputValueIds);
-            AssertParameter(behavior, tuple.InputValueIds[0], 0);
-            AssertParameter(behavior, tuple.InputValueIds[1], 1);
+            StringAssert.Contains(tuple.Target.DeclaringTypeDefinitionId, "System.ValueTuple");
+            AssertParameter(behavior, tuple.Arguments[0].ValueId, 0);
+            AssertParameter(behavior, tuple.Arguments[1].ValueId, 1);
+            Assert.IsNotNull(tuple.ResultValueId);
             AssertValueFlowsFrom(
                 behavior,
                 behavior.Returns.Single().ValueId!.Value,
-                tuple.Id);
+                tuple.ResultValueId.Value);
         }
 
-        // 验证迭代器源码事实与 DLL 工厂和 MoveNext 的执行时机分离。
+        // 验证迭代器工厂与实际 MoveNext 函数的执行时机分离。
         /// <summary>
-        /// 验证 yield 函数只在枚举阶段传播源码函数体效果。
+        /// 验证调用工厂只创建迭代器，业务写入只存在于生成的遍历函数。
         /// </summary>
         [TestMethod]
         public async Task ReadAsyncMarksIteratorBodyAsDeferredExecution()
@@ -1111,7 +1210,7 @@ namespace SetterChecker.Core.Tests
                 project.AssemblyDefinitionPath,
                 2));
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
-            MethodEntry sourceMethod = catalog.Methods.Single(method =>
+            MethodEntry sourceFactory = catalog.Methods.Single(method =>
                 method.TypeName == "SourceSamples.BehaviorSample"
                 && method.Name == "YieldWrite");
             TypeEntry managedType = catalog.Types.Single(type =>
@@ -1119,47 +1218,42 @@ namespace SetterChecker.Core.Tests
                 && type.FullName == "ExternalSamples.BehaviorSample");
             MethodEntry managedFactory = catalog.GetMethods(managedType).Single(method =>
                 method.Name == "YieldWrite");
-            int stateMachineToken;
-            using (Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(
-                       project.ExternalAssemblyPath))
-            {
-                Mono.Cecil.MethodDefinition definition = module.LookupToken(
-                    managedFactory.MetadataToken) as Mono.Cecil.MethodDefinition
-                    ?? throw new InvalidOperationException("找不到迭代器工厂定义。");
-                Mono.Cecil.CustomAttribute attribute = definition.CustomAttributes.Single(item =>
-                    item.AttributeType.FullName
-                        == "System.Runtime.CompilerServices.IteratorStateMachineAttribute");
-                Mono.Cecil.TypeReference stateMachine =
-                    (Mono.Cecil.TypeReference)attribute.ConstructorArguments[0].Value;
-                stateMachineToken = stateMachine.Resolve().MetadataToken.ToInt32();
-            }
-
-            TypeEntry stateMachineType = catalog.Types.Single(type =>
-                type.AssemblyPath == project.ExternalAssemblyPath
-                && type.MetadataToken == stateMachineToken);
-            MethodEntry moveNext = catalog.GetMethods(stateMachineType).Single(method =>
-                method.Name == "MoveNext");
-            BehaviorReadResult result = await new BehaviorReader().ReadAsync(
+            MethodEntry[] factories = { sourceFactory, managedFactory };
+            BehaviorReadResult factoryResult = await new BehaviorReader().ReadAsync(
                 material,
                 catalog,
-                new[] { sourceMethod, managedFactory, moveNext },
+                factories,
                 2);
-            MethodBehavior source = result.MethodsById[sourceMethod.Id];
-            MethodBehavior factory = result.MethodsById[managedFactory.Id];
-            MethodBehavior body = result.MethodsById[moveNext.Id];
+            MethodEntry[] moveNextMethods = factories.Select(factory =>
+                ResolveIteratorMoveNext(
+                    catalog,
+                    factoryResult.MethodsById[factory.Id]))
+                .ToArray();
+            BehaviorReadResult bodyResult = await new BehaviorReader().ReadAsync(
+                material,
+                catalog,
+                moveNextMethods,
+                2);
 
-            Assert.AreEqual(BehaviorExecutionKind.IteratorBody, source.ExecutionKind);
-            Assert.AreEqual(BehaviorExecutionKind.Immediate, factory.ExecutionKind);
-            Assert.AreEqual(BehaviorExecutionKind.Immediate, body.ExecutionKind);
-            Assert.IsTrue(source.Writes.Any(write => write.Member?.Name == "m_value"));
-            Assert.IsFalse(factory.Writes.Any(write => write.Member?.Name == "m_value"));
-            Assert.IsTrue(body.Writes.Any(write => write.Member?.Name == "m_value"));
-            Assert.HasCount(1, source.Returns.Where(item => item.ValueId != null));
+            for (int index = 0; index < factories.Length; index++)
+            {
+                MethodBehavior factory = factoryResult.MethodsById[factories[index].Id];
+                MethodBehavior body = bodyResult.MethodsById[moveNextMethods[index].Id];
+                BehaviorValue iterator = factory.Values.Single(value =>
+                    value.Kind == BehaviorValueKind.NewObject);
+
+                Assert.IsFalse(factory.Writes.Any(write => write.Member?.Name == "m_value"));
+                Assert.IsTrue(body.Writes.Any(write => write.Member?.Name == "m_value"));
+                AssertValueFlowsFrom(
+                    factory,
+                    factory.Returns.Single().ValueId!.Value,
+                    iterator.Id);
+            }
         }
 
-        // 验证匿名函数绑定到注册调用时保留 this、参数和局部值。
+        // 验证匿名函数注册保留真实闭包对象中的 this、参数和局部值。
         /// <summary>
-        /// 验证捕获来源能从注册调用参数对应到匿名函数内部写入。
+        /// 验证注册调用、闭包字段写入和生成函数字段读取可以完整对应。
         /// </summary>
         [TestMethod]
         public async Task ReadAsyncConnectsRegisteredAnonymousFunctionCaptures()
@@ -1169,104 +1263,72 @@ namespace SetterChecker.Core.Tests
                 project.AssemblyDefinitionPath,
                 2));
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
-            MethodEntry method = catalog.Methods.Single(candidate =>
+            MethodEntry sourceMethod = catalog.Methods.Single(candidate =>
                 candidate.TypeName == "SourceSamples.BehaviorSample"
                 && candidate.Name == "RegisterCaptured");
-            MethodBehavior outer = (await new BehaviorReader().ReadAsync(
-                material,
-                catalog,
-                new[] { method },
-                2)).Methods.Single();
-            BehaviorValue function = outer.Values.Single(value =>
-                value.Kind == BehaviorValueKind.Function);
-            MethodEntry anonymous = catalog.Methods.Single(candidate =>
-                candidate.Id == function.Method!.KnownMethodId);
-            MethodBehavior inner = (await new BehaviorReader().ReadAsync(
-                material,
-                catalog,
-                new[] { anonymous },
-                2)).Methods.Single();
-
-            CollectionAssert.AreEquivalent(
-                new[]
-                {
-                    BehaviorValueKind.CurrentInstance,
-                    BehaviorValueKind.Parameter,
-                    BehaviorValueKind.Local,
-                },
-                function.InputValueIds.Select(id => outer.Values[id].Kind).ToArray());
-            BehaviorCall registration = outer.Calls.Single(call => call.Target.Name == "Register");
-            AssertValueFlowsFrom(
-                outer,
-                registration.Arguments.Single().ValueId,
-                function.Id);
-            BehaviorValue[] captures = inner.Values.Where(value =>
-                    value.Kind == BehaviorValueKind.Captured)
-                .ToArray();
-            Assert.HasCount(3, captures);
-            CollectionAssert.AreEquivalent(
-                function.Captures.Select(capture => capture.Key).ToArray(),
-                captures.Select(capture => capture.Reference).ToArray());
-            BehaviorWrite write = inner.Writes.Single(item => item.Member?.Name == "m_value");
-            BehaviorValue capturedThis = captures.Single(value =>
-                value.Reference!.StartsWith("this:", StringComparison.Ordinal));
-            AssertValueFlowsFrom(inner, write.ReceiverValueId!.Value, capturedThis.Id);
-            Assert.IsTrue(captures.Where(value => value.Id != capturedThis.Id).All(value =>
-                FlowsFrom(inner, write.ValueId, value.Id, new HashSet<int>())));
-
             TypeEntry managedType = catalog.Types.Single(type =>
                 type.AssemblyPath == project.ExternalAssemblyPath
                 && type.FullName == "ExternalSamples.BehaviorSample");
             MethodEntry managedMethod = catalog.GetMethods(managedType).Single(candidate =>
                 candidate.Name == "RegisterCaptured");
-            MethodBehavior managedOuter = (await new BehaviorReader().ReadAsync(
+            MethodEntry[] methods = { sourceMethod, managedMethod };
+            BehaviorReadResult outerResult = await new BehaviorReader().ReadAsync(
                 material,
                 catalog,
-                new[] { managedMethod },
-                2)).Methods.Single();
-            BehaviorValue managedFunction = managedOuter.Values.Single(value =>
-                value.Kind == BehaviorValueKind.Function);
-            MethodEntry generatedMethod = ResolveManagedMethod(
-                catalog,
-                managedFunction.Method!);
-            MethodBehavior managedInner = (await new BehaviorReader().ReadAsync(
+                methods,
+                2);
+            MethodEntry[] generatedMethods = methods.Select(method =>
+                ResolveManagedMethod(
+                    catalog,
+                    outerResult.MethodsById[method.Id].Values.Single(value =>
+                        value.Kind == BehaviorValueKind.Function).Method!))
+                .ToArray();
+            BehaviorReadResult innerResult = await new BehaviorReader().ReadAsync(
                 material,
                 catalog,
-                new[] { generatedMethod },
-                2)).Methods.Single();
-            BehaviorCall managedRegistration = managedOuter.Calls.Single(call =>
-                call.Target.Name == "Register");
+                generatedMethods,
+                2);
 
-            AssertValueFlowsFrom(
-                managedOuter,
-                managedRegistration.Arguments.Single().ValueId,
-                managedFunction.Id);
-            BehaviorValue closure = managedOuter.Values.Single(value =>
-                value.Kind == BehaviorValueKind.NewObject
-                && value.Type?.DefinitionId
-                    == managedFunction.Method!.DeclaringTypeDefinitionId);
-            BehaviorWrite[] closureWrites = managedOuter.Writes.Where(item =>
-                    item.Member?.DeclaringTypeDefinitionId == closure.Type!.DefinitionId)
-                .ToArray();
-            Assert.HasCount(3, closureWrites);
-            BehaviorValue[] closureReads = managedInner.Values.Where(value =>
-                    value.Kind == BehaviorValueKind.FieldRead
-                    && closureWrites.Any(item => SameMember(item.Member!, value.Member!)))
-                .ToArray();
-            Assert.HasCount(3, closureReads);
-            BehaviorWrite managedWrite = managedInner.Writes.Single(item =>
-                item.Member?.Name == "m_value");
-            Assert.IsTrue(closureReads.All(value =>
-                FlowsFrom(
-                    managedInner,
-                    managedWrite.ReceiverValueId!.Value,
-                    value.Id,
-                    new HashSet<int>())
-                || FlowsFrom(
-                    managedInner,
-                    managedWrite.ValueId,
-                    value.Id,
-                    new HashSet<int>())));
+            for (int index = 0; index < methods.Length; index++)
+            {
+                MethodBehavior outer = outerResult.MethodsById[methods[index].Id];
+                MethodBehavior inner = innerResult.MethodsById[generatedMethods[index].Id];
+                BehaviorValue function = outer.Values.Single(value =>
+                    value.Kind == BehaviorValueKind.Function);
+                BehaviorCall registration = outer.Calls.Single(call =>
+                    call.Target.Name == "Register");
+                BehaviorValue closure = outer.Values.Single(value =>
+                    value.Kind == BehaviorValueKind.NewObject
+                    && value.Type?.DefinitionId
+                        == function.Method!.DeclaringTypeDefinitionId);
+                BehaviorWrite[] closureWrites = outer.Writes.Where(item =>
+                        item.Member?.DeclaringTypeDefinitionId == closure.Type!.DefinitionId)
+                    .ToArray();
+                BehaviorValue[] closureReads = inner.Values.Where(value =>
+                        value.Kind == BehaviorValueKind.FieldRead
+                        && closureWrites.Any(item => SameMember(item.Member!, value.Member!)))
+                    .ToArray();
+                BehaviorWrite businessWrite = inner.Writes.Single(item =>
+                    item.Member?.Name == "m_value");
+
+                AssertValueFlowsFrom(
+                    outer,
+                    registration.Arguments.Single().ValueId,
+                    function.Id);
+                Assert.HasCount(3, closureWrites);
+                Assert.HasCount(3, closureReads);
+                Assert.IsTrue(closureReads.All(value =>
+                    FlowsFrom(
+                        inner,
+                        businessWrite.ReceiverValueId!.Value,
+                        value.Id,
+                        new HashSet<int>())
+                    || FlowsFrom(
+                        inner,
+                        businessWrite.ValueId,
+                        value.Id,
+                        new HashSet<int>())));
+            }
         }
 
         // 验证输出参数赋值和条件调用的 out 局部地址不会丢失。
@@ -1431,36 +1493,100 @@ namespace SetterChecker.Core.Tests
             }
         }
 
-        // 验证匿名函数绑定稳定捕获槽，而普通读取仍按每次使用建立快照。
+        // 验证匿名函数绑定后重赋会写入同一个真实闭包字段。
         /// <summary>
-        /// 验证捕获绑定后重赋不会更换捕获存储，也不会合并前后读取点。
+        /// 验证闭包字段先保存外部对象、绑定委托，再保存新对象。
         /// </summary>
         [TestMethod]
         public async Task ReadAsyncKeepsCapturedSlotAcrossLaterAssignment()
         {
-            MethodBehavior source = (await ReadPairsAsync("CaptureThenOverwrite"))
-                ["CaptureThenOverwrite"][0];
-            BehaviorValue function = source.Values.Single(value =>
-                value.Kind == BehaviorValueKind.Function);
-            BehaviorCaptureBinding binding = function.Captures.Single(capture =>
-                source.Values[capture.ValueId].Kind == BehaviorValueKind.Local);
-            int capturedSlot = binding.ValueId;
-            BehaviorValue[] reads = source.Calls.Where(call => call.Target.Name == "Observe")
-                .Select(call => source.Values[call.Arguments.Single().ValueId])
-                .Where(value => value.Kind == BehaviorValueKind.SlotRead
-                    && value.InputValueIds.SequenceEqual(new[] { capturedSlot }))
-                .OrderBy(value => value.Point!.Value.BlockId)
-                .ThenBy(value => value.Point!.Value.Order)
+            using TestProject project = TestProject.CreateWithBehaviorMethods();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry sourceMethod = catalog.Methods.Single(method =>
+                method.TypeName == "SourceSamples.BehaviorSample"
+                && method.Name == "CaptureThenOverwrite");
+            TypeEntry managedType = catalog.Types.Single(type =>
+                type.AssemblyPath == project.ExternalAssemblyPath
+                && type.FullName == "ExternalSamples.BehaviorSample");
+            MethodEntry managedMethod = catalog.GetMethods(managedType).Single(method =>
+                method.Name == "CaptureThenOverwrite");
+            MethodEntry[] methods = { sourceMethod, managedMethod };
+            BehaviorReadResult outerResult = await new BehaviorReader().ReadAsync(
+                material,
+                catalog,
+                methods,
+                2);
+            MethodEntry[] generatedMethods = methods.Select(method =>
+                ResolveManagedMethod(
+                    catalog,
+                    outerResult.MethodsById[method.Id].Values.Single(value =>
+                        value.Kind == BehaviorValueKind.Function).Method!))
                 .ToArray();
+            BehaviorReadResult innerResult = await new BehaviorReader().ReadAsync(
+                material,
+                catalog,
+                generatedMethods,
+                2);
 
-            Assert.HasCount(2, reads);
-            Assert.IsTrue(function.InputValueIds.Contains(capturedSlot));
-            Assert.IsFalse(string.IsNullOrWhiteSpace(binding.Key));
-            Assert.AreNotEqual(reads[0].Point, reads[1].Point);
-            Assert.HasCount(
-                2,
-                source.Assignments.Where(assignment =>
-                    assignment.TargetValueId == capturedSlot));
+            for (int index = 0; index < methods.Length; index++)
+            {
+                MethodBehavior outer = outerResult.MethodsById[methods[index].Id];
+                MethodBehavior inner = innerResult.MethodsById[generatedMethods[index].Id];
+                BehaviorValue function = outer.Values.Single(value =>
+                    value.Kind == BehaviorValueKind.Function);
+                BehaviorValue external = outer.Values.Single(value =>
+                    value.Kind == BehaviorValueKind.Parameter
+                    && value.ParameterIndex == 0);
+                BehaviorValue[] createdValues = outer.Values.Where(value =>
+                        value.Kind == BehaviorValueKind.NewObject
+                        && value.Type?.DefinitionId
+                            != function.Method!.DeclaringTypeDefinitionId)
+                    .ToArray();
+                BehaviorValue created = createdValues.Single(value =>
+                    !outer.Calls.Any(call =>
+                        call.Kind == BehaviorCallKind.ObjectCreation
+                        && call.ResultValueId == value.Id
+                        && call.Arguments.Any(argument => FlowsFrom(
+                            outer,
+                            argument.ValueId,
+                            function.Id,
+                            new HashSet<int>()))));
+                IGrouping<string, BehaviorWrite> capturedField =
+                    outer.Writes.Where(write =>
+                            write.Member?.DeclaringTypeDefinitionId
+                                == function.Method!.DeclaringTypeDefinitionId)
+                        .GroupBy(write =>
+                            $"{write.Member!.DeclaringTypeDefinitionId}|{write.Member.Name}|"
+                                + write.Member.FieldTypeId,
+                            StringComparer.Ordinal)
+                        .Single(group => group.Count() == 2);
+                BehaviorWrite[] writes = capturedField.OrderBy(write => write.Position).ToArray();
+                BehaviorCall constructor = outer.Calls.Single(call =>
+                    call.Kind == BehaviorCallKind.ObjectCreation
+                    && call.Arguments.Any(argument =>
+                        FlowsFrom(
+                            outer,
+                            argument.ValueId,
+                            function.Id,
+                            new HashSet<int>())));
+                BehaviorValue capturedRead = inner.Values.Single(value =>
+                    value.Kind == BehaviorValueKind.FieldRead
+                    && SameMember(value.Member!, writes[0].Member!));
+                BehaviorCall observation = inner.Calls.Single(call =>
+                    call.Target.Name == "Observe");
+
+                AssertReachesAtPoint(outer, writes[0].ValueId, external.Id);
+                AssertReachesAtPoint(outer, writes[1].ValueId, created.Id);
+                Assert.IsTrue(writes[0].Position < constructor.Position);
+                Assert.IsTrue(constructor.Position < writes[1].Position);
+                AssertValueFlowsFrom(
+                    inner,
+                    observation.Arguments.Single().ValueId,
+                    capturedRead.Id);
+            }
         }
 
         // 验证反射注册表的索引器写入保留接收者、键和结构化类型。
@@ -2262,7 +2388,7 @@ namespace SetterChecker.Core.Tests
 
         // 验证不同工作数只改变速度，不改变函数事实或顺序。
         /// <summary>
-        /// 验证 -j1 与 -j4 的完整公开行为结果一致。
+        /// 验证 -j1、-j2、-j4 与 -j8 的完整公开行为结果一致。
         /// </summary>
         [TestMethod]
         public async Task AnalyzeAsyncKeepsBehaviorOrderAcrossJobCounts()
@@ -2346,6 +2472,25 @@ namespace SetterChecker.Core.Tests
                 && candidate.ReturnTypeId == reference.ReturnTypeId
                 && candidate.Parameters.Select(parameter => parameter.TypeId)
                     .SequenceEqual(reference.ParameterTypeIds, StringComparer.Ordinal));
+        }
+
+        // 从迭代器工厂实际创建的类型定位生成的遍历函数。
+        private static MethodEntry ResolveIteratorMoveNext(
+            MethodCatalogResult catalog,
+            MethodBehavior factory)
+        {
+            BehaviorTypeReference stateMachine = factory.Values.Single(value =>
+                    value.Kind == BehaviorValueKind.NewObject)
+                .Type
+                ?? throw new InvalidOperationException("迭代器创建值缺少生成类型。");
+            TypeEntry type = catalog.Types.Single(candidate =>
+                candidate.Id == stateMachine.DefinitionId
+                || candidate.LogicalId == stateMachine.DefinitionId);
+
+            return catalog.GetMethods(type).Single(method =>
+                method.Name == "MoveNext"
+                && method.Parameters.Count == 0
+                && method.ReturnTypeId == "System.Boolean");
         }
 
         // 比较跨函数行为中的同一个结构化字段身份。

@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.Operations;
+using Mono.Cecil.Rocks;
 using Cecil = Mono.Cecil;
 
 namespace SetterChecker.Core
@@ -37,58 +37,31 @@ namespace SetterChecker.Core
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Order(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
+            string[] assemblyLookupPaths = material.AssemblyLookupPaths
+                .Except(material.AnalyzerPaths, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
             IReadOnlyDictionary<string, string> assemblyNames = ReadAssemblyNames(
                 material.SourceAssemblies,
                 managedPaths,
+                assemblyLookupPaths,
                 jobs);
             SourceCatalogContext[] sourceContexts = material.SourceAssemblies
                 .Select(assembly => new SourceCatalogContext(
                     assembly,
-                    assembly.ReportSourcePaths.ToHashSet(StringComparer.OrdinalIgnoreCase),
-                    assemblyNames))
+                    assembly.SourcePaths.ToHashSet(StringComparer.OrdinalIgnoreCase),
+                    assembly.ReportSourcePaths.ToHashSet(StringComparer.OrdinalIgnoreCase)))
                 .ToArray();
             ConcurrentBag<ManagedAssemblyPart> managedParts = new();
-
-            await Parallel.ForEachAsync(
-                managedPaths,
-                new ParallelOptions
-                {
-                    CancellationToken = cancellationToken,
-                    MaxDegreeOfParallelism = jobs,
-                },
-                (path, _) =>
-                {
-                    managedParts.Add(ReadManagedTypes(path, assemblyNames));
-
-                    return ValueTask.CompletedTask;
-                }).ConfigureAwait(false);
-
-            TypeEntry[] sourceTypes = sourceContexts
-                .SelectMany(context => EnumerateTypes(
-                    context.Material.Compilation.Assembly.GlobalNamespace)
-                    .Select(type => CreateSourceType(type, context)))
-                .ToArray();
-            ManagedAssemblyPart[] orderedManagedParts = managedParts
-                .OrderBy(part => part.Path, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            TypeEntry[] managedTypes = orderedManagedParts.SelectMany(part => part.Types).ToArray();
-            TypeEntry[] allTypes = AttachForwardedAliases(
-                sourceTypes.Concat(managedTypes).ToArray(),
-                orderedManagedParts.SelectMany(part => part.Forwarders).ToArray());
-            IReadOnlyDictionary<string, TypeEntry> sourceTypesById = sourceTypes.ToDictionary(
-                type => type.Id,
-                StringComparer.Ordinal);
-            ConcurrentBag<IReadOnlyList<MethodEntry>> sourceMethodParts = new();
-            SourceMethodWorkItem[] workItems = sourceContexts
-                .SelectMany(context => EnumerateTypes(
-                        context.Material.Compilation.Assembly.GlobalNamespace)
-                    .Select(type => new SourceMethodWorkItem(context, type, null))
-                    .Concat(context.Material.Compilation.SyntaxTrees.Select(tree =>
-                        new SourceMethodWorkItem(context, null, tree))))
+            ConcurrentBag<SourceManagedPart> sourceManagedParts = new();
+            CatalogAssemblyWorkItem[] assemblyWorkItems = managedPaths
+                .Select(path => new CatalogAssemblyWorkItem(path, null))
+                .Concat(sourceContexts.Select(context => new CatalogAssemblyWorkItem(
+                    context.Material.AssemblyPath,
+                    context)))
                 .ToArray();
 
             await Parallel.ForEachAsync(
-                workItems,
+                assemblyWorkItems,
                 new ParallelOptions
                 {
                     CancellationToken = cancellationToken,
@@ -96,15 +69,73 @@ namespace SetterChecker.Core
                 },
                 (workItem, _) =>
                 {
-                    sourceMethodParts.Add(workItem.Type != null
-                        ? ReadSourceTypeMethods(
-                            workItem.Context,
-                            workItem.Type,
-                            sourceTypesById)
-                        : ReadSourceNestedMethods(
-                            workItem.Context,
-                            workItem.Tree!,
-                            sourceTypesById));
+                    if (workItem.SourceContext == null)
+                    {
+                        managedParts.Add(ReadManagedTypes(workItem.Path, assemblyNames));
+                    }
+                    else
+                    {
+                        SourceCatalogContext context = workItem.SourceContext;
+                        ManagedAssemblyPart part = ReadManagedTypes(
+                            workItem.Path,
+                            context.Material.AssemblyImage,
+                            assemblyNames);
+                        IReadOnlyDictionary<string, INamedTypeSymbol> sourceTypes = EnumerateTypes(
+                                context.Material.Compilation.Assembly.GlobalNamespace)
+                            .Where(type => IsDeclaredSourceType(type, context))
+                            .ToDictionary(ReadDocumentationId, StringComparer.Ordinal);
+                        TypeEntry[] declaredTypes = part.Types.Where(type =>
+                            sourceTypes.ContainsKey(type.DocumentationId)).ToArray();
+                        sourceManagedParts.Add(new SourceManagedPart(
+                            context,
+                            part,
+                            ReadManagedMethods(
+                                context.Material.AssemblyImage,
+                                declaredTypes,
+                                assemblyNames),
+                            sourceTypes));
+                    }
+
+                    return ValueTask.CompletedTask;
+                }).ConfigureAwait(false);
+
+            SourceManagedPart[] orderedSourceManagedParts = sourceManagedParts
+                .OrderBy(item => item.Part.Path, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            ManagedAssemblyPart[] orderedManagedParts = managedParts
+                .OrderBy(part => part.Path, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            SourceTypeWorkItem[] sourceTypeWorkItems = orderedSourceManagedParts
+                .SelectMany(ReadSourceTypeWorkItems)
+                .ToArray();
+            TypeEntry[] sourceTypes = sourceTypeWorkItems.Select(item => item.SourceType).ToArray();
+            HashSet<string> sourceMetadataTypeIds = sourceTypeWorkItems
+                .Select(item => item.MetadataType.Id)
+                .ToHashSet(StringComparer.Ordinal);
+            TypeEntry[] generatedSourceTypes = orderedSourceManagedParts
+                .SelectMany(item => item.Part.Types)
+                .Where(type => !sourceMetadataTypeIds.Contains(type.Id))
+                .ToArray();
+            TypeEntry[] managedTypes = orderedManagedParts.SelectMany(part => part.Types).ToArray();
+            ManagedAssemblyPart[] allManagedParts = orderedManagedParts
+                .Concat(orderedSourceManagedParts.Select(item => item.Part))
+                .OrderBy(part => part.Path, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            TypeEntry[] allTypes = AttachForwardedAliases(
+                sourceTypes.Concat(generatedSourceTypes).Concat(managedTypes).ToArray(),
+                allManagedParts.SelectMany(part => part.Forwarders).ToArray());
+            ConcurrentBag<IReadOnlyList<MethodEntry>> sourceMethodParts = new();
+
+            await Parallel.ForEachAsync(
+                sourceTypeWorkItems,
+                new ParallelOptions
+                {
+                    CancellationToken = cancellationToken,
+                    MaxDegreeOfParallelism = jobs,
+                },
+                (workItem, _) =>
+                {
+                    sourceMethodParts.Add(ReadSourceTypeMethods(workItem));
 
                     return ValueTask.CompletedTask;
                 }).ConfigureAwait(false);
@@ -121,9 +152,12 @@ namespace SetterChecker.Core
             return new MethodCatalogResult(
                 sourceMethods,
                 orderedTypes,
+                allManagedParts,
                 sourceContexts,
                 assemblyNames,
-                material.AssemblyLookupPaths,
+                assemblyLookupPaths,
+                material.UnityRuntimeFacadePaths,
+                material.AssemblyRedirects,
                 stopwatch,
                 jobs);
         }
@@ -132,6 +166,7 @@ namespace SetterChecker.Core
         private static IReadOnlyDictionary<string, string> ReadAssemblyNames(
             IReadOnlyList<SourceAssemblyMaterial> sourceAssemblies,
             IReadOnlyList<string> managedPaths,
+            IReadOnlyList<string> assemblyLookupPaths,
             int jobs)
         {
             ConcurrentBag<string> names = new();
@@ -152,6 +187,8 @@ namespace SetterChecker.Core
                 .Concat(sourceAssemblies.SelectMany(assembly => assembly.Compilation.ReferencedAssemblyNames)
                     .Select(identity => identity.Name))
                 .Concat(names)
+                .Concat(assemblyLookupPaths.Select(path =>
+                    System.Reflection.AssemblyName.GetAssemblyName(path).Name!))
                 .Distinct(StringComparer.Ordinal)
                 .Order(StringComparer.Ordinal)
                 .ToArray();
@@ -165,11 +202,58 @@ namespace SetterChecker.Core
             return result;
         }
 
+        // 核对候选文件的完整程序集身份。
+        internal static bool MatchesAssemblyFile(
+            string path,
+            System.Reflection.AssemblyName expected)
+        {
+            return MatchesAssemblyIdentity(
+                System.Reflection.AssemblyName.GetAssemblyName(path),
+                expected);
+        }
+
+        // 核对已读取类型的完整程序集身份。
+        internal static bool MatchesAssemblyIdentity(
+            string actualIdentity,
+            System.Reflection.AssemblyName expected)
+        {
+            return MatchesAssemblyIdentity(
+                new System.Reflection.AssemblyName(actualIdentity),
+                expected);
+        }
+
+        // 比较程序集名称、版本、区域和公钥标记。
+        private static bool MatchesAssemblyIdentity(
+            System.Reflection.AssemblyName actual,
+            System.Reflection.AssemblyName expected)
+        {
+            return string.Equals(actual.Name, expected.Name, StringComparison.OrdinalIgnoreCase)
+                && Equals(actual.Version, expected.Version)
+                && string.Equals(
+                    actual.CultureName ?? string.Empty,
+                    expected.CultureName ?? string.Empty,
+                    StringComparison.OrdinalIgnoreCase)
+                && (actual.GetPublicKeyToken() ?? Array.Empty<byte>())
+                    .SequenceEqual(expected.GetPublicKeyToken() ?? Array.Empty<byte>());
+        }
+
         // 延迟读取一个真实托管文件，避免仅建目录时解析无关特性依赖。
-        private static Cecil.ModuleDefinition OpenModule(string path)
+        internal static Cecil.ModuleDefinition OpenModule(string path)
         {
             return Cecil.ModuleDefinition.ReadModule(
                 Path.GetFullPath(path),
+                new Cecil.ReaderParameters
+                {
+                    InMemory = true,
+                    ReadingMode = Cecil.ReadingMode.Deferred,
+                });
+        }
+
+        // 从当前编译生成的内存 PE 读取 Cecil 模块。
+        internal static Cecil.ModuleDefinition OpenModule(byte[] image)
+        {
+            return Cecil.ModuleDefinition.ReadModule(
+                new MemoryStream(image, writable: false),
                 new Cecil.ReaderParameters
                 {
                     InMemory = true,
@@ -247,523 +331,174 @@ namespace SetterChecker.Core
             }
         }
 
-        // 把一个源码类型转换为统一类型记录。
-        private static TypeEntry CreateSourceType(INamedTypeSymbol type, SourceCatalogContext context)
-        {
-            INamedTypeSymbol definition = type.OriginalDefinition;
-            string logicalId = SourceNamedTypeDefinitionId(definition, context);
-
-            return new TypeEntry(
-                logicalId,
-                logicalId,
-                Array.Empty<string>(),
-                CanonicalAssemblyName(context.AssemblyNames, definition.ContainingAssembly.Identity.Name),
-                definition.Name,
-                DisplaySourceType(definition),
-                definition.BaseType == null ? null : CreateSourceRelation(definition.BaseType, context),
-                definition.Interfaces
-                    .Select(item => CreateSourceRelation(item, context))
-                    .DistinctBy(item => item.TypeId, StringComparer.Ordinal)
-                    .OrderBy(item => item.TypeId, StringComparer.Ordinal)
-                    .ToArray(),
-                ReadSourceAttributes(definition.GetAttributes()),
-                definition.TypeKind == TypeKind.Interface,
-                definition,
-                null,
-                0);
-        }
-
-        // 把一个源码基类或接口保存为结构化关系。
-        private static TypeRelationEntry CreateSourceRelation(
+        // 判断类型是用户源文件声明而不是编译或生成器产物。
+        private static bool IsDeclaredSourceType(
             INamedTypeSymbol type,
             SourceCatalogContext context)
         {
-            TypeIdentityTemplate[] arguments = ReadSourceNamedTypeArguments(type, context).ToArray();
-            TypeIdentityTemplate identity = SourceTypeIdentity(type, context);
+            return type.Locations.Any(location => location.IsInSource
+                && location.SourceTree != null
+                && context.DeclaredPaths.Contains(location.SourceTree.FilePath));
+        }
 
-            return new TypeRelationEntry(
-                SourceNamedTypeDefinitionId(type.OriginalDefinition, context),
-                identity.Text,
-                type.ContainingAssembly.Identity.GetDisplayName(),
-                arguments.Select(argument => argument.Text).ToArray());
+        // 读取标准成员编号，并保留显式接口函数实际写入元数据的名称。
+        private static string ReadDocumentationId(ISymbol symbol)
+        {
+            string id = symbol.GetDocumentationCommentId()
+                ?? throw new AnalysisException($"源码声明没有文档成员编号：{symbol}");
+            if (symbol is not IMethodSymbol method || method.ExplicitInterfaceImplementations.IsEmpty)
+            {
+                return id;
+            }
+
+            int nameStart = ReadDocumentationId(method.ContainingType).Length + 1;
+            int parameterStart = id.IndexOf('(', nameStart);
+            string suffix = parameterStart < 0 ? string.Empty : id[parameterStart..];
+            string name = method.MetadataName.Replace('.', '#').Replace('<', '{').Replace('>', '}');
+            string arity = method.Arity == 0 ? string.Empty : $"``{method.Arity}";
+
+            return id[..nameStart] + name + arity + suffix;
+        }
+
+        // 把源码位置和标签附加到 Cecil 已读取的类型事实。
+        private static TypeEntry CreateSourceType(INamedTypeSymbol type, TypeEntry metadata)
+        {
+            INamedTypeSymbol definition = type.OriginalDefinition;
+
+            return metadata with
+            {
+                Id = metadata.LogicalId,
+                FullName = DisplaySourceType(definition),
+                Attributes = ReadSourceAttributes(definition.GetAttributes()),
+                SourceSymbol = definition,
+            };
+        }
+
+        // 把用户源码类型和内存 PE 中的同一命名类型配对。
+        private static IReadOnlyList<SourceTypeWorkItem> ReadSourceTypeWorkItems(
+            SourceManagedPart assembly)
+        {
+            IReadOnlyDictionary<string, TypeEntry> metadataTypes = assembly.Part.Types
+                .ToDictionary(type => type.DocumentationId, StringComparer.Ordinal);
+            IReadOnlyDictionary<string, IReadOnlyList<MethodEntry>> methodsByTypeId = assembly.Methods
+                .GroupBy(method => method.TypeId, StringComparer.Ordinal)
+                .ToDictionary(
+                    group => group.Key,
+                    group => (IReadOnlyList<MethodEntry>)group.ToArray(),
+                    StringComparer.Ordinal);
+
+            return assembly.SourceTypesByDocumentationId.Select(item =>
+                {
+                    TypeEntry metadata = metadataTypes.TryGetValue(item.Key, out TypeEntry? found)
+                        ? found
+                        : throw new AnalysisException($"源码类型没有元数据定义：{item.Key}");
+
+                    return new SourceTypeWorkItem(
+                        assembly.Context,
+                        item.Value,
+                        CreateSourceType(item.Value, metadata),
+                        metadata,
+                        methodsByTypeId.GetValueOrDefault(metadata.Id)
+                            ?? Array.Empty<MethodEntry>());
+                })
+                .ToArray();
         }
 
         // 读取一个源码类型直接声明的全部函数。
-        private static IReadOnlyList<MethodEntry> ReadSourceTypeMethods(
-            SourceCatalogContext context,
-            INamedTypeSymbol type,
-            IReadOnlyDictionary<string, TypeEntry> sourceTypesById)
+        private static IReadOnlyList<MethodEntry> ReadSourceTypeMethods(SourceTypeWorkItem workItem)
         {
-            TypeEntry typeEntry = sourceTypesById[SourceNamedTypeDefinitionId(
-                type.OriginalDefinition,
-                context)];
-            IReadOnlyDictionary<IMethodSymbol, MethodIdentityTemplate[]> interfaceTargets =
-                ReadSourceInterfaceTargets(type, context);
-
-            return type.GetMembers()
+            Dictionary<string, IMethodSymbol> sourceMethods = workItem.Symbol.GetMembers()
                 .OfType<IMethodSymbol>()
-                .Select(method => CreateSourceMethod(
-                    method,
-                    typeEntry,
-                    context,
-                    interfaceTargets.GetValueOrDefault(NormalizeMethod(method))
-                        ?? Array.Empty<MethodIdentityTemplate>()))
-                .ToArray();
-        }
-
-        // 读取一个源码文件中的局部函数和匿名函数。
-        private static IReadOnlyList<MethodEntry> ReadSourceNestedMethods(
-            SourceCatalogContext context,
-            SyntaxTree tree,
-            IReadOnlyDictionary<string, TypeEntry> sourceTypesById)
-        {
-            SyntaxNode root = tree.GetRoot();
-            SyntaxNode[] declarations = root.DescendantNodes()
-                .Where(node => node is LocalFunctionStatementSyntax or AnonymousFunctionExpressionSyntax)
-                .ToArray();
-            if (declarations.Length == 0)
+                .Select(NormalizeMethod)
+                .Distinct<IMethodSymbol>(SymbolEqualityComparer.Default)
+                .ToDictionary(ReadDocumentationId, StringComparer.Ordinal);
+            List<MethodEntry> result = new(workItem.MetadataMethods.Count);
+            foreach (MethodEntry metadata in workItem.MetadataMethods)
             {
-                return Array.Empty<MethodEntry>();
-            }
-
-            SemanticModel model = context.Material.Compilation.GetSemanticModel(tree, true);
-            List<MethodEntry> methods = new();
-            foreach (SyntaxNode declaration in declarations)
-            {
-                IMethodSymbol? symbol = declaration switch
+                if (sourceMethods.Remove(metadata.DocumentationId, out IMethodSymbol? source))
                 {
-                    LocalFunctionStatementSyntax local => model.GetDeclaredSymbol(local) as IMethodSymbol,
-                    AnonymousFunctionExpressionSyntax anonymous =>
-                        (model.GetOperation(anonymous) as IAnonymousFunctionOperation)?.Symbol,
-                    _ => null,
-                };
-                if (symbol == null)
-                {
-                    throw new AnalysisException(
-                        $"无法建立内部函数身份：{tree.FilePath}@{declaration.Span.Start}");
+                    result.Add(CreateSourceMethod(source, workItem.SourceType, workItem.Context, metadata));
                 }
-
-                methods.Add(CreateSourceMethod(
-                    symbol,
-                    sourceTypesById[SourceNamedTypeDefinitionId(
-                        symbol.ContainingType.OriginalDefinition,
-                        context)],
-                    context,
-                    Array.Empty<MethodIdentityTemplate>()));
+                else
+                {
+                    result.Add(metadata with
+                    {
+                        TypeId = workItem.SourceType.Id,
+                        TypeName = workItem.SourceType.FullName,
+                        TypeAttributes = workItem.SourceType.Attributes,
+                    });
+                }
             }
 
-            return methods;
+            IMethodSymbol? missing = sourceMethods.Values.FirstOrDefault(method =>
+                !method.IsImplicitlyDeclared);
+            if (missing != null)
+            {
+                throw new AnalysisException(
+                    $"源码函数没有元数据定义：{ReadDocumentationId(missing)}");
+            }
+
+            return result.OrderBy(method => method.Id, StringComparer.Ordinal).ToArray();
         }
 
-        // 把一个源码函数转换为统一函数记录。
+        // 把源码显示和标签信息附加到 Cecil 已读取的函数事实。
         private static MethodEntry CreateSourceMethod(
             IMethodSymbol method,
             TypeEntry type,
             SourceCatalogContext context,
-            IReadOnlyList<MethodIdentityTemplate> interfaceTargets)
+            MethodEntry metadata)
         {
             IMethodSymbol definition = NormalizeMethod(method);
             Location? location = definition.Locations.FirstOrDefault(item => item.IsInSource);
             string? sourcePath = location?.SourceTree?.FilePath;
             int line = location == null ? 0 : location.GetLineSpan().StartLinePosition.Line + 1;
-            ParameterEntry[] parameters = definition.Parameters
-                .Select(parameter => CreateSourceParameter(parameter, context))
-                .ToArray();
-            TypeIdentityTemplate returnType = SourceReturnTypeIdentity(definition, context);
-            CatalogMethodKind kind = GetSourceMethodKind(definition);
-            MethodIdentityTemplate identity = new(
-                TypeIdentityTemplate.NamedType(type.LogicalId),
-                definition.MetadataName,
-                definition.Arity,
-                parameters.Select(parameter => parameter.TypeIdentity).ToArray(),
-                returnType);
-            string logicalId = identity.Text;
-            string id = kind is CatalogMethodKind.LocalFunction or CatalogMethodKind.AnonymousFunction
-                ? $"{logicalId}@{sourcePath}:{location?.SourceSpan.Start ?? 0}"
-                : logicalId;
-            MethodIdentityTemplate[] relations = ReadSourceRelations(
-                definition,
-                context,
-                interfaceTargets);
-
-            return new MethodEntry(
-                id,
-                logicalId,
-                CanonicalAssemblyName(context.AssemblyNames, definition.ContainingAssembly.Identity.Name),
-                type.Id,
-                type.FullName,
-                definition.MetadataName,
-                DisplaySourceType(definition.ReturnType) + (definition.ReturnsByRef || definition.ReturnsByRefReadonly ? "&" : string.Empty),
-                returnType.Text,
-                parameters,
-                kind,
-                ReadSourceAttributes(definition.GetAttributes()),
-                type.Attributes,
-                relations.Select(relation => relation.Text).ToArray(),
-                sourcePath,
-                line,
-                IsReportable(definition, kind, sourcePath, context),
-                definition.IsAbstract,
-                definition.DeclaredAccessibility == Accessibility.Public,
-                definition.IsStatic,
-                definition.IsVirtual || definition.IsAbstract || definition.IsOverride,
-                (definition.IsVirtual || definition.IsAbstract) && !definition.IsOverride,
-                definition.Arity,
-                definition,
-                null,
-                0);
-        }
-
-        // 找出源码类型直接提供的全部接口函数实现。
-        private static IReadOnlyDictionary<IMethodSymbol, MethodIdentityTemplate[]>
-            ReadSourceInterfaceTargets(INamedTypeSymbol type, SourceCatalogContext context)
-        {
-            Dictionary<IMethodSymbol, List<MethodIdentityTemplate>> targets = new(
-                SymbolEqualityComparer.Default);
-            foreach (IMethodSymbol contract in type.AllInterfaces
-                         .SelectMany(item => item.GetMembers().OfType<IMethodSymbol>()))
+            if (metadata.Parameters.Count != definition.Parameters.Length)
             {
-                if (type.FindImplementationForInterfaceMember(contract) is not IMethodSymbol implementation)
-                {
-                    continue;
-                }
-
-                IMethodSymbol definition = NormalizeMethod(implementation);
-                if (!SymbolEqualityComparer.Default.Equals(
-                        definition.ContainingType.OriginalDefinition,
-                        type.OriginalDefinition))
-                {
-                    continue;
-                }
-
-                if (!targets.TryGetValue(definition, out List<MethodIdentityTemplate>? methodTargets))
-                {
-                    methodTargets = new List<MethodIdentityTemplate>();
-                    targets.Add(definition, methodTargets);
-                }
-
-                methodTargets.Add(SourceMethodIdentity(contract.OriginalDefinition, context));
+                throw new AnalysisException(
+                    $"源码函数与元数据参数数量不一致：{metadata.LogicalId}");
             }
 
-            Dictionary<IMethodSymbol, MethodIdentityTemplate[]> result = new(
-                SymbolEqualityComparer.Default);
-            foreach ((IMethodSymbol method, List<MethodIdentityTemplate> identities) in targets)
-            {
-                result.Add(
-                    method,
-                    identities.DistinctBy(identity => identity.Text, StringComparer.Ordinal)
-                        .OrderBy(identity => identity.Text, StringComparer.Ordinal)
-                        .ToArray());
-            }
-
-            return result;
-        }
-
-        // 读取源码函数的接口实现和重写目标。
-        private static MethodIdentityTemplate[] ReadSourceRelations(
-            IMethodSymbol method,
-            SourceCatalogContext context,
-            IReadOnlyList<MethodIdentityTemplate> interfaceTargets)
-        {
-            return method.ExplicitInterfaceImplementations
-                .Append(method.OverriddenMethod)
-                .Where(target => target != null)
-                .Cast<IMethodSymbol>()
-                .Select(target => SourceMethodIdentity(target.OriginalDefinition, context))
-                .Concat(interfaceTargets)
-                .DistinctBy(identity => identity.Text, StringComparer.Ordinal)
-                .OrderBy(identity => identity.Text, StringComparer.Ordinal)
+            ParameterEntry[] parameters = metadata.Parameters.Zip(definition.Parameters)
+                .Select(pair => pair.First with
+                {
+                    Name = pair.Second.Name,
+                    TypeName = DisplaySourceType(pair.Second.Type)
+                        + (pair.Second.RefKind == RefKind.None ? string.Empty : "&"),
+                })
                 .ToArray();
+            string returnTypeName = DisplaySourceType(definition.ReturnType)
+                + (definition.ReturnsByRef || definition.ReturnsByRefReadonly
+                    ? "&"
+                    : string.Empty);
+            CatalogMethodKind kind = definition.MethodKind == MethodKind.Destructor
+                ? CatalogMethodKind.Destructor
+                : metadata.Kind;
+
+            return metadata with
+            {
+                Id = metadata.LogicalId,
+                TypeId = type.Id,
+                TypeName = type.FullName,
+                ReturnTypeName = returnTypeName,
+                Parameters = parameters,
+                Kind = kind,
+                MethodAttributes = ReadSourceAttributes(definition.GetAttributes()),
+                TypeAttributes = type.Attributes,
+                SourcePath = sourcePath,
+                Line = line,
+                IsReportable = IsReportable(
+                    definition,
+                    kind,
+                    sourcePath,
+                    context),
+                SourceSymbol = definition,
+            };
         }
 
         // 还原扩展函数、部分函数及构造函数的原始声明。
         private static IMethodSymbol NormalizeMethod(IMethodSymbol method)
         {
             return (method.ReducedFrom ?? method.PartialImplementationPart ?? method).OriginalDefinition;
-        }
-
-        // 建立一个源码函数的稳定声明身份。
-        private static MethodIdentityTemplate SourceMethodIdentity(
-            IMethodSymbol method,
-            SourceCatalogContext context)
-        {
-            IMethodSymbol definition = NormalizeMethod(method);
-
-            return new MethodIdentityTemplate(
-                TypeIdentityTemplate.NamedType(SourceNamedTypeDefinitionId(
-                    definition.ContainingType.OriginalDefinition,
-                    context)),
-                definition.MetadataName,
-                definition.Arity,
-                definition.Parameters.Select(parameter =>
-                    SourceParameterTypeIdentity(parameter, context)).ToArray(),
-                SourceReturnTypeIdentity(definition, context));
-        }
-
-        // 建立一个源码调用点的完整函数引用。
-        internal static ManagedMethodReferenceInfo ReadSourceMethodReference(
-            IMethodSymbol method,
-            SourceCatalogContext context)
-        {
-            IMethodSymbol target = method.ReducedFrom ?? method;
-            IMethodSymbol definition = NormalizeMethod(method);
-            TypeIdentityTemplate declaringType = SourceTypeIdentity(target.ContainingType, context);
-            TypeIdentityTemplate[] declaringArguments = ReadSourceNamedTypeArguments(
-                target.ContainingType,
-                context).ToArray();
-            MethodIdentityTemplate identity = SourceMethodIdentity(definition, context)
-                .Instantiate(declaringType, declaringArguments);
-            TypeIdentityTemplate[] methodArguments = target.IsGenericMethod
-                ? target.TypeArguments.Select(argument => SourceTypeIdentity(argument, context)).ToArray()
-                : Array.Empty<TypeIdentityTemplate>();
-
-            return new ManagedMethodReferenceInfo(
-                identity,
-                !target.IsStatic,
-                target.ReturnsVoid,
-                methodArguments,
-                TypeIdentityTemplate.NamedType(SourceNamedTypeDefinitionId(
-                    target.ContainingType.OriginalDefinition,
-                    context)),
-                declaringArguments,
-                target.ContainingAssembly.Identity.GetDisplayName(),
-                null);
-        }
-
-        // 建立一个源码字段的完整引用。
-        internal static ManagedFieldReferenceInfo ReadSourceFieldReference(
-            IFieldSymbol field,
-            SourceCatalogContext context)
-        {
-            TypeIdentityTemplate[] arguments = ReadSourceNamedTypeArguments(
-                field.ContainingType,
-                context).ToArray();
-
-            return new ManagedFieldReferenceInfo(
-                SourceTypeIdentity(field.ContainingType, context),
-                field.MetadataName,
-                SourceTypeIdentity(field.Type, context),
-                TypeIdentityTemplate.NamedType(SourceNamedTypeDefinitionId(
-                    field.ContainingType.OriginalDefinition,
-                    context)),
-                arguments);
-        }
-
-        // 建立一个源码字段式事件的完整引用。
-        internal static ManagedFieldReferenceInfo ReadSourceEventReference(
-            IEventSymbol eventSymbol,
-            SourceCatalogContext context)
-        {
-            TypeIdentityTemplate[] arguments = ReadSourceNamedTypeArguments(
-                eventSymbol.ContainingType,
-                context).ToArray();
-
-            return new ManagedFieldReferenceInfo(
-                SourceTypeIdentity(eventSymbol.ContainingType, context),
-                eventSymbol.MetadataName,
-                SourceTypeIdentity(eventSymbol.Type, context),
-                TypeIdentityTemplate.NamedType(SourceNamedTypeDefinitionId(
-                    eventSymbol.ContainingType.OriginalDefinition,
-                    context)),
-                arguments);
-        }
-
-        // 建立一个源码自动属性后备字段的完整引用。
-        internal static ManagedFieldReferenceInfo ReadSourcePropertyStorageReference(
-            IPropertySymbol property,
-            SourceCatalogContext context)
-        {
-            TypeIdentityTemplate[] arguments = ReadSourceNamedTypeArguments(
-                property.ContainingType,
-                context).ToArray();
-
-            return new ManagedFieldReferenceInfo(
-                SourceTypeIdentity(property.ContainingType, context),
-                $"<{property.MetadataName}>k__BackingField",
-                SourceTypeIdentity(property.Type, context),
-                TypeIdentityTemplate.NamedType(SourceNamedTypeDefinitionId(
-                    property.ContainingType.OriginalDefinition,
-                    context)),
-                arguments);
-        }
-
-        // 建立一个源码类型使用点的实际和定义身份。
-        internal static ManagedTypeReferenceInfo ReadSourceTypeReference(
-            ITypeSymbol type,
-            SourceCatalogContext context)
-        {
-            TypeIdentityTemplate identity = SourceTypeIdentity(type, context);
-            if (type is not INamedTypeSymbol namedType)
-            {
-                return new ManagedTypeReferenceInfo(
-                    identity,
-                    identity,
-                    Array.Empty<TypeIdentityTemplate>(),
-                    type.ContainingAssembly?.Identity.GetDisplayName(),
-                    null);
-            }
-
-            return new ManagedTypeReferenceInfo(
-                identity,
-                TypeIdentityTemplate.NamedType(SourceNamedTypeDefinitionId(
-                    namedType.OriginalDefinition,
-                    context)),
-                ReadSourceNamedTypeArguments(namedType, context).ToArray(),
-                namedType.ContainingAssembly.Identity.GetDisplayName(),
-                null);
-        }
-
-        // 把源码参数转换为统一参数记录。
-        private static ParameterEntry CreateSourceParameter(
-            IParameterSymbol parameter,
-            SourceCatalogContext context)
-        {
-            TypeIdentityTemplate type = SourceParameterTypeIdentity(parameter, context);
-
-            return new ParameterEntry(
-                parameter.Name,
-                DisplaySourceType(parameter.Type) + (parameter.RefKind == RefKind.None ? string.Empty : "&"),
-                type.Text,
-                ReadSourceRefKind(parameter))
-            {
-                TypeIdentity = type,
-            };
-        }
-
-        // 读取源码参数的引用传递方式。
-        private static CatalogRefKind ReadSourceRefKind(IParameterSymbol parameter)
-        {
-            return parameter.RefKind switch
-            {
-                RefKind.Ref => CatalogRefKind.Ref,
-                RefKind.Out => CatalogRefKind.Out,
-                RefKind.In or RefKind.RefReadOnlyParameter => CatalogRefKind.In,
-                _ => CatalogRefKind.None,
-            };
-        }
-
-        // 建立源码参数在托管签名中的类型身份。
-        private static TypeIdentityTemplate SourceParameterTypeIdentity(
-            IParameterSymbol parameter,
-            SourceCatalogContext context)
-        {
-            TypeIdentityTemplate type = SourceTypeIdentity(parameter.Type, context);
-
-            return parameter.RefKind == RefKind.None ? type : type.Append("&");
-        }
-
-        // 建立源码返回值在托管签名中的类型身份。
-        private static TypeIdentityTemplate SourceReturnTypeIdentity(
-            IMethodSymbol method,
-            SourceCatalogContext context)
-        {
-            TypeIdentityTemplate type = SourceTypeIdentity(method.ReturnType, context);
-
-            return method.ReturnsByRef || method.ReturnsByRefReadonly ? type.Append("&") : type;
-        }
-
-        // 建立源码类型的确定身份。
-        private static TypeIdentityTemplate SourceTypeIdentity(
-            ITypeSymbol type,
-            SourceCatalogContext context)
-        {
-            if (TryReadPrimitive(type.SpecialType, out string? primitive))
-            {
-                return TypeIdentityTemplate.Literal(primitive!);
-            }
-
-            return type switch
-            {
-                ITypeParameterSymbol parameter when parameter.TypeParameterKind == TypeParameterKind.Method =>
-                    TypeIdentityTemplate.Literal($"!!{parameter.Ordinal}"),
-                ITypeParameterSymbol parameter =>
-                    TypeIdentityTemplate.TypeParameter(ReadSourceTypeParameterOrdinal(parameter)),
-                IArrayTypeSymbol array => SourceTypeIdentity(array.ElementType, context)
-                    .Append($"[{new string(',', array.Rank - 1)}]"),
-                IPointerTypeSymbol pointer => SourceTypeIdentity(pointer.PointedAtType, context).Append("*"),
-                IFunctionPointerTypeSymbol function => TypeIdentityTemplate.Literal(
-                    function.ToDisplayString(s_typeDisplayFormat)),
-                IDynamicTypeSymbol => TypeIdentityTemplate.Literal("System.Object"),
-                INamedTypeSymbol named => SourceNamedTypeIdentity(named, context),
-                _ => throw new AnalysisException($"不支持的源码类型：{type.Kind} {type}"),
-            };
-        }
-
-        // 建立源码命名类型定义或构造类型的身份。
-        private static TypeIdentityTemplate SourceNamedTypeIdentity(
-            INamedTypeSymbol type,
-            SourceCatalogContext context)
-        {
-            string definitionId = SourceNamedTypeDefinitionId(type.OriginalDefinition, context);
-            TypeIdentityTemplate[] arguments = ReadSourceNamedTypeArguments(type, context).ToArray();
-
-            return arguments.Length == 0
-                ? TypeIdentityTemplate.NamedType(definitionId)
-                : TypeIdentityTemplate.NamedType(definitionId).Append(
-                    $"<{string.Join(',', arguments.Select(argument => argument.Text))}>");
-        }
-
-        // 按外层到内层顺序读取源码命名类型的泛型实参。
-        private static IEnumerable<TypeIdentityTemplate> ReadSourceNamedTypeArguments(
-            INamedTypeSymbol type,
-            SourceCatalogContext context)
-        {
-            if (type.ContainingType != null)
-            {
-                foreach (TypeIdentityTemplate argument in ReadSourceNamedTypeArguments(
-                             type.ContainingType,
-                             context))
-                {
-                    yield return argument;
-                }
-            }
-
-            ImmutableArray<ITypeSymbol> arguments = type.IsUnboundGenericType
-                ? type.TypeParameters.Cast<ITypeSymbol>().ToImmutableArray()
-                : type.TypeArguments;
-            foreach (ITypeSymbol argument in arguments)
-            {
-                yield return SourceTypeIdentity(argument, context);
-            }
-        }
-
-        // 计算嵌套源码类型参数在 CLR 类型参数列表中的位置。
-        private static int ReadSourceTypeParameterOrdinal(ITypeParameterSymbol parameter)
-        {
-            int offset = 0;
-            INamedTypeSymbol? containing = parameter.ContainingType?.ContainingType;
-            while (containing != null)
-            {
-                offset += containing.Arity;
-                containing = containing.ContainingType;
-            }
-
-            return offset + parameter.Ordinal;
-        }
-
-        // 生成源码类型定义使用的元数据全名。
-        private static string SourceMetadataTypeName(INamedTypeSymbol type)
-        {
-            if (type.ContainingType != null)
-            {
-                return $"{SourceMetadataTypeName(type.ContainingType)}+{type.MetadataName}";
-            }
-
-            string namespaceName = type.ContainingNamespace.IsGlobalNamespace
-                ? string.Empty
-                : type.ContainingNamespace.ToDisplayString();
-
-            return namespaceName.Length == 0 ? type.MetadataName : $"{namespaceName}.{type.MetadataName}";
-        }
-
-        // 建立源码命名类型定义的跨文件身份。
-        private static string SourceNamedTypeDefinitionId(
-            INamedTypeSymbol type,
-            SourceCatalogContext context)
-        {
-            return NamedTypeId(
-                CanonicalAssemblyName(context.AssemblyNames, type.ContainingAssembly.Identity.Name),
-                SourceMetadataTypeName(type));
         }
 
         // 生成用户可读的源码类型名称。
@@ -807,28 +542,6 @@ namespace SetterChecker.Core
                 "System.Runtime.CompilerServices.CompilerGeneratedAttribute");
         }
 
-        // 把 Roslyn 函数种类映射为项目枚举。
-        private static CatalogMethodKind GetSourceMethodKind(IMethodSymbol method)
-        {
-            return method.MethodKind switch
-            {
-                MethodKind.Ordinary or MethodKind.ExplicitInterfaceImplementation =>
-                    CatalogMethodKind.Ordinary,
-                MethodKind.Constructor => CatalogMethodKind.Constructor,
-                MethodKind.StaticConstructor => CatalogMethodKind.StaticConstructor,
-                MethodKind.PropertyGet => CatalogMethodKind.PropertyGetter,
-                MethodKind.PropertySet => CatalogMethodKind.PropertySetter,
-                MethodKind.EventAdd => CatalogMethodKind.EventAdder,
-                MethodKind.EventRemove => CatalogMethodKind.EventRemover,
-                MethodKind.UserDefinedOperator => CatalogMethodKind.Operator,
-                MethodKind.Conversion => CatalogMethodKind.Conversion,
-                MethodKind.LocalFunction => CatalogMethodKind.LocalFunction,
-                MethodKind.AnonymousFunction => CatalogMethodKind.AnonymousFunction,
-                MethodKind.Destructor => CatalogMethodKind.Destructor,
-                _ => CatalogMethodKind.Other,
-            };
-        }
-
         // 读取源码特性的完整类型名和显式参数。
         private static IReadOnlyList<AttributeEntry> ReadSourceAttributes(
             ImmutableArray<AttributeData> attributes)
@@ -845,37 +558,8 @@ namespace SetterChecker.Core
                 .ToArray();
         }
 
-        // 把常见 CLR 基础类型统一为不带程序集的稳定名称。
-        private static bool TryReadPrimitive(SpecialType type, out string? name)
-        {
-            name = type switch
-            {
-                SpecialType.System_Void => "System.Void",
-                SpecialType.System_Boolean => "System.Boolean",
-                SpecialType.System_Char => "System.Char",
-                SpecialType.System_SByte => "System.SByte",
-                SpecialType.System_Byte => "System.Byte",
-                SpecialType.System_Int16 => "System.Int16",
-                SpecialType.System_UInt16 => "System.UInt16",
-                SpecialType.System_Int32 => "System.Int32",
-                SpecialType.System_UInt32 => "System.UInt32",
-                SpecialType.System_Int64 => "System.Int64",
-                SpecialType.System_UInt64 => "System.UInt64",
-                SpecialType.System_Decimal => "System.Decimal",
-                SpecialType.System_Single => "System.Single",
-                SpecialType.System_Double => "System.Double",
-                SpecialType.System_String => "System.String",
-                SpecialType.System_Object => "System.Object",
-                SpecialType.System_IntPtr => "System.IntPtr",
-                SpecialType.System_UIntPtr => "System.UIntPtr",
-                _ => null,
-            };
-
-            return name != null;
-        }
-
         // 生成边界明确的程序集加类型身份。
-        private static string NamedTypeId(string assemblyName, string metadataName)
+        internal static string NamedTypeId(string assemblyName, string metadataName)
         {
             return $"A{assemblyName.Length}:{assemblyName}T{metadataName.Length}:{metadataName}";
         }
@@ -883,14 +567,28 @@ namespace SetterChecker.Core
         /// <summary>保存读取源码函数时需要的编译上下文。</summary>
         internal sealed record SourceCatalogContext(
             SourceAssemblyMaterial Material,
-            IReadOnlySet<string> ReportablePaths,
-            IReadOnlyDictionary<string, string> AssemblyNames);
+            IReadOnlySet<string> DeclaredPaths,
+            IReadOnlySet<string> ReportablePaths);
 
-        /// <summary>保存一个源码类型或语法树读取任务。</summary>
-        private sealed record SourceMethodWorkItem(
+        /// <summary>保存一个外部文件或源码内存 PE 目录读取任务。</summary>
+        private sealed record CatalogAssemblyWorkItem(
+            string Path,
+            SourceCatalogContext? SourceContext);
+
+        /// <summary>保存一个源码程序集的 Cecil 类型和命名类型函数。</summary>
+        private sealed record SourceManagedPart(
             SourceCatalogContext Context,
-            INamedTypeSymbol? Type,
-            SyntaxTree? Tree);
+            ManagedAssemblyPart Part,
+            IReadOnlyList<MethodEntry> Methods,
+            IReadOnlyDictionary<string, INamedTypeSymbol> SourceTypesByDocumentationId);
+
+        /// <summary>保存一个用户源码类型与它的实际元数据。</summary>
+        private sealed record SourceTypeWorkItem(
+            SourceCatalogContext Context,
+            INamedTypeSymbol Symbol,
+            TypeEntry SourceType,
+            TypeEntry MetadataType,
+            IReadOnlyList<MethodEntry> MetadataMethods);
 
         // 使用 Cecil 读取一个真实托管文件中的全部类型和转交声明。
         internal static ManagedAssemblyPart ReadManagedTypes(
@@ -899,36 +597,47 @@ namespace SetterChecker.Core
         {
             string fullPath = Path.GetFullPath(path);
             using Cecil.ModuleDefinition module = OpenModule(fullPath);
+
+            return ReadManagedTypes(fullPath, module, assemblyNames);
+        }
+
+        // 从当前源码的内存 PE 读取类型和转交声明。
+        internal static ManagedAssemblyPart ReadManagedTypes(
+            string path,
+            byte[] image,
+            IReadOnlyDictionary<string, string> assemblyNames)
+        {
+            string fullPath = Path.GetFullPath(path);
+            using Cecil.ModuleDefinition module = OpenModule(image);
+
+            return ReadManagedTypes(fullPath, module, assemblyNames);
+        }
+
+        // 把已打开模块转换为统一类型目录。
+        private static ManagedAssemblyPart ReadManagedTypes(
+            string fullPath,
+            Cecil.ModuleDefinition module,
+            IReadOnlyDictionary<string, string> assemblyNames)
+        {
             string assemblyName = CanonicalAssemblyName(assemblyNames, module.Assembly.Name.Name);
-            TypeEntry[] types = module.Types
-                .SelectMany(EnumerateManagedTypes)
+            TypeEntry[] types = module.GetAllTypes()
                 .Where(type => type.Name != "<Module>" || !string.IsNullOrEmpty(type.Namespace))
                 .Select(type => CreateManagedType(type, fullPath, assemblyName, assemblyNames))
                 .ToArray();
             ForwardedTypeEntry[] forwarders = module.ExportedTypes
-                .Where(type => type.IsForwarder)
-                .Select(type => CreateForwarder(type, assemblyName, assemblyNames))
+                .Where(type => ReadForwardedRoot(type).IsForwarder)
+                .Select(type => CreateForwarder(
+                    type,
+                    fullPath,
+                    assemblyName,
+                    module.Assembly.Name.FullName,
+                    assemblyNames))
                 .ToArray();
 
             return new ManagedAssemblyPart(
                 fullPath,
                 types,
                 forwarders);
-        }
-
-        // 递归列出一个 Cecil 类型及其内部类型。
-        private static IEnumerable<Cecil.TypeDefinition> EnumerateManagedTypes(
-            Cecil.TypeDefinition type)
-        {
-            yield return type;
-
-            foreach (Cecil.TypeDefinition nested in type.NestedTypes)
-            {
-                foreach (Cecil.TypeDefinition item in EnumerateManagedTypes(nested))
-                {
-                    yield return item;
-                }
-            }
         }
 
         // 把一个 Cecil 类型定义转换为统一类型记录。
@@ -946,6 +655,7 @@ namespace SetterChecker.Core
                 logicalId,
                 Array.Empty<string>(),
                 assemblyName,
+                type.Module.Assembly.Name.FullName,
                 RemoveGenericArity(type.Name),
                 DisplayManagedTypeDefinition(type),
                 type.BaseType == null ? null : CreateManagedRelation(type.BaseType, assemblyNames),
@@ -956,9 +666,29 @@ namespace SetterChecker.Core
                     .ToArray(),
                 Array.Empty<AttributeEntry>(),
                 type.IsInterface,
+                type.IsAbstract,
                 null,
                 path,
-                type.MetadataToken.ToInt32());
+                type.MetadataToken.ToInt32())
+            {
+                DocumentationId = DocCommentId.GetDocCommentId(type),
+                IsValueType = type.IsValueType,
+                IsNullableValueType = type.Namespace == "System" && type.Name == "Nullable`1"
+                    && (type.Module.TypeSystem.CoreLibrary is Cecil.ModuleDefinition coreModule
+                        && coreModule == type.Module
+                        || type.Module.TypeSystem.CoreLibrary is Cecil.AssemblyNameReference coreLibrary
+                        && coreLibrary.FullName == type.Module.Assembly.Name.FullName),
+                GenericParameters = type.GenericParameters.Select(parameter =>
+                    new GenericParameterRule(
+                        parameter.IsCovariant,
+                        parameter.IsContravariant,
+                        parameter.HasReferenceTypeConstraint,
+                        parameter.HasNotNullableValueTypeConstraint,
+                        parameter.HasDefaultConstructorConstraint,
+                        parameter.Constraints.Select(constraint => ManagedTypeIdentity(
+                            constraint.ConstraintType,
+                            assemblyNames)).ToArray())).ToArray(),
+            };
         }
 
         // 把一个 Cecil 基类或接口保存为结构化关系。
@@ -970,19 +700,28 @@ namespace SetterChecker.Core
             TypeIdentityTemplate[] arguments = ReadManagedTypeArguments(type, assemblyNames).ToArray();
 
             return new TypeRelationEntry(
-                ManagedNamedTypeDefinitionId(ManagedNamedTypeElement(type), assemblyNames),
+                ManagedNamedTypeDefinitionId(type.GetElementType(), assemblyNames),
                 identity.Text,
-                ReadManagedAssemblyFullName(ManagedNamedTypeElement(type)),
-                arguments.Select(argument => argument.Text).ToArray());
+                ReadManagedAssemblyFullName(type.GetElementType()),
+                arguments.Select(argument => argument.Text).ToArray())
+            {
+                FullName = type.GetElementType().FullName,
+                ReferenceMetadataToken = type.MetadataToken.ToInt32(),
+                KnownMetadataToken = type.GetElementType() is Cecil.TypeDefinition definition
+                    ? definition.MetadataToken.ToInt32()
+                    : null,
+            };
         }
 
         // 把 Cecil 类型转交声明转换为目标类型别名。
         private static ForwardedTypeEntry CreateForwarder(
             Cecil.ExportedType type,
+            string path,
             string facadeAssemblyName,
+            string facadeAssemblyIdentity,
             IReadOnlyDictionary<string, string> assemblyNames)
         {
-            Cecil.IMetadataScope scope = ReadForwardedScope(type);
+            Cecil.IMetadataScope scope = ReadForwardedRoot(type).Scope;
             if (scope is not Cecil.AssemblyNameReference assembly)
             {
                 throw new AnalysisException($"类型转交目标不是程序集：{type.FullName}");
@@ -990,13 +729,16 @@ namespace SetterChecker.Core
 
             return new ForwardedTypeEntry(
                 NamedTypeId(facadeAssemblyName, NormalizeManagedFullName(type.FullName)),
+                facadeAssemblyIdentity,
                 NamedTypeId(
                     CanonicalAssemblyName(assemblyNames, assembly.Name),
-                    NormalizeManagedFullName(type.FullName)));
+                    NormalizeManagedFullName(type.FullName)),
+                assembly.FullName,
+                path);
         }
 
-        // 沿嵌套转交类型找到最终程序集范围。
-        private static Cecil.IMetadataScope ReadForwardedScope(Cecil.ExportedType type)
+        // 沿嵌套转交记录找到持有转交标记和程序集范围的最外层类型。
+        private static Cecil.ExportedType ReadForwardedRoot(Cecil.ExportedType type)
         {
             Cecil.ExportedType root = type;
             while (root.DeclaringType != null)
@@ -1004,50 +746,179 @@ namespace SetterChecker.Core
                 root = root.DeclaringType;
             }
 
-            return root.Scope;
+            return root;
         }
 
         // 把参考程序集身份附加到唯一真实类型。
-        private static TypeEntry[] AttachForwardedAliases(
+        internal static TypeEntry[] AttachForwardedAliases(
             IReadOnlyList<TypeEntry> types,
             IReadOnlyList<ForwardedTypeEntry> forwarders)
         {
-            IReadOnlyDictionary<string, IReadOnlyList<string>> aliasesByTarget = forwarders
-                .GroupBy(item => item.TargetTypeId, StringComparer.Ordinal)
+            IReadOnlyDictionary<ForwardedTypeKey, TypeEntry> targets =
+                ResolveForwardedTargets(types, forwarders);
+            IReadOnlyDictionary<string, string[]> aliasesByTypeId = targets
+                .GroupBy(item => item.Value.Id, StringComparer.Ordinal)
                 .ToDictionary(
                     group => group.Key,
-                    group => (IReadOnlyList<string>)group.Select(item => item.AliasTypeId)
+                    group => group.Select(item => item.Key.TypeId)
                         .Distinct(StringComparer.Ordinal)
                         .Order(StringComparer.Ordinal)
                         .ToArray(),
                     StringComparer.Ordinal);
-            HashSet<string> knownTargets = types.Select(type => type.LogicalId).ToHashSet(StringComparer.Ordinal);
-            ForwardedTypeEntry? missing = forwarders.FirstOrDefault(item => !knownTargets.Contains(item.TargetTypeId));
-            if (missing != null)
-            {
-                throw new AnalysisException(
-                    $"类型转交目标没有进入材料总表：{missing.AliasTypeId} => {missing.TargetTypeId}");
-            }
 
-            IGrouping<string, ForwardedTypeEntry>? ambiguous = forwarders
-                .GroupBy(item => item.AliasTypeId, StringComparer.Ordinal)
-                .FirstOrDefault(group => group.Select(item => item.TargetTypeId)
-                    .Distinct(StringComparer.Ordinal)
-                    .Skip(1)
-                    .Any());
-            if (ambiguous != null)
-            {
-                throw new AnalysisException(
-                    $"参考类型身份对应多个真实类型：{ambiguous.Key} => "
-                    + string.Join("; ", ambiguous.Select(item => item.TargetTypeId)));
-            }
+            return types.Select(type =>
+                {
+                    string[] aliases = aliasesByTypeId.GetValueOrDefault(type.Id)
+                        ?? Array.Empty<string>();
 
-            return types.Select(type => aliasesByTarget.TryGetValue(
-                        type.LogicalId,
-                        out IReadOnlyList<string>? aliases)
-                    ? type with { AliasIds = aliases }
-                    : type)
+                    return aliases.Length == 0 ? type : type with
+                    {
+                        AliasIds = type.AliasIds.Concat(aliases)
+                            .Distinct(StringComparer.Ordinal)
+                            .Order(StringComparer.Ordinal)
+                            .ToArray(),
+                    };
+                })
                 .ToArray();
+        }
+
+        // 按每层完整程序集身份将转交链压到最终类型。
+        internal static IReadOnlyDictionary<ForwardedTypeKey, TypeEntry> ResolveForwardedTargets(
+            IReadOnlyList<TypeEntry> types,
+            IReadOnlyList<ForwardedTypeEntry> forwarders)
+        {
+            IReadOnlyDictionary<ForwardedTypeKey, TypeEntry[]> definitions = types
+                .GroupBy(type => CreateForwardedTypeKey(type.LogicalId, type.AssemblyIdentity))
+                .ToDictionary(group => group.Key, group => group.ToArray());
+            IReadOnlyDictionary<ForwardedTypeKey, ForwardedTypeEntry[]> forwardersByAlias = forwarders
+                .GroupBy(forwarder => CreateForwardedTypeKey(
+                    forwarder.AliasTypeId,
+                    forwarder.AliasAssemblyIdentity))
+                .ToDictionary(
+                    group => group.Key,
+                    group => group.ToArray());
+            IReadOnlyDictionary<ForwardedTypeKey, ForwardedTypeKey[]> nextByAlias =
+                forwardersByAlias.ToDictionary(
+                    item => item.Key,
+                    item => item.Value.Select(forwarder => CreateForwardedTypeKey(
+                        forwarder.TargetTypeId,
+                        forwarder.TargetAssemblyIdentity))
+                    .Distinct()
+                    .OrderBy(target => target.TypeId, StringComparer.Ordinal)
+                    .ThenBy(target => target.AssemblyIdentity, StringComparer.Ordinal)
+                    .ToArray());
+
+            Dictionary<ForwardedTypeKey, TypeEntry?> resolved = new();
+            foreach (ForwardedTypeKey alias in nextByAlias.Keys)
+            {
+                ResolveForwardedTarget(
+                    alias,
+                    definitions,
+                    forwardersByAlias,
+                    nextByAlias,
+                    resolved,
+                    new HashSet<ForwardedTypeKey>());
+            }
+
+            return resolved.Where(item => nextByAlias.ContainsKey(item.Key) && item.Value != null)
+                .ToDictionary(item => item.Key, item => item.Value!);
+        }
+
+        // 递归找到一条转交链的唯一最终定义。
+        private static TypeEntry? ResolveForwardedTarget(
+            ForwardedTypeKey alias,
+            IReadOnlyDictionary<ForwardedTypeKey, TypeEntry[]> definitions,
+            IReadOnlyDictionary<ForwardedTypeKey, ForwardedTypeEntry[]> forwardersByAlias,
+            IReadOnlyDictionary<ForwardedTypeKey, ForwardedTypeKey[]> nextByAlias,
+            IDictionary<ForwardedTypeKey, TypeEntry?> resolved,
+            ISet<ForwardedTypeKey> visiting)
+        {
+            if (resolved.TryGetValue(alias, out TypeEntry? known))
+            {
+                return known;
+            }
+
+            if (!visiting.Add(alias))
+            {
+                throw new AnalysisException(
+                    $"类型转交形成循环：{alias.TypeId} @ {alias.AssemblyIdentity}");
+            }
+
+            definitions.TryGetValue(alias, out TypeEntry[]? declaredTypes);
+            bool hasForwarder = nextByAlias.TryGetValue(alias, out ForwardedTypeKey[]? targets);
+            bool sameFileNameOverride = declaredTypes?.Length == 1
+                && hasForwarder
+                && forwardersByAlias[alias].All(forwarder => string.Equals(
+                    forwarder.AssemblyPath,
+                    declaredTypes[0].AssemblyPath,
+                    StringComparison.OrdinalIgnoreCase));
+            if (declaredTypes?.Length > 0 && hasForwarder && !sameFileNameOverride)
+            {
+                throw new AnalysisException(
+                    $"类型身份同时存在定义和转交：{alias.TypeId} @ {alias.AssemblyIdentity}");
+            }
+
+            TypeEntry? result;
+            if (declaredTypes?.Length > 1)
+            {
+                throw new AnalysisException(
+                    $"类型转交目标不唯一：{alias.TypeId} @ {alias.AssemblyIdentity}");
+            }
+            else if (declaredTypes?.Length == 1 && !sameFileNameOverride)
+            {
+                result = declaredTypes[0];
+            }
+            else if (hasForwarder)
+            {
+                TypeEntry?[] targetDefinitions = targets!.Select(target => ResolveForwardedTarget(
+                        target,
+                        definitions,
+                        forwardersByAlias,
+                        nextByAlias,
+                        resolved,
+                        visiting))
+                    .ToArray();
+                if (targetDefinitions.Any(target => target == null))
+                {
+                    result = null;
+                }
+                else
+                {
+                    TypeEntry[] finalDefinitions = targetDefinitions.Cast<TypeEntry>()
+                        .DistinctBy(type => type.Id, StringComparer.Ordinal)
+                        .ToArray();
+                    if (finalDefinitions.Length != 1)
+                    {
+                        throw new AnalysisException(
+                            $"参考类型身份对应多个真实类型：{alias.TypeId} @ "
+                                + $"{alias.AssemblyIdentity} => "
+                                + string.Join("; ", finalDefinitions.Select(type => type.Id)));
+                    }
+
+                    result = finalDefinitions[0];
+                }
+            }
+            else
+            {
+                result = null;
+            }
+
+            visiting.Remove(alias);
+            resolved[alias] = result;
+            return result;
+        }
+
+        // 把类型身份与完整程序集身份组合成转交节点。
+        internal static ForwardedTypeKey CreateForwardedTypeKey(
+            string typeId,
+            string assemblyIdentity)
+        {
+            System.Reflection.AssemblyName identity = new(assemblyIdentity);
+            string key = $"{identity.Name?.ToUpperInvariant()}|{identity.Version}|"
+                + $"{(identity.CultureName ?? string.Empty).ToUpperInvariant()}|"
+                + Convert.ToHexString(identity.GetPublicKeyToken() ?? Array.Empty<byte>());
+
+            return new ForwardedTypeKey(typeId, key);
         }
 
         // 读取一个 Cecil 类型直接声明的全部函数。
@@ -1071,6 +942,18 @@ namespace SetterChecker.Core
                     type,
                     accessorKinds.GetValueOrDefault(method, ReadManagedOrdinaryKind(method)),
                     assemblyNames))
+                .ToArray();
+        }
+
+        // 用一次内存 PE 读取建立多个源码命名类型的函数声明。
+        private static IReadOnlyList<MethodEntry> ReadManagedMethods(
+            byte[] image,
+            IReadOnlyList<TypeEntry> types,
+            IReadOnlyDictionary<string, string> assemblyNames)
+        {
+            using Cecil.ModuleDefinition module = OpenModule(image);
+
+            return types.SelectMany(type => ReadManagedTypeMethods(type, assemblyNames, module))
                 .ToArray();
         }
 
@@ -1176,7 +1059,10 @@ namespace SetterChecker.Core
                 method.GenericParameters.Count,
                 null,
                 type.AssemblyPath,
-                method.MetadataToken.ToInt32());
+                method.MetadataToken.ToInt32())
+            {
+                DocumentationId = DocCommentId.GetDocCommentId(method),
+            };
         }
 
         // 把一个 Cecil 参数转换为统一参数记录。
@@ -1223,7 +1109,7 @@ namespace SetterChecker.Core
                 assemblyNames).ToArray();
             MethodIdentityTemplate definition = new(
                 TypeIdentityTemplate.NamedType(ManagedNamedTypeDefinitionId(
-                    ManagedNamedTypeElement(element.DeclaringType),
+                    element.DeclaringType.GetElementType(),
                     assemblyNames)),
                 element.Name,
                 element.GenericParameters.Count,
@@ -1237,27 +1123,29 @@ namespace SetterChecker.Core
         }
 
         // 建立 Cecil 函数引用所指向的开放声明身份。
-        private static MethodIdentityTemplate ManagedMethodDefinitionIdentity(
+        internal static MethodIdentityTemplate ManagedMethodDefinitionIdentity(
             Cecil.MethodReference method,
-            IReadOnlyDictionary<string, string> assemblyNames)
+            IReadOnlyDictionary<string, string> assemblyNames,
+            Func<Cecil.TypeReference, string>? namedTypeId = null)
         {
             Cecil.MethodReference element = method.GetElementMethod();
 
             return new MethodIdentityTemplate(
-                TypeIdentityTemplate.NamedType(ManagedNamedTypeDefinitionId(
-                    ManagedNamedTypeElement(element.DeclaringType),
-                    assemblyNames)),
+                TypeIdentityTemplate.NamedType(namedTypeId == null
+                    ? ManagedNamedTypeDefinitionId(element.DeclaringType.GetElementType(), assemblyNames)
+                    : namedTypeId(element.DeclaringType.GetElementType())),
                 element.Name,
                 element.GenericParameters.Count,
                 element.Parameters.Select(parameter =>
-                    ManagedTypeIdentity(parameter.ParameterType, assemblyNames)).ToArray(),
-                ManagedTypeIdentity(element.ReturnType, assemblyNames));
+                    ManagedTypeIdentity(parameter.ParameterType, assemblyNames, namedTypeId)).ToArray(),
+                ManagedTypeIdentity(element.ReturnType, assemblyNames, namedTypeId));
         }
 
         // 建立 Cecil 类型定义或构造类型的确定身份。
         internal static TypeIdentityTemplate ManagedTypeIdentity(
             Cecil.TypeReference type,
-            IReadOnlyDictionary<string, string> assemblyNames)
+            IReadOnlyDictionary<string, string> assemblyNames,
+            Func<Cecil.TypeReference, string>? namedTypeId = null)
         {
             if (TryReadPrimitive(type.MetadataType, out string? primitive))
             {
@@ -1271,30 +1159,33 @@ namespace SetterChecker.Core
                 Cecil.GenericParameter parameter =>
                     TypeIdentityTemplate.TypeParameter(parameter.Position),
                 Cecil.GenericInstanceType instance => TypeIdentityTemplate.NamedType(
-                        ManagedNamedTypeDefinitionId(instance.ElementType, assemblyNames))
+                        namedTypeId == null ? ManagedNamedTypeDefinitionId(instance.ElementType, assemblyNames)
+                            : namedTypeId(instance.ElementType))
                     .Append($"<{string.Join(',', instance.GenericArguments.Select(argument =>
-                        ManagedTypeIdentity(argument, assemblyNames).Text))}>"),
-                Cecil.ArrayType array => ManagedTypeIdentity(array.ElementType, assemblyNames)
+                        ManagedTypeIdentity(argument, assemblyNames, namedTypeId).Text))}>"),
+                Cecil.ArrayType array => ManagedTypeIdentity(array.ElementType, assemblyNames, namedTypeId)
                     .Append($"[{new string(',', array.Rank - 1)}]"),
-                Cecil.ByReferenceType reference => ManagedTypeIdentity(reference.ElementType, assemblyNames)
+                Cecil.ByReferenceType reference => ManagedTypeIdentity(reference.ElementType, assemblyNames, namedTypeId)
                     .Append("&"),
-                Cecil.PointerType pointer => ManagedTypeIdentity(pointer.ElementType, assemblyNames)
+                Cecil.PointerType pointer => ManagedTypeIdentity(pointer.ElementType, assemblyNames, namedTypeId)
                     .Append("*"),
-                Cecil.PinnedType pinned => ManagedTypeIdentity(pinned.ElementType, assemblyNames),
-                Cecil.OptionalModifierType optional => ManagedTypeIdentity(optional.ElementType, assemblyNames),
-                Cecil.RequiredModifierType required => ManagedTypeIdentity(required.ElementType, assemblyNames),
+                Cecil.PinnedType pinned => ManagedTypeIdentity(pinned.ElementType, assemblyNames, namedTypeId),
+                Cecil.OptionalModifierType optional => ManagedTypeIdentity(optional.ElementType, assemblyNames, namedTypeId),
+                Cecil.RequiredModifierType required => ManagedTypeIdentity(required.ElementType, assemblyNames, namedTypeId),
                 Cecil.FunctionPointerType function => TypeIdentityTemplate.Literal(
                     DisplayManagedType(function)),
-                Cecil.SentinelType sentinel => ManagedTypeIdentity(sentinel.ElementType, assemblyNames)
+                Cecil.SentinelType sentinel => ManagedTypeIdentity(sentinel.ElementType, assemblyNames, namedTypeId)
                     .Append("..."),
-                _ => TypeIdentityTemplate.NamedType(ManagedNamedTypeDefinitionId(type, assemblyNames)),
+                _ => TypeIdentityTemplate.NamedType(namedTypeId == null
+                    ? ManagedNamedTypeDefinitionId(type, assemblyNames) : namedTypeId(type)),
             };
         }
 
         // 读取 Cecil 构造类型的全部实际类型参数。
         internal static IEnumerable<TypeIdentityTemplate> ReadManagedTypeArguments(
             Cecil.TypeReference type,
-            IReadOnlyDictionary<string, string> assemblyNames)
+            IReadOnlyDictionary<string, string> assemblyNames,
+            Func<Cecil.TypeReference, string>? namedTypeId = null)
         {
             if (type is not Cecil.GenericInstanceType instance)
             {
@@ -1302,19 +1193,7 @@ namespace SetterChecker.Core
             }
 
             return instance.GenericArguments.Select(argument =>
-                ManagedTypeIdentity(argument, assemblyNames)).ToArray();
-        }
-
-        // 取出 Cecil 类型规格背后的命名类型定义。
-        internal static Cecil.TypeReference ManagedNamedTypeElement(Cecil.TypeReference type)
-        {
-            Cecil.TypeReference current = type;
-            while (current is Cecil.TypeSpecification specification)
-            {
-                current = specification.ElementType;
-            }
-
-            return current;
+                ManagedTypeIdentity(argument, assemblyNames, namedTypeId)).ToArray();
         }
 
         // 建立 Cecil 命名类型定义的跨文件身份。
@@ -1322,7 +1201,7 @@ namespace SetterChecker.Core
             Cecil.TypeReference type,
             IReadOnlyDictionary<string, string> assemblyNames)
         {
-            Cecil.TypeReference element = ManagedNamedTypeElement(type);
+            Cecil.TypeReference element = type.GetElementType();
             string assemblyName = CanonicalAssemblyName(
                 assemblyNames,
                 ReadManagedAssemblyName(element));
@@ -1369,7 +1248,7 @@ namespace SetterChecker.Core
         // 生成 Cecil 类型的元数据全名。
         private static string ManagedMetadataTypeName(Cecil.TypeReference type)
         {
-            return NormalizeManagedFullName(ManagedNamedTypeElement(type).FullName);
+            return NormalizeManagedFullName(type.GetElementType().FullName);
         }
 
         // 把 Cecil 的嵌套类型分隔符统一成 CLR 身份分隔符。
@@ -1477,7 +1356,17 @@ namespace SetterChecker.Core
             IReadOnlyList<ForwardedTypeEntry> Forwarders);
 
         /// <summary>保存一个参考类型身份到真实类型身份的转交。</summary>
-        internal sealed record ForwardedTypeEntry(string AliasTypeId, string TargetTypeId);
+        internal sealed record ForwardedTypeEntry(
+            string AliasTypeId,
+            string AliasAssemblyIdentity,
+            string TargetTypeId,
+            string TargetAssemblyIdentity,
+            string AssemblyPath);
+
+        /// <summary>保存转交链中的类型身份和完整程序集身份。</summary>
+        internal readonly record struct ForwardedTypeKey(
+            string TypeId,
+            string AssemblyIdentity);
     }
 
     /// <summary>
@@ -1511,10 +1400,13 @@ namespace SetterChecker.Core
             return new TypeIdentityTemplate(this.Text + suffix);
         }
 
-        // 用构造类型实参替换 CLR 类型泛型参数。
-        internal TypeIdentityTemplate Substitute(IReadOnlyList<TypeIdentityTemplate> arguments)
+        // 分别用当前类和函数的实参替换各自的泛型参数。
+        internal TypeIdentityTemplate Substitute(
+            IReadOnlyList<TypeIdentityTemplate> arguments,
+            IReadOnlyList<TypeIdentityTemplate>? methodArguments = null)
         {
-            if (arguments.Count == 0 || !this.Text.Contains('!'))
+            if ((arguments.Count == 0 && (methodArguments == null || methodArguments.Count == 0))
+                || !this.Text.Contains('!'))
             {
                 return this;
             }
@@ -1523,30 +1415,30 @@ namespace SetterChecker.Core
             for (int index = 0; index < this.Text.Length; index++)
             {
                 char current = this.Text[index];
-                if (current != '!'
-                    || index + 1 >= this.Text.Length
-                    || this.Text[index + 1] == '!'
-                    || (index > 0 && this.Text[index - 1] == '!')
-                    || !char.IsDigit(this.Text[index + 1]))
+                int start = index + 1;
+                bool methodParameter = start < this.Text.Length && this.Text[start] == '!';
+                start += methodParameter ? 1 : 0;
+                if (current != '!' || start >= this.Text.Length || !char.IsDigit(this.Text[start]))
                 {
                     result.Append(current);
                     continue;
                 }
 
-                int end = index + 1;
+                int end = start;
                 while (end < this.Text.Length && char.IsDigit(this.Text[end]))
                 {
                     end++;
                 }
 
-                int position = int.Parse(this.Text.AsSpan(index + 1, end - index - 1));
-                if (position >= arguments.Count)
+                int position = int.Parse(this.Text.AsSpan(start, end - start));
+                IReadOnlyList<TypeIdentityTemplate>? actualArguments = methodParameter ? methodArguments : arguments;
+                if (actualArguments == null || position >= actualArguments.Count)
                 {
                     result.Append(this.Text, index, end - index);
                 }
                 else
                 {
-                    result.Append(arguments[position].Text);
+                    result.Append(actualArguments[position].Text);
                 }
 
                 index = end - 1;
@@ -1604,7 +1496,19 @@ namespace SetterChecker.Core
         TypeIdentityTemplate DeclaringTypeDefinition,
         IReadOnlyList<TypeIdentityTemplate> DeclaringTypeArguments,
         string TargetAssemblyIdentity,
-        string? ReferringAssemblyPath);
+        string? ReferringAssemblyPath)
+    {
+        internal int ReferenceMetadataToken { get; init; }
+
+        internal string? KnownDeclaringTypeId { get; init; }
+
+        internal int? KnownMetadataToken { get; init; }
+    }
+
+    /// <summary>保存一个函数声明及其实际声明类型参数。</summary>
+    internal sealed record ResolvedMethodDefinition(
+        MethodEntry Method,
+        IReadOnlyList<TypeIdentityTemplate> DeclaringTypeArguments);
 
     /// <summary>保存字段引用的声明类型、名称和字段类型。</summary>
     internal sealed record ManagedFieldReferenceInfo(
@@ -1612,7 +1516,14 @@ namespace SetterChecker.Core
         string Name,
         TypeIdentityTemplate FieldType,
         TypeIdentityTemplate DeclaringTypeDefinition,
-        IReadOnlyList<TypeIdentityTemplate> DeclaringTypeArguments);
+        IReadOnlyList<TypeIdentityTemplate> DeclaringTypeArguments)
+    {
+        internal string? KnownDeclaringTypeId { get; init; }
+
+        internal string TargetAssemblyIdentity { get; init; } = string.Empty;
+
+        internal string? ReferringAssemblyPath { get; init; }
+    }
 
     /// <summary>保存类型引用的实际身份、定义身份和泛型实参。</summary>
     internal sealed record ManagedTypeReferenceInfo(
@@ -1620,7 +1531,10 @@ namespace SetterChecker.Core
         TypeIdentityTemplate Definition,
         IReadOnlyList<TypeIdentityTemplate> Arguments,
         string? TargetAssemblyIdentity,
-        string? ReferringAssemblyPath);
+        string? ReferringAssemblyPath)
+    {
+        internal string? KnownTypeId { get; init; }
+    }
 
     /// <summary>表示函数在源码或托管文件中的种类。</summary>
     public enum CatalogMethodKind
@@ -1688,7 +1602,26 @@ namespace SetterChecker.Core
         string DefinitionId,
         string TypeId,
         string AssemblyIdentity,
-        IReadOnlyList<string> TypeArguments);
+        IReadOnlyList<string> TypeArguments)
+    {
+        internal string FullName { get; init; } = string.Empty;
+
+        internal int ReferenceMetadataToken { get; init; }
+
+        internal int? KnownMetadataToken { get; init; }
+
+        internal IReadOnlyList<TypeIdentityTemplate> SignatureArguments { get; init; } =
+            Array.Empty<TypeIdentityTemplate>();
+    }
+
+    /// <summary>保存 CLR 类型参数的方差和构造约束。</summary>
+    internal sealed record GenericParameterRule(
+        bool IsCovariant,
+        bool IsContravariant,
+        bool RequiresReferenceType,
+        bool RequiresValueType,
+        bool RequiresDefaultConstructor,
+        IReadOnlyList<TypeIdentityTemplate> TypeConstraints);
 
     /// <summary>保存一个类型及其直接继承关系。</summary>
     public sealed record TypeEntry(
@@ -1696,15 +1629,27 @@ namespace SetterChecker.Core
         string LogicalId,
         IReadOnlyList<string> AliasIds,
         string AssemblyName,
+        string AssemblyIdentity,
         string Name,
         string FullName,
         TypeRelationEntry? BaseType,
         IReadOnlyList<TypeRelationEntry> Interfaces,
         IReadOnlyList<AttributeEntry> Attributes,
         bool IsInterface,
+        bool IsAbstract,
         INamedTypeSymbol? SourceSymbol,
         string? AssemblyPath,
-        int MetadataToken);
+        int MetadataToken)
+    {
+        internal string DocumentationId { get; init; } = string.Empty;
+
+        internal bool IsValueType { get; init; }
+
+        internal bool IsNullableValueType { get; init; }
+
+        internal IReadOnlyList<GenericParameterRule> GenericParameters { get; init; } =
+            Array.Empty<GenericParameterRule>();
+    }
 
     /// <summary>保存一个函数的稳定身份、来源、参数、标签和统计属性。</summary>
     public sealed record MethodEntry(
@@ -1732,7 +1677,10 @@ namespace SetterChecker.Core
         int GenericArity,
         IMethodSymbol? SourceSymbol,
         string? AssemblyPath,
-        int MetadataToken);
+        int MetadataToken)
+    {
+        internal string DocumentationId { get; init; } = string.Empty;
+    }
 
     /// <summary>保存一条当前材料中没有目标定义的继承或接口关系。</summary>
     public sealed record MissingTypeRelationEntry(
@@ -1749,30 +1697,46 @@ namespace SetterChecker.Core
     {
         private readonly ConcurrentDictionary<string, IReadOnlyList<MethodEntry>>
             m_managedMethodsByTypeId = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<(string Path, int Token), MethodIdentityTemplate>
+            m_resolvedSignatures = new();
+        private readonly ConcurrentDictionary<(string Path, int Token), IReadOnlyList<TypeIdentityTemplate>>
+            m_resolvedTypeArguments = new();
         private readonly Dictionary<string, Cecil.ModuleDefinition> m_modulesByPath =
             new(StringComparer.OrdinalIgnoreCase);
         private readonly object m_moduleLock = new();
         private readonly IReadOnlyDictionary<string, string> m_assemblyNames;
         private readonly IReadOnlyDictionary<string, IReadOnlyList<string>> m_lookupPathsByAssemblyName;
+        private readonly IReadOnlyDictionary<string, IReadOnlyList<string>>
+            m_unityFacadePathsByAssemblyName;
+        private readonly IReadOnlyDictionary<string, AssemblyRedirectTarget> m_assemblyRedirects;
         private readonly Dictionary<string, MethodCatalog.ManagedAssemblyPart>
             m_loadedPartsByPath = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> m_completedAssemblyPaths =
+            new(StringComparer.OrdinalIgnoreCase);
         private readonly object m_loadedTypeLock = new();
         private TypeEntry[] m_types;
         private IReadOnlyDictionary<string, TypeEntry> m_typesById;
+        private IReadOnlyDictionary<string, TypeEntry> m_typesByManagedLocation;
         private IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> m_typesByLogicalId;
+        private IReadOnlyDictionary<MethodCatalog.ForwardedTypeKey, TypeEntry> m_forwardedTargets;
+        private IReadOnlySet<MethodCatalog.ForwardedTypeKey> m_forwardedAliases;
         private IReadOnlyList<MissingTypeRelationEntry> m_missingTypeRelations;
         private IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> m_derivedTypesByBaseId;
         private IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> m_implementingTypesByInterfaceId;
         private readonly IReadOnlyDictionary<string, MethodCatalog.SourceCatalogContext>
             m_sourceContextsByAssembly;
+        private readonly IReadOnlyDictionary<string, byte[]> m_sourceImagesByPath;
 
         // 保存排好顺序的函数、类型和关系索引。
         internal MethodCatalogResult(
             IReadOnlyList<MethodEntry> methods,
             IReadOnlyList<TypeEntry> types,
+            IReadOnlyList<MethodCatalog.ManagedAssemblyPart> managedParts,
             IReadOnlyList<MethodCatalog.SourceCatalogContext> sourceContexts,
             IReadOnlyDictionary<string, string> assemblyNames,
             IReadOnlyList<string> assemblyLookupPaths,
+            IReadOnlyList<string> unityRuntimeFacadePaths,
+            IReadOnlyDictionary<string, string> assemblyRedirects,
             System.Diagnostics.Stopwatch stopwatch,
             int jobs)
         {
@@ -1788,52 +1752,146 @@ namespace SetterChecker.Core
                         .Order(StringComparer.OrdinalIgnoreCase)
                         .ToArray(),
                     StringComparer.OrdinalIgnoreCase);
+            this.m_unityFacadePathsByAssemblyName = unityRuntimeFacadePaths
+                .GroupBy(
+                    path => System.Reflection.AssemblyName.GetAssemblyName(path).Name!,
+                    StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => (IReadOnlyList<string>)group
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .Order(StringComparer.OrdinalIgnoreCase)
+                        .ToArray(),
+                    StringComparer.OrdinalIgnoreCase);
+            this.m_assemblyRedirects = assemblyRedirects.ToDictionary(
+                pair => pair.Key,
+                pair =>
+                {
+                    string path = Path.GetFullPath(pair.Value);
+
+                    return new AssemblyRedirectTarget(
+                        System.Reflection.AssemblyName.GetAssemblyName(path),
+                        path);
+                },
+                StringComparer.OrdinalIgnoreCase);
             this.m_sourceContextsByAssembly = sourceContexts.ToDictionary(
                 context => context.Material.Name,
-                StringComparer.Ordinal);
-            this.Methods = methods;
+                StringComparer.OrdinalIgnoreCase);
+            this.m_sourceImagesByPath = sourceContexts.ToDictionary(
+                context => Path.GetFullPath(context.Material.AssemblyPath),
+                context => context.Material.AssemblyImage,
+                StringComparer.OrdinalIgnoreCase);
+            foreach (MethodCatalog.ManagedAssemblyPart part in managedParts)
+            {
+                this.m_loadedPartsByPath.Add(part.Path, part);
+                this.m_completedAssemblyPaths.Add(part.Path);
+            }
+
             this.m_types = types.ToArray();
-            IReadOnlyDictionary<string, MethodEntry> methodsById = null!;
+            this.m_forwardedTargets = MethodCatalog.ResolveForwardedTargets(
+                types,
+                managedParts.SelectMany(part => part.Forwarders).ToArray());
+            this.m_forwardedAliases = managedParts.SelectMany(part => part.Forwarders)
+                .Select(forwarder => MethodCatalog.CreateForwardedTypeKey(
+                    forwarder.AliasTypeId,
+                    forwarder.AliasAssemblyIdentity))
+                .ToHashSet();
             IReadOnlyDictionary<string, TypeEntry> typesById = null!;
-            IReadOnlyDictionary<string, IReadOnlyList<MethodEntry>> methodsByName = null!;
-            IReadOnlyDictionary<string, IReadOnlyList<MethodEntry>> methodsByLogicalId = null!;
             IReadOnlyDictionary<string, IReadOnlyList<MethodEntry>> methodsByTypeId = null!;
             IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> typesByLogicalId = null!;
             ParallelOptions options = new() { MaxDegreeOfParallelism = jobs };
 
             Parallel.Invoke(
                 options,
-                () => methodsById = methods.ToDictionary(method => method.Id, StringComparer.Ordinal),
                 () => typesById = types.ToDictionary(type => type.Id, StringComparer.Ordinal),
-                () => methodsByName = Index(methods, method => method.Name, method => method.Id),
-                () => methodsByLogicalId = Index(
-                    methods,
-                    method => method.LogicalId,
-                    method => method.Id),
                 () => methodsByTypeId = Index(methods, method => method.TypeId, method => method.Id),
                 () => typesByLogicalId = IndexMany(
                     types,
                     type => type.AliasIds.Prepend(type.LogicalId),
                     type => type.Id));
 
-            this.MethodsById = methodsById;
             this.m_typesById = typesById;
-            this.MethodsByName = methodsByName;
-            this.MethodsByLogicalId = methodsByLogicalId;
+            this.m_typesByManagedLocation = IndexManagedTypeLocations(types);
             this.MethodsByTypeId = methodsByTypeId;
             this.m_typesByLogicalId = typesByLogicalId;
             this.m_missingTypeRelations = ReadMissingTypeRelations(types, typesByLogicalId);
             this.m_derivedTypesByBaseId = IndexMany(
                 types.Where(type => type.BaseType != null),
-                type => ResolveDefinitionIds(type.BaseType!.DefinitionId),
+                type => ResolveRelationDefinitionIds(type.BaseType!, type),
                 type => type.Id);
             this.m_implementingTypesByInterfaceId = BuildInterfaceIndex(types);
+            MethodEntry[] completedMethods = CompleteSourceRelations(methods, jobs);
+            this.Methods = completedMethods;
+            IReadOnlyDictionary<string, MethodEntry> methodsById = null!;
+            IReadOnlyDictionary<string, IReadOnlyList<MethodEntry>> methodsByName = null!;
+            IReadOnlyDictionary<string, IReadOnlyList<MethodEntry>> methodsByLogicalId = null!;
+            Parallel.Invoke(
+                options,
+                () => methodsById = completedMethods.ToDictionary(
+                    method => method.Id,
+                    StringComparer.Ordinal),
+                () => methodsByName = Index(
+                    completedMethods,
+                    method => method.Name,
+                    method => method.Id),
+                () => methodsByLogicalId = Index(
+                    completedMethods,
+                    method => method.LogicalId,
+                    method => method.Id),
+                () => methodsByTypeId = Index(
+                    completedMethods,
+                    method => method.TypeId,
+                    method => method.Id));
+            this.MethodsById = methodsById;
+            this.MethodsByName = methodsByName;
+            this.MethodsByLogicalId = methodsByLogicalId;
+            this.MethodsByTypeId = methodsByTypeId;
             this.OverridesByMethodId = IndexMany(
-                methods,
+                completedMethods,
                 method => method.RelatedMethodIds,
                 method => method.Id);
             stopwatch.Stop();
             this.Elapsed = stopwatch.Elapsed;
+        }
+
+        // 按物理文件和TypeDef标记建立源码回贴后仍稳定的类型索引。
+        private static IReadOnlyDictionary<string, TypeEntry> IndexManagedTypeLocations(
+            IEnumerable<TypeEntry> types)
+        {
+            return types.Where(type => type.AssemblyPath != null && type.MetadataToken > 0)
+                .ToDictionary(
+                    type => ManagedTypeLocation(type.AssemblyPath!, type.MetadataToken),
+                    StringComparer.OrdinalIgnoreCase);
+        }
+
+        // 生成一个物理文件内TypeDef标记的稳定查找键。
+        private static string ManagedTypeLocation(string path, int metadataToken)
+        {
+            return $"{Path.GetFullPath(path)}|{metadataToken}";
+        }
+
+        // 按类型并行补齐源码函数的隐式接口实现和普通重写关系。
+        private MethodEntry[] CompleteSourceRelations(
+            IReadOnlyList<MethodEntry> methods,
+            int jobs)
+        {
+            ConcurrentBag<MethodEntry> completed = new();
+            Parallel.ForEach(
+                methods.GroupBy(method => method.TypeId, StringComparer.Ordinal),
+                new ParallelOptions { MaxDegreeOfParallelism = jobs },
+                group =>
+                {
+                    TypeEntry type = this.m_typesById.TryGetValue(group.Key, out TypeEntry? found)
+                        ? found
+                        : throw new AnalysisException($"源码函数的声明类型不存在：{group.Key}");
+                    IReadOnlyList<InheritedTypeRelation> inherited = ReadInheritedTypes(type);
+                    foreach (MethodEntry method in group)
+                    {
+                        completed.Add(CompleteManagedRelations(method, inherited));
+                    }
+                });
+
+            return completed.OrderBy(method => method.Id, StringComparer.Ordinal).ToArray();
         }
 
         /// <summary>启动时建立的全部源码函数。</summary>
@@ -1876,6 +1934,41 @@ namespace SetterChecker.Core
                     return this.m_typesByLogicalId;
                 }
             }
+        }
+
+        // 通过源码编译所用核心库把原始类型身份还原成唯一真实类型。
+        internal TypeEntry ReadPrimitiveType(string identity)
+        {
+            var meanings = this.m_sourceContextsByAssembly.Values.Select(context =>
+                    context.Material.Compilation.GetTypeByMetadataName(identity))
+                .Where(type => type is { SpecialType: not SpecialType.None })
+                .Select(type => new
+                {
+                    Assembly = type!.ContainingAssembly.Identity.GetDisplayName(),
+                    ReferringPath = this.m_sourceContextsByAssembly.Values.First().Material.AssemblyPath,
+                })
+                .DistinctBy(item => item.Assembly, StringComparer.Ordinal)
+                .ToArray();
+            if (meanings.Length != 1)
+            {
+                throw new AnalysisException($"原始类型没有唯一运行时含义：{identity}");
+            }
+
+            System.Reflection.AssemblyName assembly = new(meanings[0].Assembly);
+            TypeEntry[] matches = this.Types.Where(type => type.FullName == identity
+                    && MethodCatalog.MatchesAssemblyIdentity(type.AssemblyIdentity, assembly))
+                .ToArray();
+            if (matches.Length == 0)
+            {
+                LoadAssemblyTypes(assembly, meanings[0].ReferringPath);
+                matches = this.Types.Where(type => type.FullName == identity
+                        && MethodCatalog.MatchesAssemblyIdentity(type.AssemblyIdentity, assembly))
+                    .ToArray();
+            }
+
+            return matches.Length == 1
+                ? matches[0]
+                : throw new AnalysisException($"原始类型定义不唯一：{identity}，命中 {matches.Length} 个定义");
         }
 
         /// <summary>按简单名称查找源码函数。</summary>
@@ -1935,20 +2028,303 @@ namespace SetterChecker.Core
         /// </summary>
         public IReadOnlyList<MethodEntry> GetMethods(TypeEntry type)
         {
-            if (type.AssemblyPath == null)
-            {
-                return this.MethodsByTypeId.GetValueOrDefault(type.Id)
-                    ?? Array.Empty<MethodEntry>();
-            }
-
-            IReadOnlyList<MethodEntry> methods = this.m_managedMethodsByTypeId.GetOrAdd(
-                type.Id,
-                _ => ReadManagedMethodDeclarations(type));
+            IReadOnlyList<MethodEntry> methods = ReadDeclaredMethods(type);
             IReadOnlyList<InheritedTypeRelation> inherited = ReadInheritedTypes(type);
 
             return methods.Select(method => CompleteManagedRelations(method, inherited))
                 .OrderBy(method => method.Id, StringComparer.Ordinal)
                 .ToArray();
+        }
+
+        // 普通调用只读取类型直接声明，继承实现关系在动态调用需要时补全。
+        private IReadOnlyList<MethodEntry> ReadDeclaredMethods(TypeEntry type)
+        {
+            return type.SourceSymbol != null
+                ? this.MethodsByTypeId.GetValueOrDefault(type.Id) ?? Array.Empty<MethodEntry>()
+                : this.m_managedMethodsByTypeId.GetOrAdd(type.Id, _ => ReadManagedMethodDeclarations(type));
+        }
+
+        // 按行为事实中的完整类型引用定位唯一声明。
+        internal TypeEntry ResolveTypeDefinition(BehaviorTypeReference reference)
+        {
+            if (reference.KnownTypeId != null)
+            {
+                return this.TypesById.TryGetValue(reference.KnownTypeId, out TypeEntry? known)
+                    ? known
+                    : throw new AnalysisException($"本地类型定义尚未载入：{reference.KnownTypeId}");
+            }
+
+            if (reference.Identity.Text.StartsWith('!'))
+            {
+                throw new AnalysisException($"开放类型引用尚未闭合：{reference.Id}");
+            }
+
+            if (reference.TargetAssemblyIdentity == null)
+            {
+                return ReadPrimitiveType(reference.Id);
+            }
+
+            IReadOnlyList<TypeEntry> matches = FindTypeDefinitions(
+                reference.DefinitionId,
+                reference.TargetAssemblyIdentity,
+                reference.ReferringAssemblyPath,
+                loadMissing: true);
+
+            return matches.Count == 1
+                ? matches[0]
+                : throw new AnalysisException(
+                    $"类型引用定义不唯一：{reference.Id}，命中 {matches.Count} 个定义");
+        }
+
+        // 依据当前模块真实核心库确认类型是否直接继承系统委托基类。
+        internal bool IsDelegateType(TypeEntry type)
+        {
+            if (type.BaseType == null || type.AssemblyPath == null)
+            {
+                return false;
+            }
+
+            if (type.BaseType.FullName != "System.MulticastDelegate")
+            {
+                return false;
+            }
+
+            Cecil.IMetadataScope coreLibrary = GetManagedModule(type.AssemblyPath).TypeSystem.CoreLibrary;
+            string coreName;
+            string coreIdentity;
+            if (coreLibrary is Cecil.ModuleDefinition coreModule)
+            {
+                coreName = coreModule.Assembly.Name.Name;
+                coreIdentity = coreModule.Assembly.Name.FullName;
+            }
+            else if (coreLibrary is Cecil.AssemblyNameReference coreReference)
+            {
+                coreName = coreReference.Name;
+                coreIdentity = coreReference.FullName;
+            }
+            else
+            {
+                throw new AnalysisException($"类型核心库身份不是程序集：{type.Id}");
+            }
+
+            string expectedId = MethodCatalog.NamedTypeId(
+                this.m_assemblyNames.GetValueOrDefault(coreName) ?? coreName,
+                "System.MulticastDelegate");
+            TypeEntry[] actualBases = FindTypeDefinitions(
+                type.BaseType,
+                type,
+                loadMissing: true).ToArray();
+            TypeEntry[] coreBases = FindTypeDefinitions(
+                expectedId,
+                coreIdentity,
+                type.AssemblyPath,
+                loadMissing: true).ToArray();
+            if (actualBases.Length != 1 || coreBases.Length != 1)
+            {
+                throw new AnalysisException($"委托基类没有唯一运行时定义：{type.Id}");
+            }
+
+            return actualBases[0].Id == coreBases[0].Id;
+        }
+
+        // 按调用点的完整类型和函数签名找到唯一声明。
+        internal ResolvedMethodDefinition ResolveMethodDefinition(
+            ManagedMethodReferenceInfo reference,
+            bool searchInherited)
+        {
+            TypeEntry[] declaringTypes = reference.KnownDeclaringTypeId == null
+                ? FindReferencedTypes(reference).ToArray()
+                : new[]
+                {
+                    this.TypesById.TryGetValue(reference.KnownDeclaringTypeId, out TypeEntry? known)
+                        ? known
+                        : throw new AnalysisException(
+                            $"本地函数声明类型尚未载入：{reference.KnownDeclaringTypeId}"),
+                };
+            ResolvedMethodDefinition[] matches = reference.KnownMetadataToken is int metadataToken
+                ? declaringTypes.SelectMany(type => ReadDeclaredMethods(type).Where(method =>
+                        method.MetadataToken == metadataToken)
+                    .Select(method => new ResolvedMethodDefinition(
+                        method,
+                        reference.DeclaringTypeArguments))).ToArray()
+                : declaringTypes.SelectMany(type =>
+                        FindMatchingMethods(type, reference, reference.DeclaringTypeArguments))
+                    .ToArray();
+            if (matches.Length == 0
+                && searchInherited
+                && reference.KnownMetadataToken == null)
+            {
+                matches = declaringTypes.SelectMany(type =>
+                        FindInheritedMethods(type, reference))
+                    .ToArray();
+            }
+
+            if (matches.Length == 1)
+            {
+                return matches[0];
+            }
+
+            throw new AnalysisException(matches.Length == 0
+                ? $"调用目标不存在：{reference.Identity.Text}"
+                : $"调用目标不唯一：{reference.Identity.Text} => "
+                    + string.Join("; ", matches.Select(match => match.Method.Id)));
+        }
+
+        // 按开放类型身份和完整程序集身份筛选真实声明类型。
+        private IReadOnlyList<TypeEntry> FindReferencedTypes(ManagedMethodReferenceInfo reference)
+        {
+            return FindTypeDefinitions(
+                reference.DeclaringTypeDefinition.Text,
+                reference.TargetAssemblyIdentity,
+                reference.ReferringAssemblyPath,
+                loadMissing: true);
+        }
+
+        // 核对类型本身的真实程序集身份。
+        private bool IsDirectlyDeclaredInAssembly(
+            TypeEntry type,
+            System.Reflection.AssemblyName identity)
+        {
+            AssemblyRedirectTarget target = NormalizeAssemblyReference(identity);
+
+            return MethodCatalog.MatchesAssemblyIdentity(type.AssemblyIdentity, target.Identity)
+                && (target.Path == null || string.Equals(
+                    type.AssemblyPath,
+                    target.Path,
+                    StringComparison.OrdinalIgnoreCase));
+        }
+
+        // 把材料已证明的参考身份归一到唯一实际文件和身份。
+        private AssemblyRedirectTarget NormalizeAssemblyReference(
+            System.Reflection.AssemblyName identity)
+        {
+            string key = identity.FullName
+                ?? throw new AnalysisException("程序集引用没有完整身份。");
+
+            return this.m_assemblyRedirects.GetValueOrDefault(key)
+                ?? new AssemblyRedirectTarget(identity, null);
+        }
+
+        // 按最近继承层级寻找函数的实际声明。
+        private IReadOnlyList<ResolvedMethodDefinition> FindInheritedMethods(
+            TypeEntry type,
+            ManagedMethodReferenceInfo reference)
+        {
+            bool searchInterfaces = type.IsInterface;
+            RequireClosedHierarchy(
+                type,
+                includeBaseTypes: !searchInterfaces,
+                includeInterfaces: searchInterfaces);
+            foreach (IGrouping<int, InheritedTypeRelation> level in ReadInheritedTypes(
+                         type,
+                         reference.DeclaringTypeArguments,
+                         ReadResolvedTypeArguments(reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken))
+                     .Where(relation =>
+                         relation.IsInterface == searchInterfaces).GroupBy(item => item.Depth)
+                     .OrderBy(group => group.Key))
+            {
+                ResolvedMethodDefinition[] matches = level.SelectMany(relation =>
+                        FindMatchingMethods(
+                            relation.Definition,
+                            reference,
+                            relation.TypeArguments,
+                            relation.SignatureArguments))
+                    .ToArray();
+                if (matches.Length > 0)
+                {
+                    return matches;
+                }
+            }
+
+            return Array.Empty<ResolvedMethodDefinition>();
+        }
+
+        // 在一个声明类型中精确比较函数的构造签名。
+        private IReadOnlyList<ResolvedMethodDefinition> FindMatchingMethods(
+            TypeEntry type,
+            ManagedMethodReferenceInfo reference,
+            IReadOnlyList<TypeIdentityTemplate> typeArguments,
+            IReadOnlyList<TypeIdentityTemplate>? signatureArguments = null)
+        {
+            return ReadDeclaredMethods(type).Where(method => MethodMatchesReference(
+                    method,
+                    reference,
+                    signatureArguments))
+                .Select(method => new ResolvedMethodDefinition(method, typeArguments))
+                .ToArray();
+        }
+
+        // 比较名称、元数、调用形态、参数和返回类型的完整身份。
+        private bool MethodMatchesReference(
+            MethodEntry method,
+            ManagedMethodReferenceInfo reference,
+            IReadOnlyList<TypeIdentityTemplate>? typeArguments)
+        {
+            if (method.Name != reference.Identity.Name
+                || method.GenericArity != reference.Identity.GenericArity
+                || method.IsStatic == reference.HasInstance
+                || method.Parameters.Count != reference.Identity.Parameters.Count)
+            {
+                return false;
+            }
+
+            MethodIdentityTemplate declaration = ReadResolvedMethodSignature(method.AssemblyPath!, method.MetadataToken);
+            MethodIdentityTemplate target = ReadResolvedMethodSignature(
+                reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken);
+            IReadOnlyList<TypeIdentityTemplate> declarationArguments = typeArguments ?? Array.Empty<TypeIdentityTemplate>();
+            IReadOnlyList<TypeIdentityTemplate> referenceArguments = typeArguments == null
+                ? Array.Empty<TypeIdentityTemplate>()
+                : ReadResolvedTypeArguments(reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken);
+
+            return declaration.Parameters.Select(parameter => parameter.Substitute(declarationArguments).Text)
+                    .SequenceEqual(target.Parameters.Select(parameter =>
+                        parameter.Substitute(referenceArguments).Text), StringComparer.Ordinal)
+                && declaration.ReturnType.Substitute(declarationArguments).Text
+                    == target.ReturnType.Substitute(referenceArguments).Text;
+        }
+
+        // 从实际元数据读取签名，并把其中每个命名类型定位到真实定义。
+        private MethodIdentityTemplate ReadResolvedMethodSignature(string path, int token)
+        {
+            return this.m_resolvedSignatures.GetOrAdd((path, token), key =>
+            {
+                Cecil.ModuleDefinition module = GetManagedModule(key.Path);
+                Cecil.MethodReference method;
+                lock (module)
+                {
+                    method = (Cecil.MethodReference)module.LookupToken(key.Token);
+                }
+
+                return MethodCatalog.ManagedMethodDefinitionIdentity(method, this.m_assemblyNames,
+                    type => ReadResolvedTypeId(type, key.Path));
+            });
+        }
+
+        // 从原始类型或函数引用读取实参，保留每个命名类型的实际来源。
+        private IReadOnlyList<TypeIdentityTemplate> ReadResolvedTypeArguments(string path, int token)
+        {
+            return this.m_resolvedTypeArguments.GetOrAdd((path, token), key =>
+            {
+                Cecil.ModuleDefinition module = GetManagedModule(key.Path);
+                Cecil.IMetadataTokenProvider reference;
+                lock (module)
+                {
+                    reference = module.LookupToken(key.Token);
+                }
+
+                Cecil.TypeReference type = reference is Cecil.MethodReference method
+                    ? method.DeclaringType
+                    : (Cecil.TypeReference)reference;
+
+                return MethodCatalog.ReadManagedTypeArguments(type, this.m_assemblyNames,
+                    argument => ReadResolvedTypeId(argument, key.Path)).ToArray();
+            });
+        }
+
+        // 使用现有类型定位流程取得签名中的真实类型身份。
+        private string ReadResolvedTypeId(Cecil.TypeReference type, string path)
+        {
+            return ResolveTypeDefinition(BehaviorTypeReference.From(ReadManagedTypeReference(type, path))).Id;
         }
 
         // 按完整程序集身份从候选表延迟读取一次真实托管文件的类型。
@@ -1966,16 +2342,38 @@ namespace SetterChecker.Core
                         path,
                         out MethodCatalog.ManagedAssemblyPart? part))
                 {
-                    part = MethodCatalog.ReadManagedTypes(path, this.m_assemblyNames);
+                    part = this.m_sourceImagesByPath.TryGetValue(path, out byte[]? image)
+                        ? MethodCatalog.ReadManagedTypes(path, image, this.m_assemblyNames)
+                        : MethodCatalog.ReadManagedTypes(path, this.m_assemblyNames);
                     this.m_loadedPartsByPath.Add(path, part);
                 }
+                else if (this.m_completedAssemblyPaths.Contains(path))
+                {
+                    return part.Types.Select(type => this.m_typesByManagedLocation[
+                        ManagedTypeLocation(path, type.MetadataToken)]).ToArray();
+                }
 
-                TypeEntry[] nextTypes = this.m_types
+                TypeEntry[] addedTypes = this.m_types
                     .Concat(part.Types)
                     .DistinctBy(type => type.Id, StringComparer.Ordinal)
+                    .ToArray();
+                MethodCatalog.ForwardedTypeEntry[] knownForwarders = this.m_loadedPartsByPath.Values
+                    .SelectMany(item => item.Forwarders)
+                    .ToArray();
+                TypeEntry[] nextTypes = MethodCatalog.AttachForwardedAliases(
+                        addedTypes,
+                        knownForwarders)
                     .OrderBy(type => type.Id, StringComparer.Ordinal)
                     .ToArray();
-                if (nextTypes.Length != this.m_types.Length)
+                this.m_forwardedTargets = MethodCatalog.ResolveForwardedTargets(
+                    nextTypes,
+                    knownForwarders);
+                this.m_forwardedAliases = knownForwarders.Select(forwarder =>
+                        MethodCatalog.CreateForwardedTypeKey(
+                            forwarder.AliasTypeId,
+                            forwarder.AliasAssemblyIdentity))
+                    .ToHashSet();
+                if (!nextTypes.SequenceEqual(this.m_types))
                 {
                     IReadOnlyDictionary<string, TypeEntry> nextTypesById = nextTypes.ToDictionary(
                         type => type.Id,
@@ -1988,18 +2386,21 @@ namespace SetterChecker.Core
 
                     this.m_types = nextTypes;
                     this.m_typesById = nextTypesById;
+                    this.m_typesByManagedLocation = IndexManagedTypeLocations(nextTypes);
                     this.m_typesByLogicalId = nextTypesByLogicalId;
                     this.m_missingTypeRelations = ReadMissingTypeRelations(
                         nextTypes,
                         nextTypesByLogicalId);
                     this.m_derivedTypesByBaseId = IndexMany(
                         nextTypes.Where(type => type.BaseType != null),
-                        type => ResolveDefinitionIds(type.BaseType!.DefinitionId),
+                        type => ResolveRelationDefinitionIds(type.BaseType!, type),
                         type => type.Id);
                     this.m_implementingTypesByInterfaceId = BuildInterfaceIndex(nextTypes);
                 }
 
-                return part.Types;
+                this.m_completedAssemblyPaths.Add(path);
+                return part.Types.Select(type => this.m_typesByManagedLocation[
+                    ManagedTypeLocation(path, type.MetadataToken)]).ToArray();
             }
         }
 
@@ -2008,20 +2409,36 @@ namespace SetterChecker.Core
             System.Reflection.AssemblyName identity,
             string referringAssemblyPath)
         {
+            AssemblyRedirectTarget target = NormalizeAssemblyReference(identity);
+            if (target.Path != null)
+            {
+                return target.Path;
+            }
+
+            identity = target.Identity;
             string assemblyName = identity.Name
                 ?? throw new AnalysisException("程序集引用没有名称。");
-            string siblingPath = Path.Combine(
-                Path.GetDirectoryName(referringAssemblyPath)!,
-                $"{assemblyName}.dll");
+            if (this.m_sourceContextsByAssembly.TryGetValue(
+                    assemblyName,
+                    out MethodCatalog.SourceCatalogContext? sourceContext)
+                && MethodCatalog.MatchesAssemblyIdentity(
+                    sourceContext.Material.Compilation.Assembly.Identity.GetDisplayName(),
+                    identity))
+            {
+                return Path.GetFullPath(sourceContext.Material.AssemblyPath);
+            }
+
             string[] candidates = this.m_lookupPathsByAssemblyName.TryGetValue(
                     assemblyName,
                     out IReadOnlyList<string>? knownPaths)
-                ? knownPaths.Where(path => MatchesAssemblyIdentity(path, identity)).ToArray()
+                ? knownPaths.Where(path => MethodCatalog.MatchesAssemblyFile(path, identity)).ToArray()
                 : Array.Empty<string>();
-            if (File.Exists(siblingPath) && MatchesAssemblyIdentity(siblingPath, identity))
+            if (candidates.Length == 0
+                && this.m_unityFacadePathsByAssemblyName.TryGetValue(
+                    assemblyName,
+                    out IReadOnlyList<string>? facadePaths))
             {
-                candidates = candidates.Append(Path.GetFullPath(siblingPath))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                candidates = facadePaths.Where(path => MatchesUnityFacadeAssembly(path, identity))
                     .ToArray();
             }
 
@@ -2043,22 +2460,22 @@ namespace SetterChecker.Core
                 };
         }
 
-        // 核对候选文件与调用点记录的完整程序集身份。
-        private static bool MatchesAssemblyIdentity(
+        // 按 Unity 运行时的门面身份规则核对已验证候选。
+        private static bool MatchesUnityFacadeAssembly(
             string path,
             System.Reflection.AssemblyName expected)
         {
-            System.Reflection.AssemblyName actual =
+            System.Reflection.AssemblyName candidate =
                 System.Reflection.AssemblyName.GetAssemblyName(path);
 
-            return string.Equals(actual.Name, expected.Name, StringComparison.OrdinalIgnoreCase)
-                && Equals(actual.Version, expected.Version)
+            return string.Equals(candidate.Name, expected.Name, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(
-                    actual.CultureName ?? string.Empty,
+                    candidate.CultureName ?? string.Empty,
                     expected.CultureName ?? string.Empty,
                     StringComparison.OrdinalIgnoreCase)
-                && (actual.GetPublicKeyToken() ?? Array.Empty<byte>())
-                    .SequenceEqual(expected.GetPublicKeyToken() ?? Array.Empty<byte>());
+                && (candidate.GetPublicKeyToken() ?? Array.Empty<byte>())
+                    .SequenceEqual(expected.GetPublicKeyToken() ?? Array.Empty<byte>())
+                && candidate.Version?.Major >= expected.Version?.Major;
         }
 
         // 在动态调用确实依赖类型层级时要求整条层级关系完整。
@@ -2066,6 +2483,15 @@ namespace SetterChecker.Core
         /// 验证指定类型的全部基类和接口都能由当前真实材料定位。
         /// </summary>
         public void RequireClosedHierarchy(TypeEntry type)
+        {
+            RequireClosedHierarchy(type, includeBaseTypes: true, includeInterfaces: true);
+        }
+
+        // 只闭合当前调用查找确实依赖的类型关系。
+        private void RequireClosedHierarchy(
+            TypeEntry type,
+            bool includeBaseTypes,
+            bool includeInterfaces)
         {
             Stack<TypeEntry> pending = new();
             HashSet<string> visited = new(StringComparer.Ordinal);
@@ -2078,21 +2504,20 @@ namespace SetterChecker.Core
                     continue;
                 }
 
-                foreach (TypeRelationEntry relation in current.Interfaces
-                             .Prepend(current.BaseType)
-                             .Where(relation => relation != null)
-                             .Cast<TypeRelationEntry>())
+                IEnumerable<TypeRelationEntry> relations = includeInterfaces
+                    ? current.Interfaces
+                    : Array.Empty<TypeRelationEntry>();
+                if (includeBaseTypes && current.BaseType != null)
+                {
+                    relations = relations.Prepend(current.BaseType);
+                }
+
+                foreach (TypeRelationEntry relation in relations)
                 {
                     IReadOnlyList<TypeEntry> definitions = FindTypeDefinitions(
-                        relation.DefinitionId,
-                        current);
-                    if (definitions.Count == 0 && current.AssemblyPath != null)
-                    {
-                        LoadAssemblyTypes(
-                            new System.Reflection.AssemblyName(relation.AssemblyIdentity),
-                            current.AssemblyPath);
-                        definitions = FindTypeDefinitions(relation.DefinitionId, current);
-                    }
+                        relation,
+                        current,
+                        loadMissing: true);
 
                     if (definitions.Count == 0)
                     {
@@ -2107,66 +2532,6 @@ namespace SetterChecker.Core
                     }
                 }
             }
-        }
-
-        // 使用源码程序集上下文读取一个函数引用。
-        internal ManagedMethodReferenceInfo ReadSourceMethodReference(
-            IMethodSymbol method,
-            string callerAssemblyName)
-        {
-            return MethodCatalog.ReadSourceMethodReference(
-                method,
-                RequireSourceContext(callerAssemblyName));
-        }
-
-        // 使用源码程序集上下文读取一个字段引用。
-        internal ManagedFieldReferenceInfo ReadSourceFieldReference(
-            IFieldSymbol field,
-            string callerAssemblyName)
-        {
-            return MethodCatalog.ReadSourceFieldReference(
-                field,
-                RequireSourceContext(callerAssemblyName));
-        }
-
-        // 使用源码程序集上下文读取一个事件字段引用。
-        internal ManagedFieldReferenceInfo ReadSourceEventReference(
-            IEventSymbol eventSymbol,
-            string callerAssemblyName)
-        {
-            return MethodCatalog.ReadSourceEventReference(
-                eventSymbol,
-                RequireSourceContext(callerAssemblyName));
-        }
-
-        // 使用源码程序集上下文读取一个自动属性后备字段引用。
-        internal ManagedFieldReferenceInfo ReadSourcePropertyStorageReference(
-            IPropertySymbol property,
-            string callerAssemblyName)
-        {
-            return MethodCatalog.ReadSourcePropertyStorageReference(
-                property,
-                RequireSourceContext(callerAssemblyName));
-        }
-
-        // 使用源码程序集上下文读取一个类型引用。
-        internal ManagedTypeReferenceInfo ReadSourceTypeReference(
-            ITypeSymbol type,
-            string callerAssemblyName)
-        {
-            return MethodCatalog.ReadSourceTypeReference(
-                type,
-                RequireSourceContext(callerAssemblyName));
-        }
-
-        // 找到已经建立统一身份规则的源码程序集上下文。
-        private MethodCatalog.SourceCatalogContext RequireSourceContext(string assemblyName)
-        {
-            return this.m_sourceContextsByAssembly.TryGetValue(
-                assemblyName,
-                out MethodCatalog.SourceCatalogContext? context)
-                ? context
-                : throw new AnalysisException($"源码程序集没有进入函数总表：{assemblyName}");
         }
 
         // 使用 Cecil 读取托管调用点的函数引用。
@@ -2184,23 +2549,37 @@ namespace SetterChecker.Core
                 ? generic.GenericArguments.Select(argument =>
                     MethodCatalog.ManagedTypeIdentity(argument, this.m_assemblyNames)).ToArray()
                 : Array.Empty<TypeIdentityTemplate>();
+            Cecil.MethodReference definition = method;
+            while (definition is Cecil.GenericInstanceMethod instance)
+            {
+                definition = instance.ElementMethod;
+            }
+
             return new ManagedMethodReferenceInfo(
                 identity,
                 method.HasThis,
                 identity.ReturnType.Text == "System.Void",
                 genericArguments,
                 TypeIdentityTemplate.NamedType(MethodCatalog.ManagedNamedTypeDefinitionId(
-                    MethodCatalog.ManagedNamedTypeElement(method.DeclaringType),
+                    method.DeclaringType.GetElementType(),
                     this.m_assemblyNames)),
                 declaringArguments,
                 MethodCatalog.ReadManagedAssemblyFullName(
-                    MethodCatalog.ManagedNamedTypeElement(method.DeclaringType)),
-                referringAssemblyPath);
+                    method.DeclaringType.GetElementType()),
+                referringAssemblyPath)
+            {
+                ReferenceMetadataToken = definition.MetadataToken.ToInt32(),
+                KnownDeclaringTypeId = ReadKnownTypeId(method.DeclaringType, referringAssemblyPath),
+                KnownMetadataToken = definition is Cecil.MethodDefinition methodDefinition
+                    ? methodDefinition.MetadataToken.ToInt32()
+                    : null,
+            };
         }
 
         // 使用 Cecil 读取托管字段引用。
         internal ManagedFieldReferenceInfo ReadManagedFieldReference(
-            Cecil.FieldReference field)
+            Cecil.FieldReference field,
+            string referringAssemblyPath)
         {
             TypeIdentityTemplate[] declaringArguments = MethodCatalog.ReadManagedTypeArguments(
                 field.DeclaringType,
@@ -2214,9 +2593,15 @@ namespace SetterChecker.Core
                 field.Name,
                 fieldType,
                 TypeIdentityTemplate.NamedType(MethodCatalog.ManagedNamedTypeDefinitionId(
-                    MethodCatalog.ManagedNamedTypeElement(field.DeclaringType),
+                    field.DeclaringType.GetElementType(),
                     this.m_assemblyNames)),
-                declaringArguments);
+                declaringArguments)
+            {
+                KnownDeclaringTypeId = ReadKnownTypeId(field.DeclaringType, referringAssemblyPath),
+                TargetAssemblyIdentity = MethodCatalog.ReadManagedAssemblyFullName(
+                    field.DeclaringType.GetElementType()),
+                ReferringAssemblyPath = referringAssemblyPath,
+            };
         }
 
         // 使用 Cecil 读取托管类型引用。
@@ -2225,7 +2610,7 @@ namespace SetterChecker.Core
             string referringAssemblyPath)
         {
             TypeIdentityTemplate identity = MethodCatalog.ManagedTypeIdentity(type, this.m_assemblyNames);
-            Cecil.TypeReference definition = MethodCatalog.ManagedNamedTypeElement(type);
+            Cecil.TypeReference definition = type.GetElementType();
 
             return new ManagedTypeReferenceInfo(
                 identity,
@@ -2234,7 +2619,34 @@ namespace SetterChecker.Core
                     this.m_assemblyNames)),
                 MethodCatalog.ReadManagedTypeArguments(type, this.m_assemblyNames).ToArray(),
                 MethodCatalog.ReadManagedAssemblyFullName(definition),
-                referringAssemblyPath);
+                referringAssemblyPath)
+            {
+                KnownTypeId = ReadKnownTypeId(type, referringAssemblyPath),
+            };
+        }
+
+        // 按当前文件和TypeDef标记取得源码回贴后的真实类型身份。
+        private string? ReadKnownTypeId(Cecil.TypeReference type, string referringAssemblyPath)
+        {
+            if (type.GetElementType() is not Cecil.TypeDefinition definition)
+            {
+                return null;
+            }
+
+            string key = ManagedTypeLocation(referringAssemblyPath, definition.MetadataToken.ToInt32());
+            lock (this.m_loadedTypeLock)
+            {
+                if (!this.m_typesByManagedLocation.TryGetValue(key, out TypeEntry? known)
+                    || known.LogicalId != MethodCatalog.ManagedNamedTypeDefinitionId(
+                        definition,
+                        this.m_assemblyNames))
+                {
+                    throw new AnalysisException(
+                        $"本地类型标记没有目录定义：{referringAssemblyPath} @ {definition.MetadataToken}");
+                }
+
+                return known.Id;
+            }
         }
 
         // 读取一个托管类型直接声明的函数事实。
@@ -2255,7 +2667,22 @@ namespace SetterChecker.Core
             MethodEntry method,
             IReadOnlyList<InheritedTypeRelation> inherited)
         {
-            HashSet<string> relations = method.RelatedMethodIds.ToHashSet(StringComparer.Ordinal);
+            HashSet<string> relations = new(StringComparer.Ordinal);
+            if (method.RelatedMethodIds.Count > 0)
+            {
+                Cecil.ModuleDefinition module = GetManagedModule(method.AssemblyPath!);
+                Cecil.MethodReference[] overrides;
+                lock (module)
+                {
+                    overrides = ((Cecil.MethodDefinition)module.LookupToken(method.MetadataToken)).Overrides.ToArray();
+                }
+
+                foreach (Cecil.MethodReference target in overrides)
+                {
+                    relations.Add(ResolveMethodDefinition(ReadManagedMethodReference(target, method.AssemblyPath!),
+                        searchInherited: false).Method.LogicalId);
+                }
+            }
             foreach (InheritedTypeRelation relation in inherited.Where(item =>
                          item.IsInterface && item.CanImplementInterface))
             {
@@ -2264,9 +2691,9 @@ namespace SetterChecker.Core
                     break;
                 }
 
-                foreach (MethodEntry target in GetMethods(relation.Definition))
+                foreach (MethodEntry target in ReadDeclaredMethods(relation.Definition))
                 {
-                    if (HasMatchingSignature(method, target, relation.TypeArguments, true))
+                    if (HasMatchingSignature(method, target, relation.SignatureArguments, true))
                     {
                         relations.Add(target.LogicalId);
                     }
@@ -2280,9 +2707,9 @@ namespace SetterChecker.Core
                              .GroupBy(item => item.Depth)
                              .OrderBy(group => group.Key))
                 {
-                    string[] matches = level.SelectMany(relation => GetMethods(relation.Definition)
+                    string[] matches = level.SelectMany(relation => ReadDeclaredMethods(relation.Definition)
                             .Where(target => target.IsVirtual
-                                && HasMatchingSignature(method, target, relation.TypeArguments, false)))
+                                && HasMatchingSignature(method, target, relation.SignatureArguments, false)))
                         .Select(target => target.LogicalId)
                         .Distinct(StringComparer.Ordinal)
                         .ToArray();
@@ -2298,7 +2725,7 @@ namespace SetterChecker.Core
         }
 
         // 精确比较两个函数在构造继承关系下的名称、元数和参数签名。
-        private static bool HasMatchingSignature(
+        private bool HasMatchingSignature(
             MethodEntry method,
             MethodEntry target,
             IReadOnlyList<TypeIdentityTemplate> targetTypeArguments,
@@ -2312,31 +2739,36 @@ namespace SetterChecker.Core
                 return false;
             }
 
+            MethodIdentityTemplate implementation = ReadResolvedMethodSignature(method.AssemblyPath!, method.MetadataToken);
+            MethodIdentityTemplate declaration = ReadResolvedMethodSignature(target.AssemblyPath!, target.MetadataToken);
             bool parametersMatch = method.Parameters.Zip(target.Parameters).All(pair =>
-                pair.First.RefKind == pair.Second.RefKind
-                && pair.First.TypeId == pair.Second.TypeIdentity.Substitute(targetTypeArguments).Text);
+                    pair.First.RefKind == pair.Second.RefKind)
+                && implementation.Parameters.Select(parameter => parameter.Text).SequenceEqual(
+                    declaration.Parameters.Select(parameter => parameter.Substitute(targetTypeArguments).Text),
+                    StringComparer.Ordinal);
             bool returnMatches = !isInterface
-                || method.ReturnTypeId == TypeIdentityTemplate.Literal(target.ReturnTypeId)
-                    .Substitute(targetTypeArguments)
-                    .Text;
+                || implementation.ReturnType.Text == declaration.ReturnType.Substitute(targetTypeArguments).Text;
 
             return parametersMatch && returnMatches;
         }
 
         // 列出一个类型直接或间接继承的全部构造基类和接口。
-        private IReadOnlyList<InheritedTypeRelation> ReadInheritedTypes(TypeEntry type)
+        internal IReadOnlyList<InheritedTypeRelation> ReadInheritedTypes(
+            TypeEntry type,
+            IReadOnlyList<TypeIdentityTemplate>? typeArguments = null,
+            IReadOnlyList<TypeIdentityTemplate>? signatureArguments = null)
         {
             Stack<(TypeRelationEntry Relation, TypeEntry Owner, bool IsInterface,
                 bool CanImplementInterface, int Depth)> pending = new();
             HashSet<string> visited = new(StringComparer.Ordinal);
             List<InheritedTypeRelation> result = new();
 
-            PushRelations(pending, type, 1, canImplementInterface: true);
+            PushRelations(pending, type, 1, canImplementInterface: true, typeArguments, signatureArguments);
             while (pending.Count > 0)
             {
                 (TypeRelationEntry relation, TypeEntry owner, bool isInterface,
                     bool canImplementInterface, int depth) = pending.Pop();
-                foreach (TypeEntry definition in FindTypeDefinitions(relation.DefinitionId, owner))
+                foreach (TypeEntry definition in FindTypeDefinitions(relation, owner))
                 {
                     string key = $"{definition.Id}|{relation.TypeId}|{isInterface}";
                     if (!visited.Add(key))
@@ -2352,13 +2784,17 @@ namespace SetterChecker.Core
                         arguments,
                         isInterface,
                         canImplementInterface,
-                        depth));
+                        depth)
+                    {
+                        SignatureArguments = relation.SignatureArguments,
+                    });
                     PushRelations(
                         pending,
                         definition,
                         depth + 1,
                         canImplementInterface,
-                        arguments);
+                        arguments,
+                        relation.SignatureArguments);
                 }
             }
 
@@ -2366,18 +2802,19 @@ namespace SetterChecker.Core
         }
 
         // 把一个类型的直接基类和接口放入继承遍历栈。
-        private static void PushRelations(
+        private void PushRelations(
             Stack<(TypeRelationEntry Relation, TypeEntry Owner, bool IsInterface,
                 bool CanImplementInterface, int Depth)> pending,
             TypeEntry type,
             int depth,
             bool canImplementInterface,
-            IReadOnlyList<TypeIdentityTemplate>? ownerArguments = null)
+            IReadOnlyList<TypeIdentityTemplate>? ownerArguments = null,
+            IReadOnlyList<TypeIdentityTemplate>? signatureArguments = null)
         {
             if (type.BaseType != null)
             {
                 pending.Push((
-                    InstantiateRelation(type.BaseType, ownerArguments),
+                    InstantiateRelation(type.BaseType, type, ownerArguments, signatureArguments),
                     type,
                     false,
                     false,
@@ -2387,7 +2824,7 @@ namespace SetterChecker.Core
             foreach (TypeRelationEntry relation in type.Interfaces.Reverse())
             {
                 pending.Push((
-                    InstantiateRelation(relation, ownerArguments),
+                    InstantiateRelation(relation, type, ownerArguments, signatureArguments),
                     type,
                     true,
                     canImplementInterface,
@@ -2396,50 +2833,184 @@ namespace SetterChecker.Core
         }
 
         // 用当前构造类型实参实例化一条继承关系。
-        private static TypeRelationEntry InstantiateRelation(
+        private TypeRelationEntry InstantiateRelation(
             TypeRelationEntry relation,
-            IReadOnlyList<TypeIdentityTemplate>? ownerArguments)
+            TypeEntry owner,
+            IReadOnlyList<TypeIdentityTemplate>? ownerArguments,
+            IReadOnlyList<TypeIdentityTemplate>? signatureArguments)
         {
-            if (ownerArguments == null || ownerArguments.Count == 0)
+            if (relation.TypeArguments.Count == 0)
             {
                 return relation;
             }
 
             TypeIdentityTemplate type = TypeIdentityTemplate.Literal(relation.TypeId)
-                .Substitute(ownerArguments);
+                .Substitute(ownerArguments ?? Array.Empty<TypeIdentityTemplate>());
             TypeIdentityTemplate[] arguments = relation.TypeArguments
                 .Select(TypeIdentityTemplate.Literal)
-                .Select(argument => argument.Substitute(ownerArguments))
+                .Select(argument => argument.Substitute(ownerArguments ?? Array.Empty<TypeIdentityTemplate>()))
                 .ToArray();
 
             return relation with
             {
                 TypeId = type.Text,
                 TypeArguments = arguments.Select(argument => argument.Text).ToArray(),
+                SignatureArguments = ReadResolvedTypeArguments(owner.AssemblyPath!, relation.ReferenceMetadataToken)
+                    .Select(argument => argument.Substitute(signatureArguments ?? Array.Empty<TypeIdentityTemplate>()))
+                    .ToArray(),
             };
         }
 
-        // 按逻辑身份定位类型定义并优先选择同一物理程序集。
-        private IReadOnlyList<TypeEntry> FindTypeDefinitions(string definitionId, TypeEntry owner)
+        // 按继承声明的完整程序集身份定位类型定义。
+        private IReadOnlyList<TypeEntry> FindTypeDefinitions(
+            TypeRelationEntry relation,
+            TypeEntry owner,
+            bool loadMissing = false)
         {
-            IReadOnlyList<TypeEntry>? candidates;
-            lock (this.m_loadedTypeLock)
+            if (relation.KnownMetadataToken is int metadataToken)
             {
-                candidates = this.m_typesByLogicalId.GetValueOrDefault(definitionId);
+                if (owner.AssemblyPath == null)
+                {
+                    throw new AnalysisException($"本地类型关系没有程序集路径：{owner.Id}");
+                }
+
+                string key = ManagedTypeLocation(owner.AssemblyPath, metadataToken);
+                lock (this.m_loadedTypeLock)
+                {
+                    return this.m_typesByManagedLocation.TryGetValue(key, out TypeEntry? known)
+                        ? new[] { known }
+                        : throw new AnalysisException(
+                            $"本地类型关系没有目录定义：{owner.Id} @ {metadataToken}");
+                }
             }
 
-            if (candidates == null)
+            return FindTypeDefinitions(
+                relation.DefinitionId,
+                relation.AssemblyIdentity,
+                owner.AssemblyPath,
+                loadMissing);
+        }
+
+        // 按开放类型身份和完整程序集身份定位唯一定义。
+        private IReadOnlyList<TypeEntry> FindTypeDefinitions(
+            string definitionId,
+            string assemblyIdentity,
+            string? referringAssemblyPath,
+            bool loadMissing)
+        {
+            System.Reflection.AssemblyName identity = new(assemblyIdentity);
+            TypeEntry[] definitions = FindLoadedTypeDefinitions(definitionId, identity);
+            if (definitions.Length != 0)
+            {
+                return definitions;
+            }
+
+            if (!loadMissing || referringAssemblyPath == null)
             {
                 return Array.Empty<TypeEntry>();
             }
 
-            TypeEntry[] sameAssembly = candidates.Where(candidate => string.Equals(
-                    candidate.AssemblyPath,
-                    owner.AssemblyPath,
-                    StringComparison.OrdinalIgnoreCase))
-                .ToArray();
+            string forwardingAssemblyPath = ResolveAssemblyPath(identity, referringAssemblyPath);
+            LoadAssemblyTypes(identity, referringAssemblyPath);
+            definitions = FindLoadedTypeDefinitions(definitionId, identity);
+            if (definitions.Length != 0)
+            {
+                return definitions;
+            }
 
-            return sameAssembly.Length == 0 ? candidates : sameAssembly;
+            MethodCatalog.ForwardedTypeKey? alias = null;
+            (MethodCatalog.ForwardedTypeEntry Forwarder, string Path)[] forwarders;
+            lock (this.m_loadedTypeLock)
+            {
+                MethodCatalog.ForwardedTypeEntry[] selected =
+                    this.m_loadedPartsByPath[forwardingAssemblyPath].Forwarders
+                    .Where(forwarder => forwarder.AliasTypeId == definitionId)
+                    .ToArray();
+                if (selected.Length > 0)
+                {
+                    alias = MethodCatalog.CreateForwardedTypeKey(
+                        selected[0].AliasTypeId,
+                        selected[0].AliasAssemblyIdentity);
+                }
+
+                forwarders = alias == null
+                    ? Array.Empty<(MethodCatalog.ForwardedTypeEntry, string)>()
+                    : this.m_loadedPartsByPath.Values.SelectMany(part => part.Forwarders
+                            .Where(forwarder => MethodCatalog.CreateForwardedTypeKey(
+                                forwarder.AliasTypeId,
+                                forwarder.AliasAssemblyIdentity) == alias)
+                            .Select(forwarder => (forwarder, part.Path)))
+                        .OrderBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
+                        .DistinctBy(item => MethodCatalog.CreateForwardedTypeKey(
+                            item.forwarder.TargetTypeId,
+                            item.forwarder.TargetAssemblyIdentity))
+                        .ToArray();
+            }
+
+            if (forwarders.Length == 0)
+            {
+                return Array.Empty<TypeEntry>();
+            }
+
+            List<TypeEntry> targets = new();
+            foreach ((MethodCatalog.ForwardedTypeEntry forwarder, string path) in forwarders)
+            {
+                IReadOnlyList<TypeEntry> branch = FindTypeDefinitions(
+                    forwarder.TargetTypeId,
+                    forwarder.TargetAssemblyIdentity,
+                    path,
+                    loadMissing: true);
+                if (branch.Count == 0)
+                {
+                    throw new AnalysisException(
+                        $"类型转交目标没有定义：{forwarder.AliasTypeId} @ "
+                            + $"{forwarder.AliasAssemblyIdentity} => {forwarder.TargetTypeId} @ "
+                            + forwarder.TargetAssemblyIdentity);
+                }
+
+                targets.AddRange(branch);
+            }
+
+            TypeEntry[] finalDefinitions = targets.DistinctBy(type => type.Id, StringComparer.Ordinal)
+                .ToArray();
+            if (finalDefinitions.Length != 1)
+            {
+                throw new AnalysisException(
+                    $"参考类型身份对应多个真实类型：{alias!.Value.TypeId} @ "
+                        + $"{alias.Value.AssemblyIdentity} => "
+                        + string.Join("; ", finalDefinitions.Select(type => type.Id)));
+            }
+
+            return finalDefinitions;
+        }
+
+        // 按定义身份或完整转交身份读取当前已经闭合的类型。
+        private TypeEntry[] FindLoadedTypeDefinitions(
+            string definitionId,
+            System.Reflection.AssemblyName identity)
+        {
+            AssemblyRedirectTarget redirected = NormalizeAssemblyReference(identity);
+            MethodCatalog.ForwardedTypeKey alias = MethodCatalog.CreateForwardedTypeKey(
+                definitionId,
+                redirected.Identity.FullName
+                    ?? throw new AnalysisException("程序集引用没有完整身份。"));
+            lock (this.m_loadedTypeLock)
+            {
+                if (this.m_forwardedTargets.TryGetValue(alias, out TypeEntry? target))
+                {
+                    return new[] { target };
+                }
+
+                if (this.m_forwardedAliases.Contains(alias))
+                {
+                    return Array.Empty<TypeEntry>();
+                }
+
+                return this.m_typesByLogicalId.GetValueOrDefault(definitionId)
+                    ?.Where(type => IsDirectlyDeclaredInAssembly(type, identity))
+                    .ToArray()
+                    ?? Array.Empty<TypeEntry>();
+            }
         }
 
         // 列出材料总表中当前没有目标定义的直接类型关系。
@@ -2478,13 +3049,9 @@ namespace SetterChecker.Core
             {
                 if (!this.m_modulesByPath.TryGetValue(path, out Cecil.ModuleDefinition? module))
                 {
-                    module = Cecil.ModuleDefinition.ReadModule(
-                        path,
-                        new Cecil.ReaderParameters
-                        {
-                            InMemory = true,
-                            ReadingMode = Cecil.ReadingMode.Deferred,
-                        });
+                    module = this.m_sourceImagesByPath.TryGetValue(path, out byte[]? image)
+                        ? MethodCatalog.OpenModule(image)
+                        : MethodCatalog.OpenModule(path);
                     this.m_modulesByPath.Add(path, module);
                 }
 
@@ -2492,15 +3059,18 @@ namespace SetterChecker.Core
             }
         }
 
-        // 把参考身份转换为全部真实类型身份。
-        private IReadOnlyList<string> ResolveDefinitionIds(string definitionId)
+        // 把一条具体继承关系转换为它实际指向的类型身份。
+        private IReadOnlyList<string> ResolveRelationDefinitionIds(
+            TypeRelationEntry relation,
+            TypeEntry owner)
         {
-            return this.TypesByLogicalId.TryGetValue(definitionId, out IReadOnlyList<TypeEntry>? types)
-                ? types.Select(type => type.LogicalId)
+            IReadOnlyList<TypeEntry> definitions = FindTypeDefinitions(relation, owner);
+            return definitions.Count == 0
+                ? new[] { relation.DefinitionId }
+                : definitions.Select(type => type.LogicalId)
                     .Distinct(StringComparer.Ordinal)
                     .Order(StringComparer.Ordinal)
-                    .ToArray()
-                : new[] { definitionId };
+                    .ToArray();
         }
 
         // 建立接口到全部直接或间接实现类型的索引。
@@ -2516,8 +3086,9 @@ namespace SetterChecker.Core
                         .DistinctBy(type => type.Id, StringComparer.Ordinal)
                         .OrderBy(type => type.Id, StringComparer.Ordinal)
                         .ToArray(),
-                    StringComparer.Ordinal);
+                StringComparer.Ordinal);
         }
+
 
         // 读取一个类型继承的全部接口定义身份。
         private IReadOnlyList<string> ReadInheritedInterfaceIds(TypeEntry type)
@@ -2539,7 +3110,7 @@ namespace SetterChecker.Core
             while (pending.Count > 0)
             {
                 (TypeRelationEntry relation, TypeEntry owner, bool isInterface) = pending.Pop();
-                foreach (TypeEntry definition in FindTypeDefinitions(relation.DefinitionId, owner))
+                foreach (TypeEntry definition in FindTypeDefinitions(relation, owner))
                 {
                     string key = $"{definition.Id}|{isInterface}";
                     if (!visited.Add(key))
@@ -2588,7 +3159,9 @@ namespace SetterChecker.Core
             Func<T, string> order)
             where T : class
         {
-            return items.SelectMany(item => keys(item).Select(key => (Key: key, Item: item)))
+            return items.SelectMany(item => keys(item)
+                    .Distinct(StringComparer.Ordinal)
+                    .Select(key => (Key: key, Item: item)))
                 .GroupBy(pair => pair.Key, StringComparer.Ordinal)
                 .ToDictionary(
                     group => group.Key,
@@ -2598,12 +3171,21 @@ namespace SetterChecker.Core
                     StringComparer.Ordinal);
         }
 
+        /// <summary>保存一个已经归一到实际运行文件的程序集身份。</summary>
+        private sealed record AssemblyRedirectTarget(
+            System.Reflection.AssemblyName Identity,
+            string? Path);
+
         /// <summary>保存一条已经闭合到类型定义的继承关系。</summary>
-        private sealed record InheritedTypeRelation(
+        internal sealed record InheritedTypeRelation(
             TypeEntry Definition,
             IReadOnlyList<TypeIdentityTemplate> TypeArguments,
             bool IsInterface,
             bool CanImplementInterface,
-            int Depth);
+            int Depth)
+        {
+            internal IReadOnlyList<TypeIdentityTemplate> SignatureArguments { get; init; } =
+                Array.Empty<TypeIdentityTemplate>();
+        }
     }
 }

@@ -93,8 +93,73 @@ namespace SetterChecker.Core.Tests
                 attribute.TypeName == "NoLogTrackAttribute" && attribute.HasArguments));
             Assert.IsTrue(plain.TypeAttributes.Any(attribute =>
                 attribute.TypeName == "NoLogTrackAttribute"));
-            Assert.IsTrue(result.Methods.Any(method => method.Kind == CatalogMethodKind.LocalFunction));
-            Assert.IsTrue(result.Methods.Any(method => method.Kind == CatalogMethodKind.AnonymousFunction));
+            Assert.IsTrue(result.Methods.Any(method => method.TypeName == "Sample"
+                && method.SourceSymbol == null
+                && !method.IsReportable));
+        }
+
+        // 验证带命名空间和全局限定写法的显式接口函数保留源码信息。
+        /// <summary>
+        /// 复刻协议生成源码使用 global 限定接口实现的写法。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncPairsGloballyQualifiedExplicitInterfaceMethod()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                namespace Contracts
+                {
+                    public interface IExtension { object GetExtension(bool create); }
+                }
+                namespace Samples
+                {
+                    public sealed class Message : global::Contracts.IExtension
+                    {
+                        object global::Contracts.IExtension.GetExtension(bool create) => null;
+                    }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(
+                new MaterialRequest(project.AssemblyDefinitionPath, 2));
+
+            MethodCatalogResult result = await new MethodCatalog().BuildAsync(material, 2);
+
+            MethodEntry method = result.Methods.Single(item => item.TypeName == "Samples.Message"
+                && item.Name == "global::Contracts.IExtension.GetExtension");
+            Assert.IsNotNull(method.SourceSymbol);
+            Assert.IsTrue(method.IsReportable);
+            Assert.AreEqual("System.Boolean", method.Parameters.Single().TypeName);
+            Assert.IsTrue(method.MetadataToken > 0);
+        }
+
+        // 验证接口和重写关系使用转交后的真实参数及返回类型。
+        /// <summary>
+        /// 同时覆盖隐式实现、显式实现、泛型接口和普通重写。
+        /// </summary>
+        [TestMethod]
+        [DataRow("Worker", "ForwardedSignature.IUse")]
+        [DataRow("ExplicitWorker", "ForwardedSignature.IUse")]
+        [DataRow("GenericWorker", "ForwardedSignature.IGenericUse<T>")]
+        [DataRow("ExplicitGenericWorker", "ForwardedSignature.IGenericUse<T>")]
+        [DataRow("DerivedWorker", "ForwardedSignature.Base")]
+        [DataRow("NestedWorker<T>", "ForwardedSignature.IGenericUse<T>")]
+        [DataRow("ExplicitNestedWorker<T>", "ForwardedSignature.IGenericUse<T>")]
+        [DataRow("DerivedGenericWorker<T>", "ForwardedSignature.GenericBase<T>")]
+        public async Task BuildAsyncResolvesForwardedImplementationSignatures(string workerName, string contractName)
+        {
+            using TestProject project = TestProject.CreateWithForwardedMethodSignature();
+            MaterialSet material = await new MaterialLoader().LoadAsync(
+                new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult result = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry worker = result.Types.Single(type => type.FullName == workerName);
+            result.RequireClosedHierarchy(worker);
+            TypeEntry contract = result.Types.Single(type => type.AssemblyPath == project.ForwardTargetPath
+                && type.FullName == contractName);
+            MethodEntry implementation = result.GetMethods(worker).Single(method =>
+                method.Name.EndsWith("Convert", StringComparison.Ordinal));
+            MethodEntry declaration = result.GetMethods(contract).Single(method => method.Name == "Convert");
+
+            CollectionAssert.AreEquivalent(new[] { declaration.LogicalId }, implementation.RelatedMethodIds.ToArray());
         }
 
         // 检查源码类型关系和函数重写索引。
@@ -240,6 +305,391 @@ namespace SetterChecker.Core.Tests
                 result.TypesByLogicalId[alias].Select(type => type.Id).ToArray(),
                 implementation.Id);
             Assert.IsTrue(result.GetMethods(implementation).Any());
+        }
+
+        // 检查外层门面可以穿过中间门面找到真实类型。
+        /// <summary>
+        /// 验证每层门面身份都映射到同一个最终类型及函数。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncMapsTwoForwardingFacadesToImplementation()
+        {
+            using TestProject project = TestProject.CreateWithTwoForwardingFacades();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+
+            MethodCatalogResult result = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry derived = result.Types.Single(type =>
+                type.FullName == "ForwardedConsumer.Derived");
+
+            result.RequireClosedHierarchy(derived);
+            TypeEntry implementation = result.Types.Single(type =>
+                type.AssemblyPath == project.ForwardTargetPath
+                && type.FullName == "ForwardedNamespace.ForwardedType");
+            string outerAlias = implementation.AliasIds.Single(alias =>
+                alias.Contains("OuterFacade", StringComparison.Ordinal));
+            string middleAlias = implementation.AliasIds.Single(alias =>
+                alias.Contains("MiddleFacade", StringComparison.Ordinal));
+
+            Assert.HasCount(2, implementation.AliasIds);
+            Assert.AreEqual(
+                implementation.Id,
+                result.TypesByLogicalId[implementation.LogicalId].Single().Id);
+            CollectionAssert.Contains(
+                result.TypesByLogicalId[outerAlias].Select(type => type.Id).ToArray(),
+                implementation.Id);
+            CollectionAssert.Contains(
+                result.TypesByLogicalId[middleAlias].Select(type => type.Id).ToArray(),
+                implementation.Id);
+            MethodEntry target = result.GetMethods(implementation).Single(method =>
+                method.Name == "Touch");
+            MethodEntry derivedTouch = result.GetMethods(derived).Single(method =>
+                method.Name == "Touch");
+
+            CollectionAssert.Contains(
+                derivedTouch.RelatedMethodIds.ToArray(),
+                target.LogicalId);
+        }
+
+        // 检查同一门面的未使用缺失分支不阻断已承载类型。
+        /// <summary>
+        /// 验证函数总表保留全部转交记录，并只闭合实际使用的已承载类型。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncClosesUsedTypeWhenAnotherForwarderTargetIsMissing()
+        {
+            using TestProject project = TestProject.CreateWithPartiallyMissingForwarders();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry root = catalog.Types.Single(type =>
+                type.FullName == "PartialForwardingConsumer.RootType");
+
+            catalog.RequireClosedHierarchy(root);
+            TypeEntry target = catalog.Types.Single(type =>
+                type.AssemblyPath == project.ForwardTargetPath
+                && type.FullName == "PartialForwarding.UsedType");
+            MethodEntry targetRead = catalog.GetMethods(target).Single(method =>
+                method.Name == "Read");
+            MethodEntry rootRead = catalog.GetMethods(root).Single(method =>
+                method.Name == "Read");
+
+            CollectionAssert.Contains(rootRead.RelatedMethodIds.ToArray(), targetRead.LogicalId);
+            Assert.IsFalse(catalog.Types.Any(type =>
+                type.FullName == "PartialForwarding.MissingType"));
+        }
+
+        // 检查参考门面有运行载体时只沿真实运行转交链。
+        /// <summary>
+        /// 验证目录闭合材料已经选定的唯一运行定义。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncAcceptsForwardingBranchesWithOneFinalDefinition()
+        {
+            using TestProject project = TestProject.CreateWithConvergingForwardingBranches();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry derived = catalog.Types.Single(type =>
+                type.FullName == "ConvergingConsumer.Derived");
+
+            catalog.RequireClosedHierarchy(derived);
+            TypeEntry finalType = catalog.Types.Single(type =>
+                type.AssemblyPath == project.UnityRuntimeTargetPath
+                && type.FullName == "Converging.ForwardedType");
+            MethodEntry finalTouch = catalog.GetMethods(finalType).Single(method =>
+                method.Name == "Touch");
+            MethodEntry derivedTouch = catalog.GetMethods(derived).Single(method =>
+                method.Name == "Touch");
+
+            CollectionAssert.Contains(derivedTouch.RelatedMethodIds.ToArray(), finalTouch.LogicalId);
+        }
+
+        // 检查参考门面的终点不会覆盖运行门面的不同终点。
+        /// <summary>
+        /// 验证目录只使用材料选定的运行转交链。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncUsesRuntimeEndpointWhenReferenceEndpointDiffers()
+        {
+            using TestProject project = TestProject.CreateWithConvergingForwardingBranches(
+                differentEndpoints: true);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry derived = catalog.Types.Single(type =>
+                type.FullName == "ConvergingConsumer.Derived");
+
+            catalog.RequireClosedHierarchy(derived);
+            TypeEntry target = catalog.Types.Single(type =>
+                type.AssemblyPath == project.ConvergingAlternateFinalPath
+                && type.FullName == "Converging.ForwardedType");
+            MethodEntry targetTouch = catalog.GetMethods(target).Single(method =>
+                method.Name == "Touch");
+            MethodEntry derivedTouch = catalog.GetMethods(derived).Single(method =>
+                method.Name == "Touch");
+
+            CollectionAssert.Contains(derivedTouch.RelatedMethodIds.ToArray(), targetTouch.LogicalId);
+        }
+
+        // 检查同一别名的任一缺失分支都不会被另一条完整分支掩盖。
+        /// <summary>
+        /// 验证实际命中多分支转交时必须闭合每一条分支。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncRejectsMissingBranchBehindSameForwardedIdentity()
+        {
+            using TestProject project = TestProject.CreateWithMissingConvergingForwardingBranch();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry derived = catalog.Types.Single(type =>
+                type.FullName == "ConvergingConsumer.Derived");
+
+            AnalysisException exception = Assert.Throws<AnalysisException>(() =>
+                catalog.RequireClosedHierarchy(derived));
+
+            StringAssert.Contains(exception.Message, "ConvergingMiddleB");
+        }
+
+        // 检查接口实现会沿查找目录中的间接基类完整闭合。
+        /// <summary>
+        /// 验证接口索引不会漏掉从延迟基类继承接口的派生类型。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncIndexesInterfaceInheritedFromLookupOnlyBase()
+        {
+            using TestProject project = TestProject.CreateWithTransitiveInterfaceHierarchy();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry derived = catalog.Types.Single(type =>
+                type.FullName == "LookupConsumer.Derived");
+            System.Reflection.AssemblyName contractIdentity =
+                System.Reflection.AssemblyName.GetAssemblyName(project.ExternalReferencePath);
+
+            TypeEntry contract = catalog.LoadAssemblyTypes(
+                    contractIdentity,
+                    project.ExternalAssemblyPath)
+                .Single(type => type.FullName == "LookupContract.IRun");
+
+            catalog.RequireClosedHierarchy(derived);
+            TypeEntry implementation = catalog.ImplementingTypesByInterfaceId[contract.LogicalId]
+                .Single(type => type.Id == derived.Id);
+            TypeEntry baseType = catalog.Types.Single(type =>
+                type.FullName == "LookupBase.Base");
+
+            Assert.AreEqual(derived.Id, implementation.Id);
+            CollectionAssert.Contains(
+                catalog.DerivedTypesByBaseId[baseType.LogicalId]
+                    .Select(type => type.Id).ToArray(),
+                derived.Id);
+            MethodEntry contractMethod = catalog.GetMethods(contract).Single(method =>
+                method.Name == "Run");
+            MethodEntry baseMethod = catalog.GetMethods(baseType).Single(method =>
+                method.Name == "Run");
+            MethodEntry derivedMethod = catalog.GetMethods(derived).Single(method =>
+                method.Name == "Run");
+            CollectionAssert.Contains(
+                baseMethod.RelatedMethodIds.ToArray(),
+                contractMethod.LogicalId);
+            CollectionAssert.Contains(
+                derivedMethod.RelatedMethodIds.ToArray(),
+                baseMethod.LogicalId);
+        }
+
+        // 检查参考目录的同目录桩不能被目录额外注入为运行载体。
+        /// <summary>
+        /// 验证目录只从材料核实的候选中选择转交目标。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncRejectsReferenceSiblingAsForwardingCarrier()
+        {
+            using TestProject project = TestProject.CreateWithReferenceSiblingForwarderStub();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            System.Reflection.AssemblyName targetIdentity =
+                System.Reflection.AssemblyName.GetAssemblyName(project.UnityReferenceSiblingPath);
+
+            AnalysisException exception = Assert.Throws<AnalysisException>(() =>
+                catalog.LoadAssemblyTypes(targetIdentity, project.UnityReferencePath));
+
+            StringAssert.Contains(exception.Message, "ReferenceOnlyTarget");
+        }
+
+        // 检查真正命中缺失转交载体时不会返回空候选继续分析。
+        /// <summary>
+        /// 验证缺失类型进入实际继承关系时准确停止并报告目标程序集。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncRejectsUsedMissingForwarderTarget()
+        {
+            using TestProject project = TestProject.CreateWithPartiallyMissingForwarders();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry consumer = catalog.Types.Single(type =>
+                type.FullName == "PartialForwardingConsumer.MissingConsumer");
+
+            AnalysisException exception = Assert.Throws<AnalysisException>(() =>
+                catalog.RequireClosedHierarchy(consumer));
+
+            StringAssert.Contains(exception.Message, "MissingForwardTarget");
+        }
+
+        // 检查转交链缺少最终真实类型时不会生成假别名。
+        /// <summary>
+        /// 验证真实继承关系需要闭合时会报告缺失的最终程序集。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncRejectsMissingEndOfForwardingChain()
+        {
+            using TestProject project = TestProject.CreateWithTwoForwardingFacades();
+            File.Delete(project.ForwardTargetPath);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+            MethodCatalogResult result = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry derived = result.Types.Single(type =>
+                type.FullName == "ForwardedConsumer.Derived");
+
+            AnalysisException exception = Assert.Throws<AnalysisException>(() =>
+                result.RequireClosedHierarchy(derived));
+
+            StringAssert.Contains(exception.Message, "FinalImplementation");
+        }
+
+        // 检查转交链循环时不会无限递归。
+        /// <summary>
+        /// 验证闭合真实继承关系时准确报告门面循环。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncRejectsForwardingCycle()
+        {
+            using TestProject project = TestProject.CreateWithForwardingCycle();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+            MethodCatalogResult result = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry derived = result.Types.Single(type =>
+                type.FullName == "ForwardedConsumer.Derived");
+
+            AnalysisException exception = Assert.Throws<AnalysisException>(() =>
+                result.RequireClosedHierarchy(derived));
+
+            StringAssert.Contains(exception.Message, "循环");
+        }
+
+        // 检查同一完整门面身份不能转交到两个目标。
+        /// <summary>
+        /// 验证转交分叉会报告精确的门面类型身份。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncRejectsAmbiguousForwardingTargets()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteAmbiguousForwardedAssemblies();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+
+            AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() =>
+                new MethodCatalog().BuildAsync(material, 2));
+
+            StringAssert.Contains(exception.Message, "对应多个真实类型");
+        }
+
+        // 检查外层门面与最终实现同名时仍按版本分辨转交节点。
+        /// <summary>
+        /// 验证同一逻辑类型名的高版本门面可准确落到低版本真实类型。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncKeepsSameNameVersionedForwardingAlias()
+        {
+            using TestProject project =
+                TestProject.CreateWithSameNameVersionedForwardingFacades();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+            MethodCatalogResult result = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry derived = result.Types.Single(type =>
+                type.FullName == "ForwardedConsumer.Derived");
+
+            result.RequireClosedHierarchy(derived);
+            TypeEntry implementation = result.Types.Single(type =>
+                type.AssemblyPath == project.ForwardTargetPath
+                && type.FullName == "ForwardedNamespace.ForwardedType");
+            MethodEntry target = result.GetMethods(implementation).Single(method =>
+                method.Name == "Touch");
+            MethodEntry derivedTouch = result.GetMethods(derived).Single(method =>
+                method.Name == "Touch");
+
+            CollectionAssert.Contains(implementation.AliasIds.ToArray(), implementation.LogicalId);
+            Assert.AreEqual(
+                implementation.Id,
+                result.TypesByLogicalId[implementation.LogicalId].Single().Id);
+            CollectionAssert.Contains(
+                derivedTouch.RelatedMethodIds.ToArray(),
+                target.LogicalId);
+        }
+
+        // 检查材料已证明的程序集重映射贯穿类型与函数目录。
+        /// <summary>
+        /// 验证4.2参考身份通过唯一4.0运行文件闭合继承、迟加载和普通函数查找。
+        /// </summary>
+        [TestMethod]
+        [DataRow(true)]
+        [DataRow(false)]
+        public async Task BuildAsyncUsesProvenAssemblyRedirectForTypesAndMethods(bool includeOldVersionReference)
+        {
+            using TestProject project = TestProject.CreateWithUnityFrameworkVersionRemapping(
+                includeOldVersionReference: includeOldVersionReference);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            System.Reflection.AssemblyName referenceAssembly =
+                System.Reflection.AssemblyName.GetAssemblyName(
+                    project.UnityFrameworkReferencePath);
+            TypeEntry derived = catalog.Types.Single(type =>
+                type.FullName == "UnityFrameworkConsumer.Derived");
+
+            IReadOnlyList<TypeEntry> loaded = catalog.LoadAssemblyTypes(
+                referenceAssembly,
+                project.ExternalAssemblyPath);
+            catalog.RequireClosedHierarchy(derived);
+            TypeEntry baseType = catalog.Types.Single(type =>
+                type.FullName == "UnityFrameworkTypes.BaseType");
+            MethodEntry baseMethod = catalog.GetMethods(baseType).Single(method =>
+                method.Name == "Read");
+            MethodEntry derivedMethod = catalog.GetMethods(derived).Single(method =>
+                method.Name == "Read");
+            BehaviorReadResult behaviors = await new BehaviorReader().ReadAsync(
+                material,
+                catalog,
+                new[] { baseMethod, derivedMethod },
+                2);
+
+            Assert.IsTrue(loaded.Any(type => type.Id == baseType.Id));
+            Assert.AreEqual(project.UnityRuntimeFrameworkPath, baseType.AssemblyPath);
+            CollectionAssert.Contains(derivedMethod.RelatedMethodIds.ToArray(), baseMethod.LogicalId);
+            Assert.AreEqual(project.UnityRuntimeFrameworkPath, baseMethod.AssemblyPath);
+            Assert.IsGreaterThan(0, baseMethod.MetadataToken);
+            CollectionAssert.AreEquivalent(
+                new[] { baseMethod.Id, derivedMethod.Id },
+                behaviors.Methods.Select(method => method.MethodId).ToArray());
         }
 
         // 检查与当前分析无关的缺失外部继承目标会被明确登记。
@@ -487,6 +937,322 @@ namespace SetterChecker.Core.Tests
             }
         }
 
+        // 检查源码和真实 DLL 都保留抽象类事实。
+        /// <summary>
+        /// 验证实际接收类型候选可以排除抽象类。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncRecordsSourceAndManagedAbstractTypes()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets(
+                "namespace Samples; public abstract class AbstractSample { }");
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry source = catalog.Types.Single(type =>
+                type.FullName == "SourceSamples.AbstractSample");
+            TypeEntry managed = catalog.Types.Single(type =>
+                type.FullName == "ExternalSamples.AbstractSample");
+
+            Assert.IsTrue(source.IsAbstract);
+            Assert.IsTrue(managed.IsAbstract);
+        }
+
+        // 检查源码析构函数不会被普通函数统计规则收录。
+        /// <summary>
+        /// 验证析构函数保留源码种类并排除于最终标签统计范围。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncKeepsSourceDestructorKindAndExcludesItFromReport()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Finalizable
+                {
+                    ~Finalizable() { }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry destructor = catalog.Methods.Single(method =>
+                method.TypeName == "SourceSamples.Finalizable" && method.Name == "Finalize");
+
+            Assert.AreEqual(CatalogMethodKind.Destructor, destructor.Kind);
+            Assert.IsFalse(destructor.IsReportable);
+        }
+
+        // 检查嵌套泛型源码声明与内存 PE 通过标准成员编号精确配对。
+        /// <summary>
+        /// 验证源码信息、泛型身份、接口关系和生成函数物理身份同时保留。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncPairsNestedGenericSourceWithEmittedMetadata()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                [System.AttributeUsage(System.AttributeTargets.Method)]
+                public sealed class NoLogTrackAttribute : System.Attribute
+                {
+                    public NoLogTrackAttribute(string reason) { }
+                }
+                public interface IContract<T>
+                {
+                    T Echo<V>(ref T value, V other);
+                }
+                public sealed class Outer<T>
+                {
+                    public sealed class Inner<U> : IContract<U>
+                    {
+                        [NoLogTrack("why")]
+                        public U Echo<V>(ref U value, V other) => value;
+                        public U Run(U value)
+                        {
+                            static U Local(U item) => item;
+                            System.Func<U, U> callback = item => item;
+                            return callback(Local(value));
+                        }
+                    }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry inner = catalog.Types.Single(type =>
+                type.SourceSymbol != null
+                && type.FullName == "SourceSamples.Outer<T>.Inner<U>");
+            MethodEntry echo = catalog.Methods.Single(method =>
+                method.TypeId == inner.Id && method.Name == "Echo");
+            MethodEntry contract = catalog.Methods.Single(method =>
+                method.TypeName == "SourceSamples.IContract<T>" && method.Name == "Echo");
+            MethodEntry generated = catalog.Methods.Single(method =>
+                method.TypeId == inner.Id
+                && method.Name.Contains("g__Local", StringComparison.Ordinal));
+
+            Assert.IsNotNull(echo.SourceSymbol);
+            Assert.AreEqual(project.RootSourcePath, echo.SourcePath);
+            Assert.IsGreaterThan(0, echo.Line);
+            Assert.AreEqual(echo.LogicalId, echo.Id);
+            Assert.IsGreaterThan(0, echo.MetadataToken);
+            Assert.IsTrue(echo.MethodAttributes.Any(attribute =>
+                attribute.TypeName == "SourceSamples.NoLogTrackAttribute"
+                && attribute.HasArguments));
+            Assert.AreEqual("!1&", echo.Parameters[0].TypeId);
+            Assert.AreEqual("!!0", echo.Parameters[1].TypeId);
+            Assert.AreEqual("!1", echo.ReturnTypeId);
+            CollectionAssert.Contains(echo.RelatedMethodIds.ToArray(), contract.LogicalId);
+            Assert.IsNull(generated.SourceSymbol);
+            Assert.AreNotEqual(generated.LogicalId, generated.Id);
+            Assert.IsGreaterThan(0, generated.MetadataToken);
+        }
+
+        // 检查源码编号和位置保留时已绑定内存 PE 元数据。
+        /// <summary>
+        /// 验证普通函数、属性 setter 和构造函数共用真实函数体入口。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncBindsSourceDeclarationsToEmittedMetadata()
+        {
+            using TestProject project = TestProject.CreateWithBehaviorMethods();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            SourceAssemblyMaterial sourceAssembly = material.SourceAssemblies.Single(assembly =>
+                assembly.IsReportAssembly);
+            IReadOnlyDictionary<string, int> expectedLines = new Dictionary<string, int>
+            {
+                [".ctor"] = 103,
+                ["set_Value"] = 95,
+                ["WriteField"] = 119,
+            };
+
+            foreach ((string name, int line) in expectedLines)
+            {
+                MethodEntry method = catalog.Methods.Single(item =>
+                    item.TypeName == "SourceSamples.BehaviorSample" && item.Name == name);
+                Assert.AreEqual(method.LogicalId, method.Id);
+                Assert.AreEqual(project.RootSourcePath, method.SourcePath);
+                Assert.AreEqual(line, method.Line);
+                Assert.AreEqual(sourceAssembly.AssemblyPath, method.AssemblyPath);
+                Assert.IsGreaterThan(0, method.MetadataToken);
+            }
+        }
+
+        // 验证普通同名结构体不因名字相同被当作系统类型。
+        /// <summary>
+        /// 没有专用元素码的值类型必须保留其实际声明来源。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncPreservesAssemblyIdentityForNamedValueTypes()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                namespace System { public struct Decimal { } }
+                public class Sample { public System.Decimal Echo(System.Decimal value) => value; }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(
+                new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry localType = catalog.Types.Single(type => type.SourceSymbol != null && type.FullName == "System.Decimal");
+            MethodEntry method = catalog.Methods.Single(item => item.TypeName == "Sample" && item.Name == "Echo");
+
+            Assert.AreEqual(localType.LogicalId, method.Parameters.Single().TypeId);
+            Assert.AreEqual(localType.LogicalId, method.ReturnTypeId);
+        }
+
+        // 验证按程序集读取已经编译的源码时仍返回同一份带标签目录。
+        /// <summary>
+        /// 延迟读取入口不能重新暴露源码回贴前的内部元数据记录。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncKeepsSourceFactsWhenLoadingAnExistingAssembly()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                [System.Obsolete] public class Sample { [System.Obsolete] public void Run() { } }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(
+                new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            SourceAssemblyMaterial source = material.SourceAssemblies.Single();
+            TypeEntry expected = catalog.Types.Single(type => type.FullName == "Sample");
+            MethodEntry expectedMethod = catalog.Methods.Single(method => method.TypeName == "Sample" && method.Name == "Run");
+
+            TypeEntry loaded = catalog.LoadAssemblyTypes(
+                    new System.Reflection.AssemblyName(source.Compilation.Assembly.Identity.GetDisplayName()), source.AssemblyPath)
+                .Single(type => type.FullName == "Sample");
+            MethodEntry method = catalog.GetMethods(loaded).Single(candidate => candidate.Name == "Run");
+
+            Assert.AreEqual(expected.Id, loaded.Id);
+            Assert.AreSame(expected.SourceSymbol, loaded.SourceSymbol);
+            CollectionAssert.AreEqual(expected.Attributes.ToArray(), loaded.Attributes.ToArray());
+            Assert.AreEqual(expectedMethod.Id, method.Id);
+            Assert.AreEqual(expectedMethod.SourcePath, method.SourcePath);
+            CollectionAssert.AreEqual(expectedMethod.MethodAttributes.ToArray(), method.MethodAttributes.ToArray());
+        }
+
+        // 检查没有专用元数据元素类型的基础值类型也能绑定内存函数。
+        /// <summary>
+        /// 验证 decimal、IntPtr 与 UIntPtr 的源码签名和 Cecil 签名使用同一身份。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncBindsSpecialValueTypeSignaturesToMetadata()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class ValueTypes
+                {
+                    // 接收 decimal 参数。
+                    public void Write(decimal number) { }
+                    // 返回传入的 decimal。
+                    public decimal Echo(decimal number) => number;
+                    // 保留平台有符号指针类型。
+                    public System.IntPtr EchoIntPtr(System.IntPtr value) => value;
+                    // 保留平台无符号指针类型。
+                    public System.UIntPtr EchoUIntPtr(System.UIntPtr value) => value;
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] methods = catalog.Methods.Where(method =>
+                    method.TypeName == "SourceSamples.ValueTypes")
+                .ToArray();
+            TypeEntry decimalType = catalog.Types.Single(type => type.FullName == "System.Decimal"
+                && type.AssemblyPath == typeof(decimal).Assembly.Location);
+            TypeEntry externalType = catalog.Types.Single(type => type.FullName == "ExternalSamples.ValueTypes");
+            IReadOnlyList<MethodEntry> externalMethods = catalog.GetMethods(externalType);
+
+            Assert.HasCount(5, methods);
+            Assert.IsTrue(methods.All(method => method.MetadataToken > 0));
+            foreach (MethodEntry method in methods.Where(method => method.Name != ".ctor"))
+            {
+                string expectedType = method.Name switch
+                {
+                    "EchoIntPtr" => "System.IntPtr",
+                    "EchoUIntPtr" => "System.UIntPtr",
+                    _ => decimalType.LogicalId,
+                };
+                Assert.AreEqual(expectedType, method.Parameters.Single().TypeId);
+                Assert.AreEqual(expectedType, externalMethods.Single(candidate => candidate.Name == method.Name)
+                    .Parameters.Single().TypeId);
+                Assert.AreEqual(
+                    method.Name == "Write" ? "System.Void" : expectedType,
+                    method.ReturnTypeId);
+            }
+
+            Assert.AreEqual(decimalType.Id, catalog.TypesByLogicalId[methods.Single(method => method.Name == "Echo")
+                .Parameters.Single().TypeId].Single().Id);
+        }
+
+        // 检查Unity门面的参考类型身份连接到转交后的真实定义。
+        /// <summary>
+        /// 验证类型层级闭合使用运行目标，不把参考门面当成实现。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncResolvesUnityFacadeAliasToForwardedType()
+        {
+            using TestProject project = TestProject.CreateWithUnityRuntimeCandidate(
+                runtimeIsForwardingFacade: true);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry derived = catalog.Types.Single(type =>
+                type.FullName == "UnityFacadeConsumer.Derived");
+            TypeEntry baseType = catalog.Types.Single(type =>
+                type.FullName == "UnityFacadeTypes.BaseType");
+
+            catalog.RequireClosedHierarchy(derived);
+            Assert.AreEqual(project.UnityRuntimeTargetPath, baseType.AssemblyPath);
+            Assert.IsTrue(baseType.AliasIds.Contains(
+                derived.BaseType!.DefinitionId,
+                StringComparer.Ordinal));
+            Assert.IsFalse(catalog.Types.Any(type => string.Equals(
+                type.AssemblyPath,
+                project.UnityReferencePath,
+                StringComparison.OrdinalIgnoreCase)));
+        }
+
+        // 检查源码目录绝不回读输出路径上的旧文件。
+        /// <summary>
+        /// 验证磁盘输出损坏也不影响已生成的内存 PE。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncReadsSourceMetadataFromMemoryWhenOutputIsStale()
+        {
+            using TestProject project = TestProject.CreateWithBehaviorMethods();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+            SourceAssemblyMaterial sourceAssembly = material.SourceAssemblies.Single(assembly =>
+                assembly.IsReportAssembly);
+            File.WriteAllText(sourceAssembly.AssemblyPath, "stale output");
+
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry method = catalog.Methods.Single(item =>
+                item.TypeName == "SourceSamples.BehaviorSample" && item.Name == "WriteField");
+            TypeEntry generatedType = catalog.Types.First(type =>
+                type.SourceSymbol == null
+                && type.AssemblyPath == sourceAssembly.AssemblyPath);
+            IReadOnlyList<MethodEntry> generatedMethods = catalog.GetMethods(generatedType);
+
+            Assert.AreEqual(sourceAssembly.AssemblyPath, method.AssemblyPath);
+            Assert.IsGreaterThan(0, method.MetadataToken);
+            Assert.IsNotEmpty(generatedMethods);
+            Assert.IsTrue(generatedMethods.All(item => item.MetadataToken > 0));
+        }
+
         // 检查目标包内的源码依赖进入最终统计。
         /// <summary>
         /// 验证统计范围按包目录判断而不依赖程序集名称。
@@ -503,6 +1269,49 @@ namespace SetterChecker.Core.Tests
 
             Assert.IsTrue(result.Methods.Single(method =>
                 method.Name == "DependencyMethod").IsReportable);
+        }
+
+        // 检查同一运行文件的本地标记与外部按名引用遵循Unity Mono的不同规则。
+        /// <summary>
+        /// 验证本地函数和继承仍使用TypeDef，外部TypeRef使用同名类型转交目标。
+        /// </summary>
+        [TestMethod]
+        public async Task BuildAsyncDistinguishesLocalDefinitionsFromForwardedNameLookups()
+        {
+            using TestProject project = TestProject.CreateWithDefinitionAndSameFileForwarder();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(
+                project.AssemblyDefinitionPath,
+                2));
+
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry externalDerived = catalog.Types.Single(type =>
+                type.AssemblyPath == project.ExternalAssemblyPath
+                && type.FullName == "SameFileForwardingConsumer.ExternalDerived");
+            catalog.RequireClosedHierarchy(externalDerived);
+            TypeEntry localEntry = catalog.Types.Single(type =>
+                type.AssemblyPath == project.ExternalReferencePath
+                && type.FullName == "SameFileForwarding.Entry");
+            TypeEntry targetEntry = catalog.Types.Single(type =>
+                type.AssemblyPath == project.ForwardTargetPath
+                && type.FullName == "SameFileForwarding.Entry");
+            TypeEntry localDerived = catalog.Types.Single(type =>
+                type.AssemblyPath == project.ExternalReferencePath
+                && type.FullName == "SameFileForwarding.LocalDerived");
+
+            catalog.RequireClosedHierarchy(localDerived);
+            MethodEntry localBaseTouch = catalog.GetMethods(localEntry).Single(method =>
+                method.Name == "Touch");
+            MethodEntry targetTouch = catalog.GetMethods(targetEntry).Single(method =>
+                method.Name == "Touch");
+            MethodEntry localOverride = catalog.GetMethods(localDerived).Single(method =>
+                method.Name == "Touch");
+            MethodEntry externalOverride = catalog.GetMethods(externalDerived).Single(method =>
+                method.Name == "Touch");
+
+            CollectionAssert.Contains(localOverride.RelatedMethodIds.ToArray(), localBaseTouch.LogicalId);
+            CollectionAssert.DoesNotContain(localOverride.RelatedMethodIds.ToArray(), targetTouch.LogicalId);
+            CollectionAssert.Contains(externalOverride.RelatedMethodIds.ToArray(), targetTouch.LogicalId);
+            CollectionAssert.DoesNotContain(externalOverride.RelatedMethodIds.ToArray(), localBaseTouch.LogicalId);
         }
 
         // 对比单线程和四线程建立的稳定清单。
@@ -528,5 +1337,6 @@ namespace SetterChecker.Core.Tests
                 oneJob.Types.Select(type => type.Id).ToArray(),
                 fourJobs.Types.Select(type => type.Id).ToArray());
         }
+
     }
 }

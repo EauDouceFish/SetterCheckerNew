@@ -1,10 +1,5 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.FlowAnalysis;
-using Microsoft.CodeAnalysis.Operations;
 using Cecil = Mono.Cecil;
 using Cil = Mono.Cecil.Cil;
 using OpCode = Mono.Cecil.Cil.OpCode;
@@ -34,40 +29,27 @@ namespace SetterChecker.Core
             }
 
             Stopwatch stopwatch = Stopwatch.StartNew();
-            IReadOnlyDictionary<string, SourceAssemblyMaterial> sourceAssemblies =
-                material.SourceAssemblies.ToDictionary(
-                    assembly => assembly.Name,
-                    StringComparer.Ordinal);
-            Dictionary<ISymbol, string> sourceMethodIds = new(SymbolEqualityComparer.Default);
-            foreach (MethodEntry method in catalog.Methods.Where(method => method.SourceSymbol != null))
-            {
-                sourceMethodIds.Add(method.SourceSymbol!.OriginalDefinition, method.Id);
-            }
-
-            long sourcePartitionCount = (long)jobs * 4;
+            IReadOnlyDictionary<string, byte[]> sourceImages = material.SourceAssemblies.ToDictionary(
+                assembly => Path.GetFullPath(assembly.AssemblyPath),
+                assembly => assembly.AssemblyImage,
+                StringComparer.OrdinalIgnoreCase);
+            long partitionCount = (long)jobs * 4;
             BehaviorWorkItem[] workItems = methods
-                .Where(method => method.SourceSymbol != null)
-                .GroupBy(method => method.AssemblyName, StringComparer.Ordinal)
+                .GroupBy(
+                    method => method.AssemblyPath
+                        ?? throw new AnalysisException($"函数缺少实际程序集：{method.Id}"),
+                    StringComparer.OrdinalIgnoreCase)
                 .SelectMany(group =>
                 {
                     MethodEntry[] assemblyMethods = group.ToArray();
                     int batchSize = (int)Math.Max(
                         1,
-                        (assemblyMethods.Length + sourcePartitionCount - 1)
-                            / sourcePartitionCount);
+                        (assemblyMethods.Length + partitionCount - 1) / partitionCount);
 
                     return assemblyMethods.Chunk(batchSize).Select(batch => new BehaviorWorkItem(
-                        sourceAssemblies[group.Key],
-                        null,
+                        group.Key,
                         batch));
                 })
-                .Concat(methods
-                    .Where(method => method.SourceSymbol == null)
-                    .GroupBy(
-                        method => method.AssemblyPath
-                            ?? throw new AnalysisException($"托管函数缺少真实文件：{method.Id}"),
-                        StringComparer.OrdinalIgnoreCase)
-                    .Select(group => new BehaviorWorkItem(null, group.Key, group.ToArray())))
                 .ToArray();
             ConcurrentBag<IReadOnlyList<MethodBehavior>> parts = new();
 
@@ -80,17 +62,12 @@ namespace SetterChecker.Core
                 },
                 (workItem, token) =>
                 {
-                    parts.Add(workItem.SourceAssembly != null
-                        ? ReadSourceBehaviors(
-                            workItem.SourceAssembly,
-                            catalog,
-                            sourceMethodIds,
-                            workItem.Methods,
-                            token)
-                        : ReadManagedBehaviors(
-                            workItem.AssemblyPath!,
-                            catalog,
-                            workItem.Methods));
+                    token.ThrowIfCancellationRequested();
+                    parts.Add(ReadManagedBehaviors(
+                        workItem.AssemblyPath,
+                        sourceImages,
+                        catalog,
+                        workItem.Methods));
 
                     return ValueTask.CompletedTask;
                 }).ConfigureAwait(false);
@@ -105,56 +82,17 @@ namespace SetterChecker.Core
             return new BehaviorReadResult(ordered, stopwatch.Elapsed);
         }
 
-        // 使用 Roslyn 当前编译内容直接读取这一批源码函数。
-        private static IReadOnlyList<MethodBehavior> ReadSourceBehaviors(
-            SourceAssemblyMaterial assembly,
-            MethodCatalogResult catalog,
-            IReadOnlyDictionary<ISymbol, string> sourceMethodIds,
-            IReadOnlyList<MethodEntry> methods,
-            CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            return methods.Select(method => ReadSourceBehavior(
-                    assembly.Compilation,
-                    catalog,
-                    sourceMethodIds,
-                    method,
-                    cancellationToken))
-                .ToArray();
-        }
-
-        // 为源码读取错误补充当前函数身份，确保真实项目问题可以直接定位。
-        private static MethodBehavior ReadSourceBehavior(
-            CSharpCompilation compilation,
-            MethodCatalogResult catalog,
-            IReadOnlyDictionary<ISymbol, string> sourceMethodIds,
-            MethodEntry method,
-            CancellationToken cancellationToken)
-        {
-            try
-            {
-                return new SourceBehaviorBuilder(
-                    compilation,
-                    catalog,
-                    sourceMethodIds,
-                    method,
-                    cancellationToken).Read();
-            }
-            catch (AnalysisException exception)
-            {
-                throw new AnalysisException($"读取源码函数失败：{method.Id} => {exception.Message}");
-            }
-        }
-
-        // 一次打开真实文件并读取这一批托管函数。
+        // 一次打开内存编译结果或真实托管文件并读取一批函数。
         private static IReadOnlyList<MethodBehavior> ReadManagedBehaviors(
             string assemblyPath,
+            IReadOnlyDictionary<string, byte[]> sourceImages,
             MethodCatalogResult catalog,
             IReadOnlyList<MethodEntry> methods)
         {
-            using ManagedAssemblyResolver resolver = new(catalog, assemblyPath);
-            Cecil.ModuleDefinition module = resolver.ReadAssembly(assemblyPath).MainModule;
+            string fullPath = Path.GetFullPath(assemblyPath);
+            using Cecil.ModuleDefinition module = sourceImages.TryGetValue(fullPath, out byte[]? image)
+                ? MethodCatalog.OpenModule(image)
+                : MethodCatalog.OpenModule(fullPath);
 
             if (methods.Any(method => !string.Equals(
                     method.AssemblyName,
@@ -169,79 +107,6 @@ namespace SetterChecker.Core
                     catalog,
                     method))
                 .ToArray();
-        }
-
-        /// <summary>
-        /// 让 Cecil 依赖读取复用函数总表的精确文件定位，并在本批结束时释放文件。
-        /// </summary>
-        private sealed class ManagedAssemblyResolver : Cecil.IAssemblyResolver
-        {
-            private readonly MethodCatalogResult m_catalog;
-            private readonly string m_referringAssemblyPath;
-            private readonly Dictionary<string, Cecil.AssemblyDefinition> m_assemblies;
-            private readonly bool m_ownsAssemblies;
-
-            // 为当前文件保存引用上下文，嵌套读取共享本批已打开的程序集。
-            public ManagedAssemblyResolver(
-                MethodCatalogResult catalog,
-                string referringAssemblyPath,
-                Dictionary<string, Cecil.AssemblyDefinition>? assemblies = null)
-            {
-                this.m_catalog = catalog;
-                this.m_referringAssemblyPath = referringAssemblyPath;
-                this.m_ownsAssemblies = assemblies == null;
-                this.m_assemblies = assemblies ?? new(StringComparer.OrdinalIgnoreCase);
-            }
-
-            // 按引用的完整身份选择唯一真实文件。
-            public Cecil.AssemblyDefinition Resolve(Cecil.AssemblyNameReference name)
-            {
-                return ReadAssembly(this.m_catalog.ResolveAssemblyPath(
-                    new System.Reflection.AssemblyName(name.FullName),
-                    this.m_referringAssemblyPath));
-            }
-
-            // Cecil 的读取参数不会改变本工具统一的文件与身份约束。
-            public Cecil.AssemblyDefinition Resolve(
-                Cecil.AssemblyNameReference name,
-                Cecil.ReaderParameters parameters)
-            {
-                return Resolve(name);
-            }
-
-            // 每个精确路径只打开一次，并把新文件本身设为其依赖的引用上下文。
-            public Cecil.AssemblyDefinition ReadAssembly(string path)
-            {
-                if (!this.m_assemblies.TryGetValue(path, out Cecil.AssemblyDefinition? assembly))
-                {
-                    assembly = Cecil.AssemblyDefinition.ReadAssembly(
-                        path,
-                        new Cecil.ReaderParameters
-                        {
-                            AssemblyResolver = new ManagedAssemblyResolver(
-                                this.m_catalog,
-                                path,
-                                this.m_assemblies),
-                            InMemory = true,
-                            ReadingMode = Cecil.ReadingMode.Deferred,
-                        });
-                    this.m_assemblies.Add(path, assembly);
-                }
-
-                return assembly;
-            }
-
-            // 只有本批读取的拥有者负责释放共享的所有程序集。
-            public void Dispose()
-            {
-                if (this.m_ownsAssemblies)
-                {
-                    foreach (Cecil.AssemblyDefinition assembly in this.m_assemblies.Values)
-                    {
-                        assembly.Dispose();
-                    }
-                }
-            }
         }
 
         // 按一个确定的函数定义标记读取函数体或明确的无托管体边界。
@@ -289,2920 +154,11 @@ namespace SetterChecker.Core
         }
 
         /// <summary>
-        /// 保存一次共享源码编译或托管文件读取所处理的函数批次。
+        /// 保存一次程序集内容读取所处理的函数批次。
         /// </summary>
         private sealed record BehaviorWorkItem(
-            SourceAssemblyMaterial? SourceAssembly,
-            string? AssemblyPath,
+            string AssemblyPath,
             IReadOnlyList<MethodEntry> Methods);
-
-        /// <summary>
-        /// 使用 Roslyn 操作树把一个源码函数转换为统一行为事实。
-        /// </summary>
-        private sealed class SourceBehaviorBuilder : OperationWalker
-        {
-            private readonly CSharpCompilation m_compilation;
-            private readonly MethodCatalogResult m_catalog;
-            private readonly IReadOnlyDictionary<ISymbol, string> m_sourceMethodIds;
-            private readonly MethodEntry m_method;
-            private readonly CancellationToken m_cancellationToken;
-            private readonly Dictionary<IOperation, int> m_valueIds = new(
-                ReferenceEqualityComparer.Instance);
-            private readonly Dictionary<IParameterSymbol, int> m_parameterValueIds = new(
-                SymbolEqualityComparer.Default);
-            private readonly Dictionary<ILocalSymbol, int> m_localValueIds = new(
-                SymbolEqualityComparer.Default);
-            private readonly Dictionary<ISymbol, int> m_capturedValueIds = new(
-                SymbolEqualityComparer.Default);
-            private readonly Dictionary<CaptureId, int> m_captureValueIds = new();
-            private readonly Dictionary<CaptureId, IOperation> m_captureOperations = new();
-            private readonly List<BehaviorValue> m_values = new();
-            private readonly List<BehaviorAssignment> m_assignments = new();
-            private readonly List<BehaviorWrite> m_writes = new();
-            private readonly List<BehaviorCall> m_calls = new();
-            private readonly List<BehaviorReturn> m_returns = new();
-            private readonly List<BehaviorFlowBlock> m_blocks = new();
-            private readonly List<BehaviorFlowRegion> m_regions = new();
-            private readonly HashSet<IOperation> m_recordedCalls = new(
-                ReferenceEqualityComparer.Instance);
-            private readonly HashSet<IOperation> m_writeTargets = new(
-                ReferenceEqualityComparer.Instance);
-            private readonly HashSet<IOperation> m_recordedInitializers = new(
-                ReferenceEqualityComparer.Instance);
-            private readonly Stack<int> m_implicitReceivers = new();
-            private readonly Stack<int> m_conditionalReceivers = new();
-            private int? m_currentInstanceValueId;
-            private int? m_capturedInstanceValueId;
-            private int m_currentBlockId;
-            private int m_nextOrder;
-            private bool m_hasInitializerBlock;
-
-            // 保存当前源码编译、函数总表和正在读取的函数。
-            public SourceBehaviorBuilder(
-                CSharpCompilation compilation,
-                MethodCatalogResult catalog,
-                IReadOnlyDictionary<ISymbol, string> sourceMethodIds,
-                MethodEntry method,
-                CancellationToken cancellationToken)
-            {
-                this.m_compilation = compilation;
-                this.m_catalog = catalog;
-                this.m_sourceMethodIds = sourceMethodIds;
-                this.m_method = method;
-                this.m_cancellationToken = cancellationToken;
-            }
-
-            // 读取函数声明、明确原生入口或编译器生成的简单访问器。
-            public MethodBehavior Read()
-            {
-                IMethodSymbol symbol = this.m_method.SourceSymbol
-                    ?? throw new AnalysisException($"源码函数缺少 Roslyn 符号：{this.m_method.Id}");
-                if (symbol.IsAbstract)
-                {
-                    return MethodBehavior.Empty(this.m_method.Id, MethodBodyKind.Declaration);
-                }
-
-                System.Reflection.MethodImplAttributes implementation =
-                    symbol.MethodImplementationFlags;
-                if ((implementation & System.Reflection.MethodImplAttributes.CodeTypeMask)
-                        == System.Reflection.MethodImplAttributes.Runtime
-                    || (implementation & System.Reflection.MethodImplAttributes.InternalCall) != 0)
-                {
-                    return MethodBehavior.Empty(
-                        this.m_method.Id,
-                        MethodBodyKind.RuntimeImplementation);
-                }
-
-                DllImportData? import = symbol.GetDllImportData();
-                if (import != null)
-                {
-                    return MethodBehavior.Empty(
-                        this.m_method.Id,
-                        MethodBodyKind.PlatformInvocation,
-                        new NativeBoundary(
-                            import.ModuleName
-                                ?? throw new AnalysisException(
-                                    $"平台调用缺少原生库名称：{this.m_method.Id}"),
-                            import.EntryPointName ?? symbol.Name));
-                }
-
-                if (symbol.MethodKind is MethodKind.Constructor or MethodKind.StaticConstructor)
-                {
-                    BeginBlock(-1);
-                    ReadInitializers(symbol);
-                    this.m_hasInitializerBlock = this.m_nextOrder > 0;
-                }
-
-                IOperation? operation = ReadRootOperation(symbol);
-                if (operation == null)
-                {
-                    ControlFlowGraph? expressionFlow = ReadExpressionBodyFlow(symbol);
-                    if (expressionFlow != null)
-                    {
-                        ReadControlFlow(expressionFlow);
-                    }
-                    else
-                    {
-                        if (!this.m_hasInitializerBlock)
-                        {
-                            BeginBlock(1);
-                        }
-
-                        ReadCompilerProvidedBody(symbol);
-                        BuildCompilerProvidedFlow();
-                    }
-                }
-                else if (operation is ILocalFunctionOperation localFunction)
-                {
-                    ReadControlFlow(CreateNestedControlFlow(localFunction.Symbol));
-                }
-                else if (operation is IAnonymousFunctionOperation anonymousFunction)
-                {
-                    ReadControlFlow(CreateNestedControlFlow(anonymousFunction.Symbol));
-                }
-                else if (operation is IMethodBodyOperation methodBody)
-                {
-                    ReadControlFlow(ControlFlowGraph.Create(
-                        methodBody,
-                        this.m_cancellationToken));
-                }
-                else if (operation is IConstructorBodyOperation constructorBody)
-                {
-                    ReadControlFlow(ControlFlowGraph.Create(
-                        constructorBody,
-                        this.m_cancellationToken));
-                }
-                else
-                {
-                    throw new AnalysisException(
-                        $"源码函数包含未知控制流根：{this.m_method.Id} "
-                            + $"@ {operation.Syntax.SpanStart} {operation.Kind}");
-                }
-
-                return new MethodBehavior(
-                    this.m_method.Id,
-                    MethodBodyKind.Executable,
-                    this.m_values,
-                    this.m_assignments.OrderBy(item => item.Position).ToArray(),
-                    this.m_writes.OrderBy(item => item.Position).ToArray(),
-                    this.m_calls.OrderBy(item => item.Position).ToArray(),
-                    this.m_returns.OrderBy(item => item.Position).ToArray(),
-                    executionKind: symbol.IsIterator
-                        ? BehaviorExecutionKind.IteratorBody
-                        : BehaviorExecutionKind.Immediate,
-                    blocks: this.m_blocks.OrderBy(item => item.Id).ToArray(),
-                    regions: this.m_regions.OrderBy(item => item.Id).ToArray());
-            }
-
-            // 为自动访问器或隐式静态构造函数建立最小真实控制流。
-            private void BuildCompilerProvidedFlow()
-            {
-                if (this.m_hasInitializerBlock)
-                {
-                    this.m_blocks.Add(new BehaviorFlowBlock(
-                        -2,
-                        BehaviorFlowBlockKind.Entry,
-                        true,
-                        0,
-                        new[] { RegularEdge(-1) }));
-                    this.m_blocks.Add(new BehaviorFlowBlock(
-                        -1,
-                        BehaviorFlowBlockKind.Block,
-                        true,
-                        0,
-                        new[] { RegularEdge(0) }));
-                    this.m_blocks.Add(new BehaviorFlowBlock(
-                        0,
-                        BehaviorFlowBlockKind.Exit,
-                        true,
-                        0,
-                        Array.Empty<BehaviorFlowEdge>()));
-                    this.m_regions.Add(new BehaviorFlowRegion(
-                        0,
-                        BehaviorFlowRegionKind.Root,
-                        null,
-                        -2,
-                        0,
-                        null));
-                    return;
-                }
-
-                this.m_blocks.Add(new BehaviorFlowBlock(
-                    0,
-                    BehaviorFlowBlockKind.Entry,
-                    true,
-                    0,
-                    new[] { RegularEdge(1) }));
-                this.m_blocks.Add(new BehaviorFlowBlock(
-                    1,
-                    BehaviorFlowBlockKind.Block,
-                    true,
-                    0,
-                    new[] { RegularEdge(2) }));
-                this.m_blocks.Add(new BehaviorFlowBlock(
-                    2,
-                    BehaviorFlowBlockKind.Exit,
-                    true,
-                    0,
-                    Array.Empty<BehaviorFlowEdge>()));
-                this.m_regions.Add(new BehaviorFlowRegion(
-                    0,
-                    BehaviorFlowRegionKind.Root,
-                    null,
-                    0,
-                    2,
-                    null));
-            }
-
-            // 建立没有异常区域变化的普通控制流边。
-            private static BehaviorFlowEdge RegularEdge(int targetBlockId)
-            {
-                return new BehaviorFlowEdge(
-                    targetBlockId,
-                    false,
-                    BehaviorFlowBranchSemantics.Regular,
-                    Array.Empty<int>(),
-                    Array.Empty<int>(),
-                    Array.Empty<int>());
-            }
-
-            // 从包含函数的控制流图取得局部函数或匿名函数自己的控制流图。
-            private ControlFlowGraph CreateNestedControlFlow(IMethodSymbol symbol)
-            {
-                IMethodSymbol containing = symbol.ContainingSymbol as IMethodSymbol
-                    ?? throw new AnalysisException(
-                        $"内部函数缺少包含函数：{this.m_method.Id}");
-                ControlFlowGraph parent = CreateSymbolControlFlow(containing);
-                if (symbol.MethodKind == MethodKind.LocalFunction)
-                {
-                    return parent.GetLocalFunctionControlFlowGraphInScope(
-                        symbol,
-                        this.m_cancellationToken);
-                }
-
-                IFlowAnonymousFunctionOperation flow = EnumerateGraphOperations(parent)
-                    .OfType<IFlowAnonymousFunctionOperation>()
-                    .Single(candidate => SymbolEqualityComparer.Default.Equals(
-                        candidate.Symbol,
-                        symbol));
-                return parent.GetAnonymousFunctionControlFlowGraphInScope(
-                    flow,
-                    this.m_cancellationToken);
-            }
-
-            // 为普通函数或内部函数建立可继续向内查找的控制流图。
-            private ControlFlowGraph CreateSymbolControlFlow(IMethodSymbol symbol)
-            {
-                IOperation operation = ReadRootOperation(symbol)
-                    ?? throw new AnalysisException(
-                        $"源码函数没有控制流根：{this.m_method.Id}");
-                return operation switch
-                {
-                    IMethodBodyOperation methodBody => ControlFlowGraph.Create(
-                        methodBody,
-                        this.m_cancellationToken),
-                    IConstructorBodyOperation constructorBody => ControlFlowGraph.Create(
-                        constructorBody,
-                        this.m_cancellationToken),
-                    ILocalFunctionOperation local => CreateNestedControlFlow(local.Symbol),
-                    IAnonymousFunctionOperation anonymous =>
-                        CreateNestedControlFlow(anonymous.Symbol),
-                    _ => throw new AnalysisException(
-                        $"源码函数无法建立控制流：{this.m_method.Id} "
-                            + $"@ {operation.Syntax.SpanStart} {operation.Kind}"),
-                };
-            }
-
-            // 列出控制流图中的顶层操作和分支值以定位匿名函数节点。
-            private static IEnumerable<IOperation> EnumerateGraphOperations(ControlFlowGraph graph)
-            {
-                foreach (BasicBlock block in graph.Blocks)
-                {
-                    foreach (IOperation operation in block.Operations)
-                    {
-                        yield return operation;
-                        foreach (IOperation descendant in EnumerateOperations(operation))
-                        {
-                            yield return descendant;
-                        }
-                    }
-
-                    if (block.BranchValue != null)
-                    {
-                        yield return block.BranchValue;
-                        foreach (IOperation descendant in EnumerateOperations(block.BranchValue))
-                        {
-                            yield return descendant;
-                        }
-                    }
-                }
-            }
-
-            // 按基本块顺序读取编译器已经展开的源码行为。
-            private void ReadControlFlow(ControlFlowGraph graph)
-            {
-                BuildSourceFlow(graph);
-                foreach (BasicBlock block in graph.Blocks)
-                {
-                    if (!block.IsReachable)
-                    {
-                        continue;
-                    }
-
-                    BeginBlock(block.Ordinal);
-                    foreach (IOperation operation in block.Operations)
-                    {
-                        Visit(operation);
-                    }
-
-                    if (block.BranchValue == null)
-                    {
-                        continue;
-                    }
-
-                    bool returns = block.FallThroughSuccessor?.Semantics
-                            == ControlFlowBranchSemantics.Return
-                        || block.ConditionalSuccessor?.Semantics
-                            == ControlFlowBranchSemantics.Return;
-                    int valueId = returns
-                        && (this.m_method.SourceSymbol?.ReturnsByRef == true
-                            || this.m_method.SourceSymbol?.ReturnsByRefReadonly == true)
-                            ? ReadAddress(block.BranchValue)
-                            : ReadValue(block.BranchValue);
-                    if (returns)
-                    {
-                        this.m_returns.Add(CreateReturn(
-                                                    valueId,
-                                                    block.BranchValue.Syntax.SpanStart));
-                    }
-                }
-            }
-
-            // 直接复制 Roslyn 的控制流块、区域和异常边关系。
-            private void BuildSourceFlow(ControlFlowGraph graph)
-            {
-                Dictionary<ControlFlowRegion, int> regionIds = new(
-                    ReferenceEqualityComparer.Instance);
-                AddSourceRegion(graph.Root, null, regionIds);
-                if (this.m_hasInitializerBlock)
-                {
-                    int rootRegionId = regionIds[graph.Root];
-                    this.m_blocks.Add(new BehaviorFlowBlock(
-                        -2,
-                        BehaviorFlowBlockKind.Entry,
-                        true,
-                        rootRegionId,
-                        new[] { RegularEdge(-1) }));
-                    this.m_blocks.Add(new BehaviorFlowBlock(
-                        -1,
-                        BehaviorFlowBlockKind.Block,
-                        true,
-                        rootRegionId,
-                        new[] { RegularEdge(graph.Blocks[0].Ordinal) }));
-                }
-
-                foreach (BasicBlock block in graph.Blocks)
-                {
-                    List<BehaviorFlowEdge> successors = new();
-                    if (block.FallThroughSuccessor != null)
-                    {
-                        successors.Add(ReadSourceEdge(
-                            block.FallThroughSuccessor,
-                            regionIds));
-                    }
-
-                    if (block.ConditionalSuccessor != null)
-                    {
-                        successors.Add(ReadSourceEdge(
-                            block.ConditionalSuccessor,
-                            regionIds));
-                    }
-
-                    this.m_blocks.Add(new BehaviorFlowBlock(
-                        block.Ordinal,
-                        block.Kind switch
-                        {
-                            BasicBlockKind.Entry when this.m_hasInitializerBlock =>
-                                BehaviorFlowBlockKind.Block,
-                            BasicBlockKind.Entry => BehaviorFlowBlockKind.Entry,
-                            BasicBlockKind.Block => BehaviorFlowBlockKind.Block,
-                            BasicBlockKind.Exit => BehaviorFlowBlockKind.Exit,
-                            _ => throw new AnalysisException(
-                                $"源码函数包含未知控制流块：{this.m_method.Id} "
-                                    + block.Kind.ToString()),
-                        },
-                        block.IsReachable,
-                        regionIds[block.EnclosingRegion],
-                        successors));
-                }
-            }
-
-            // 递归复制一个 Roslyn 控制流区域及其子区域。
-            private void AddSourceRegion(
-                ControlFlowRegion region,
-                int? parentRegionId,
-                Dictionary<ControlFlowRegion, int> regionIds)
-            {
-                int regionId = regionIds.Count;
-                regionIds.Add(region, regionId);
-                this.m_regions.Add(new BehaviorFlowRegion(
-                    regionId,
-                    ReadSourceRegionKind(region.Kind),
-                    parentRegionId,
-                    parentRegionId == null && this.m_hasInitializerBlock
-                        ? -2
-                        : region.FirstBlockOrdinal,
-                    region.LastBlockOrdinal,
-                    region.ExceptionType == null
-                        ? null
-                        : ReadTypeReference(region.ExceptionType)));
-                foreach (ControlFlowRegion nested in region.NestedRegions)
-                {
-                    AddSourceRegion(nested, regionId, regionIds);
-                }
-            }
-
-            // 复制一条 Roslyn 分支和它经过的异常处理区域。
-            private static BehaviorFlowEdge ReadSourceEdge(
-                ControlFlowBranch branch,
-                IReadOnlyDictionary<ControlFlowRegion, int> regionIds)
-            {
-                return new BehaviorFlowEdge(
-                    branch.Destination?.Ordinal,
-                    branch.IsConditionalSuccessor,
-                    branch.Semantics switch
-                    {
-                        ControlFlowBranchSemantics.None =>
-                            BehaviorFlowBranchSemantics.None,
-                        ControlFlowBranchSemantics.Regular =>
-                            BehaviorFlowBranchSemantics.Regular,
-                        ControlFlowBranchSemantics.Return =>
-                            BehaviorFlowBranchSemantics.Return,
-                        ControlFlowBranchSemantics.StructuredExceptionHandling =>
-                            BehaviorFlowBranchSemantics.StructuredExceptionHandling,
-                        ControlFlowBranchSemantics.ProgramTermination =>
-                            BehaviorFlowBranchSemantics.ProgramTermination,
-                        ControlFlowBranchSemantics.Throw =>
-                            BehaviorFlowBranchSemantics.Throw,
-                        ControlFlowBranchSemantics.Rethrow =>
-                            BehaviorFlowBranchSemantics.Rethrow,
-                        ControlFlowBranchSemantics.Error =>
-                            BehaviorFlowBranchSemantics.Error,
-                        _ => throw new AnalysisException(
-                            $"未知 Roslyn 控制流分支：{branch.Semantics}"),
-                    },
-                    branch.LeavingRegions.Select(region => regionIds[region]).ToArray(),
-                    branch.EnteringRegions.Select(region => regionIds[region]).ToArray(),
-                    branch.FinallyRegions.Select(region => regionIds[region]).ToArray());
-            }
-
-            // 将当前 Roslyn 区域种类映射到公开控制流事实。
-            private static BehaviorFlowRegionKind ReadSourceRegionKind(
-                ControlFlowRegionKind kind)
-            {
-                return kind switch
-                {
-                    ControlFlowRegionKind.Root => BehaviorFlowRegionKind.Root,
-                    ControlFlowRegionKind.LocalLifetime => BehaviorFlowRegionKind.LocalLifetime,
-                    ControlFlowRegionKind.Try => BehaviorFlowRegionKind.Try,
-                    ControlFlowRegionKind.Filter => BehaviorFlowRegionKind.Filter,
-                    ControlFlowRegionKind.Catch => BehaviorFlowRegionKind.Catch,
-                    ControlFlowRegionKind.FilterAndHandler =>
-                        BehaviorFlowRegionKind.FilterAndHandler,
-                    ControlFlowRegionKind.TryAndCatch => BehaviorFlowRegionKind.TryAndCatch,
-                    ControlFlowRegionKind.Finally => BehaviorFlowRegionKind.Finally,
-                    ControlFlowRegionKind.TryAndFinally => BehaviorFlowRegionKind.TryAndFinally,
-                    ControlFlowRegionKind.StaticLocalInitializer =>
-                        BehaviorFlowRegionKind.StaticLocalInitializer,
-                    ControlFlowRegionKind.ErroneousBody => BehaviorFlowRegionKind.ErroneousBody,
-                    _ => throw new AnalysisException($"未知 Roslyn 控制流区域：{kind}"),
-                };
-            }
-
-            // 建立带有当前执行位置的槽赋值事实。
-            private BehaviorAssignment CreateAssignment(
-                int targetValueId,
-                int valueId,
-                int position)
-            {
-                return new BehaviorAssignment(targetValueId, valueId, position)
-                {
-                    Point = NextPoint(),
-                };
-            }
-
-            // 建立带有当前执行位置的写入事实。
-            private BehaviorWrite CreateWrite(
-                BehaviorWriteKind kind,
-                int? receiverValueId,
-                BehaviorMemberReference? member,
-                IReadOnlyList<int> indexValueIds,
-                int valueId,
-                int position)
-            {
-                return new BehaviorWrite(
-                    kind,
-                    receiverValueId,
-                    member,
-                    indexValueIds,
-                    valueId,
-                    position)
-                {
-                    Point = NextPoint(),
-                };
-            }
-
-            // 建立带有当前执行位置的调用事实。
-            private BehaviorCall CreateCall(
-                BehaviorCallKind kind,
-                BehaviorMethodReference target,
-                int? receiverValueId,
-                IReadOnlyList<BehaviorArgument> arguments,
-                int? resultValueId,
-                int position,
-                BehaviorTypeReference? constrainedReceiverType = null)
-            {
-                return new BehaviorCall(
-                    kind,
-                    target,
-                    receiverValueId,
-                    arguments,
-                    resultValueId,
-                    position)
-                {
-                    ConstrainedReceiverType = constrainedReceiverType,
-                    Point = NextPoint(),
-                };
-            }
-
-            // 建立带有当前执行位置的返回事实。
-            private BehaviorReturn CreateReturn(int? valueId, int position)
-            {
-                return new BehaviorReturn(valueId, position)
-                {
-                    Point = NextPoint(),
-                };
-            }
-
-            // 切换到一个控制流块并从块首重新编号事实。
-            private void BeginBlock(int blockId)
-            {
-                this.m_currentBlockId = blockId;
-                this.m_nextOrder = 0;
-            }
-
-            // 返回当前控制流块中的下一个严格执行位置。
-            private BehaviorFlowPoint NextPoint()
-            {
-                return new BehaviorFlowPoint(
-                    this.m_currentBlockId,
-                    this.m_nextOrder++);
-            }
-
-            // 把实际会由当前构造函数执行的字段和自动属性初始化器记为写入。
-            private void ReadInitializers(IMethodSymbol constructor)
-            {
-                bool delegatesToAnotherConstructor = constructor.DeclaringSyntaxReferences
-                    .Select(reference => reference.GetSyntax(this.m_cancellationToken))
-                    .OfType<ConstructorDeclarationSyntax>()
-                    .Any(declaration => declaration.Initializer?.IsKind(
-                        SyntaxKind.ThisConstructorInitializer) == true);
-                if (delegatesToAnotherConstructor)
-                {
-                    return;
-                }
-
-                Dictionary<SyntaxTree, int> treeOrder = this.m_compilation.SyntaxTrees
-                    .Select((tree, index) => (tree, index))
-                    .ToDictionary(item => item.tree, item => item.index);
-                List<(ISymbol Member, EqualsValueClauseSyntax Initializer, string Description)>
-                    initializers = new();
-                foreach (ISymbol member in constructor.ContainingType.GetMembers())
-                {
-                    if (member is IFieldSymbol field
-                        && field.IsStatic == constructor.IsStatic)
-                    {
-                        foreach (SyntaxReference reference in field.DeclaringSyntaxReferences)
-                        {
-                            if (reference.GetSyntax(this.m_cancellationToken)
-                                    is VariableDeclaratorSyntax { Initializer: { } initializer })
-                            {
-                                initializers.Add((field, initializer, "字段"));
-                            }
-                        }
-                    }
-                    else if (member is IPropertySymbol property
-                        && property.IsStatic == constructor.IsStatic)
-                    {
-                        foreach (SyntaxReference reference in property.DeclaringSyntaxReferences)
-                        {
-                            if (reference.GetSyntax(this.m_cancellationToken)
-                                    is PropertyDeclarationSyntax { Initializer: { } initializer })
-                            {
-                                initializers.Add((property, initializer, "属性"));
-                            }
-                        }
-                    }
-                }
-
-                foreach ((ISymbol member, EqualsValueClauseSyntax initializer, string description)
-                         in initializers.OrderBy(item => treeOrder[item.Initializer.SyntaxTree])
-                             .ThenBy(item => item.Initializer.SpanStart))
-                {
-                    IOperation value = ReadInitializerValue(initializer, description);
-                    int valueId = ReadValue(value);
-                    ReadInitializerEffects(value, valueId);
-                    BehaviorMemberReference storage = member switch
-                    {
-                        IFieldSymbol field => ReadFieldReference(field),
-                        IPropertySymbol property => BehaviorMemberReference.From(
-                            this.m_catalog.ReadSourcePropertyStorageReference(
-                                property,
-                                this.m_method.AssemblyName)),
-                        _ => throw new AnalysisException(
-                            $"未知初始化成员：{this.m_method.Id} @ {initializer.SpanStart}"),
-                    };
-                    this.m_writes.Add(CreateWrite(
-                        BehaviorWriteKind.Field,
-                        constructor.IsStatic ? null : GetCurrentInstanceValueId(),
-                        storage,
-                        Array.Empty<int>(),
-                        valueId,
-                        initializer.SpanStart));
-                }
-            }
-
-            // 从完整初始化语句读取值，兼容编译器不为感叹号节点单独建立操作树的情况。
-            private IOperation ReadInitializerValue(
-                EqualsValueClauseSyntax initializer,
-                string description)
-            {
-                SemanticModel model = this.m_compilation.GetSemanticModel(initializer.SyntaxTree);
-                IOperation? operation = model.GetOperation(initializer, this.m_cancellationToken);
-                IOperation? value = operation switch
-                {
-                    IFieldInitializerOperation field => field.Value,
-                    IPropertyInitializerOperation property => property.Value,
-                    IVariableInitializerOperation variable => variable.Value,
-                    _ => model.GetOperation(initializer.Value, this.m_cancellationToken),
-                };
-
-                return value ?? throw new AnalysisException(
-                    $"{description}初始化器没有操作树：{this.m_method.Id} "
-                        + $"@ {initializer.SpanStart}");
-            }
-
-            // 找到函数声明或表达式体对应的 Roslyn 操作树根。
-            private IOperation? ReadRootOperation(IMethodSymbol symbol)
-            {
-                foreach (SyntaxReference reference in symbol.DeclaringSyntaxReferences)
-                {
-                    SyntaxNode syntax = reference.GetSyntax(this.m_cancellationToken);
-                    SemanticModel model = this.m_compilation.GetSemanticModel(syntax.SyntaxTree);
-                    IOperation? operation = model.GetOperation(syntax, this.m_cancellationToken);
-                    IOperation? root = FindControlFlowRoot(operation);
-                    if (root != null)
-                    {
-                        return root;
-                    }
-
-                    SyntaxNode? body = syntax switch
-                    {
-                        BaseMethodDeclarationSyntax method =>
-                            (SyntaxNode?)method.Body ?? method.ExpressionBody?.Expression,
-                        AccessorDeclarationSyntax accessor =>
-                            accessor.Body ?? (SyntaxNode?)accessor.ExpressionBody?.Expression,
-                        LocalFunctionStatementSyntax local =>
-                            local.Body ?? (SyntaxNode?)local.ExpressionBody?.Expression,
-                        AnonymousFunctionExpressionSyntax anonymous => anonymous.Body,
-                        PropertyDeclarationSyntax property => property.ExpressionBody?.Expression,
-                        IndexerDeclarationSyntax indexer => indexer.ExpressionBody?.Expression,
-                        _ => null,
-                    };
-                    if (body != null)
-                    {
-                        operation = model.GetOperation(body, this.m_cancellationToken);
-                        root = FindControlFlowRoot(operation);
-                        if (root != null)
-                        {
-                            return root;
-                        }
-                    }
-                }
-
-                return null;
-            }
-
-            // 让 Roslyn 为表达式体属性或索引器建立真实分支图。
-            private ControlFlowGraph? ReadExpressionBodyFlow(IMethodSymbol symbol)
-            {
-                foreach (SyntaxReference reference in symbol.DeclaringSyntaxReferences)
-                {
-                    SyntaxNode syntax = reference.GetSyntax(this.m_cancellationToken);
-                    ArrowExpressionClauseSyntax? expressionBody = syntax switch
-                    {
-                        ArrowExpressionClauseSyntax arrow => arrow,
-                        BaseMethodDeclarationSyntax method => method.ExpressionBody,
-                        AccessorDeclarationSyntax accessor => accessor.ExpressionBody,
-                        LocalFunctionStatementSyntax local => local.ExpressionBody,
-                        PropertyDeclarationSyntax property => property.ExpressionBody,
-                        IndexerDeclarationSyntax indexer => indexer.ExpressionBody,
-                        _ => null,
-                    };
-                    if (expressionBody == null)
-                    {
-                        continue;
-                    }
-
-                    SemanticModel model = this.m_compilation.GetSemanticModel(
-                        expressionBody.SyntaxTree);
-                    return ControlFlowGraph.Create(
-                        expressionBody,
-                        model,
-                        this.m_cancellationToken);
-                }
-
-                return null;
-            }
-
-            // 从声明或表达式节点向上找到 Roslyn 提供的真实函数体根。
-            private static IOperation? FindControlFlowRoot(IOperation? operation)
-            {
-                for (IOperation? current = operation; current != null; current = current.Parent)
-                {
-                    if (current is IMethodBodyOperation
-                        or IConstructorBodyOperation
-                        or ILocalFunctionOperation
-                        or IAnonymousFunctionOperation)
-                    {
-                        return current;
-                    }
-                }
-
-                return null;
-            }
-
-            // 读取自动属性、自动事件和没有源码语句的编译器函数体。
-            private void ReadCompilerProvidedBody(IMethodSymbol symbol)
-            {
-                if (symbol.MethodKind == MethodKind.Constructor
-                    && symbol.IsImplicitlyDeclared
-                    && symbol.ContainingType.TypeKind == TypeKind.Class)
-                {
-                    INamedTypeSymbol baseType = symbol.ContainingType.BaseType
-                        ?? throw new AnalysisException(
-                            $"隐式实例构造函数缺少基类：{this.m_method.Id}");
-                    IMethodSymbol baseConstructor = baseType.InstanceConstructors.Single(
-                        constructor => constructor.Parameters.Length == 0);
-                    this.m_calls.Add(CreateCall(
-                        BehaviorCallKind.Direct,
-                        ReadMethodReference(baseConstructor),
-                        GetCurrentInstanceValueId(),
-                        Array.Empty<BehaviorArgument>(),
-                        null,
-                        symbol.ContainingType.Locations.FirstOrDefault()?.SourceSpan.Start ?? 0));
-                    return;
-                }
-
-                if (symbol.AssociatedSymbol is IPropertySymbol property)
-                {
-                    IFieldSymbol? field = symbol.ContainingType.GetMembers()
-                        .OfType<IFieldSymbol>()
-                        .SingleOrDefault(candidate => SymbolEqualityComparer.Default.Equals(
-                            candidate.AssociatedSymbol,
-                            property));
-                    if (field == null)
-                    {
-                        throw new AnalysisException($"属性访问器没有源码函数体：{this.m_method.Id}");
-                    }
-
-                    int position = symbol.Locations.FirstOrDefault()?.SourceSpan.Start ?? 0;
-                    BehaviorMemberReference member = ReadFieldReference(field);
-                    int? receiverValueId = field.IsStatic ? null : GetCurrentInstanceValueId();
-                    if (symbol.MethodKind == MethodKind.PropertyGet)
-                    {
-                        int valueId = AddMemberValue(
-                            BehaviorValueKind.FieldRead,
-                            member,
-                            receiverValueId == null
-                                ? Array.Empty<int>()
-                                : new[] { receiverValueId.Value });
-                        this.m_returns.Add(CreateReturn(valueId, position));
-                    }
-                    else
-                    {
-                        this.m_writes.Add(CreateWrite(
-                            BehaviorWriteKind.Field,
-                            receiverValueId,
-                            member,
-                            Array.Empty<int>(),
-                            AddValue(
-                                BehaviorValueKind.SlotRead,
-                                symbol.Parameters[0].Name,
-                                null,
-                                new[] { GetParameterValueId(symbol.Parameters[0]) }),
-                            position));
-                    }
-
-                    return;
-                }
-
-                if (symbol.AssociatedSymbol is IEventSymbol eventSymbol)
-                {
-                    int position = symbol.Locations.FirstOrDefault()?.SourceSpan.Start ?? 0;
-                    BehaviorMemberReference member = ReadEventReference(eventSymbol);
-                    int? receiverValueId = eventSymbol.IsStatic
-                        ? null
-                        : GetCurrentInstanceValueId();
-                    int oldValueId = AddMemberValue(
-                        BehaviorValueKind.FieldRead,
-                        member,
-                        receiverValueId == null
-                            ? Array.Empty<int>()
-                            : new[] { receiverValueId.Value });
-                    int newValueId = AddValue(
-                        BehaviorValueKind.SlotRead,
-                        symbol.Parameters[0].Name,
-                        null,
-                        new[] { GetParameterValueId(symbol.Parameters[0]) });
-                    string operationName = symbol.MethodKind switch
-                    {
-                        MethodKind.EventAdd => "Combine",
-                        MethodKind.EventRemove => "Remove",
-                        _ => throw new AnalysisException(
-                            $"事件访问器种类未知：{this.m_method.Id} {symbol.MethodKind}"),
-                    };
-                    INamedTypeSymbol delegateType = this.m_compilation.GetTypeByMetadataName(
-                            "System.Delegate")
-                        ?? throw new AnalysisException("当前源码编译缺少 System.Delegate。");
-                    IMethodSymbol operation = delegateType.GetMembers(operationName)
-                        .OfType<IMethodSymbol>()
-                        .Single(method => method.IsStatic
-                            && method.Parameters.Length == 2
-                            && method.Parameters.All(parameter =>
-                                SymbolEqualityComparer.Default.Equals(
-                                    parameter.Type,
-                                    delegateType)));
-                    int resultValueId = AddValue(
-                        BehaviorValueKind.CallResult,
-                        operation.MetadataName,
-                        null,
-                        new[] { oldValueId, newValueId });
-                    this.m_calls.Add(CreateCall(
-                        BehaviorCallKind.Direct,
-                        ReadMethodReference(operation),
-                        null,
-                        new[]
-                        {
-                            new BehaviorArgument(oldValueId, CatalogRefKind.None),
-                            new BehaviorArgument(newValueId, CatalogRefKind.None),
-                        },
-                        resultValueId,
-                        position));
-                    this.m_writes.Add(CreateWrite(
-                        BehaviorWriteKind.Field,
-                        receiverValueId,
-                        member,
-                        Array.Empty<int>(),
-                        resultValueId,
-                        position));
-
-                    return;
-                }
-
-                if (symbol.IsExtern)
-                {
-                    throw new AnalysisException(
-                        $"源码 extern 函数不是已支持的平台调用：{this.m_method.Id}");
-                }
-
-                if (symbol.MethodKind == MethodKind.StaticConstructor
-                    && symbol.IsImplicitlyDeclared
-                    && this.m_hasInitializerBlock)
-                {
-                    return;
-                }
-
-                if (symbol.IsImplicitlyDeclared)
-                {
-                    throw new AnalysisException(
-                        $"未支持的编译器隐式函数体：{this.m_method.Id} {symbol.MethodKind}");
-                }
-
-                throw new AnalysisException($"源码函数没有可读取的函数体：{this.m_method.Id}");
-            }
-
-            // 记录普通赋值产生的局部关系或外部写入。
-            public override void VisitSimpleAssignment(ISimpleAssignmentOperation operation)
-            {
-                ReadSimpleAssignmentValue(operation);
-                base.VisitSimpleAssignment(operation);
-            }
-
-            // 记录空值赋值真正执行时产生的写入和表达式结果。
-            public override void VisitCoalesceAssignment(ICoalesceAssignmentOperation operation)
-            {
-                if (this.m_valueIds.ContainsKey(operation))
-                {
-                    return;
-                }
-
-                int currentValueId = ReadValue(operation.Target);
-                int assignedValueId = ReadValue(operation.Value);
-                this.m_writeTargets.Add(operation.Target);
-                RecordWrite(operation.Target, assignedValueId, operation.Syntax.SpanStart);
-                AddOperationValue(
-                    operation,
-                    BehaviorValueKind.Merge,
-                    "coalesce-assignment",
-                    new[] { currentValueId, assignedValueId });
-            }
-
-            // 将解构赋值中的每个目标和值按位置一一展开。
-            public override void VisitDeconstructionAssignment(
-                IDeconstructionAssignmentOperation operation)
-            {
-                RecordDeconstruction(
-                    operation.Target,
-                    operation.Value,
-                    operation.Syntax.SpanStart);
-            }
-
-            // 记录复合赋值的最终写入位置。
-            public override void VisitCompoundAssignment(ICompoundAssignmentOperation operation)
-            {
-                ReadCompoundAssignmentValue(operation);
-                base.VisitCompoundAssignment(operation);
-            }
-
-            // 记录递增和递减表达式的最终写入位置。
-            public override void VisitIncrementOrDecrement(IIncrementOrDecrementOperation operation)
-            {
-                ReadIncrementValue(operation);
-                base.VisitIncrementOrDecrement(operation);
-            }
-
-            // 记录局部变量初始化的值来源。
-            public override void VisitVariableDeclarator(IVariableDeclaratorOperation operation)
-            {
-                if (operation.Initializer != null)
-                {
-                    this.m_assignments.Add(CreateAssignment(
-                                            GetLocalValueId(operation.Symbol),
-                                            ReadValue(operation.Initializer.Value),
-                                            operation.Syntax.SpanStart));
-                }
-
-                base.VisitVariableDeclarator(operation);
-            }
-
-            // 记录控制流图临时槽与其真实值来源。
-            public override void VisitFlowCapture(IFlowCaptureOperation operation)
-            {
-                this.m_captureOperations[operation.Id] = operation.Value;
-                int captureValueId = GetCaptureValueId(operation.Id);
-                this.m_assignments.Add(CreateAssignment(
-                    captureValueId,
-                    ReadValue(operation.Value),
-                    operation.Syntax.SpanStart));
-            }
-
-            // 记录普通函数、接口函数、虚函数或委托调用。
-            public override void VisitInvocation(IInvocationOperation operation)
-            {
-                RecordInvocation(operation);
-                base.VisitInvocation(operation);
-            }
-
-            // 记录构造函数调用和新对象值。
-            public override void VisitObjectCreation(IObjectCreationOperation operation)
-            {
-                int createdValueId = RecordObjectCreation(operation);
-                ReadInitializerEffects(operation, createdValueId);
-            }
-
-            // 记录泛型 new T() 及其初始化器的值来源。
-            public override void VisitTypeParameterObjectCreation(
-                ITypeParameterObjectCreationOperation operation)
-            {
-                int createdValueId = ReadTypeParameterObjectCreation(operation);
-                ReadInitializerEffects(operation, createdValueId);
-            }
-
-            // 读取对象或集合初始化器对刚创建对象产生的成员行为。
-            private void ReadInitializerEffects(
-                IOperation value,
-                int createdValueId)
-            {
-                while (value is IConversionOperation conversion)
-                {
-                    value = conversion.Operand;
-                }
-
-                IObjectOrCollectionInitializerOperation? initializer = value switch
-                {
-                    IObjectCreationOperation creation => creation.Initializer,
-                    ITypeParameterObjectCreationOperation creation => creation.Initializer,
-                    _ => null,
-                };
-                if (initializer == null
-                    || !this.m_recordedInitializers.Add(initializer))
-                {
-                    return;
-                }
-
-                this.m_implicitReceivers.Push(createdValueId);
-                Visit(initializer);
-                this.m_implicitReceivers.Pop();
-            }
-
-            // 记录数组创建及初始化器中的每一个元素写入。
-            public override void VisitArrayCreation(IArrayCreationOperation operation)
-            {
-                ReadArrayCreation(operation, operation);
-            }
-
-            // 把事件订阅或退订转换为对应事件访问器调用。
-            public override void VisitEventAssignment(IEventAssignmentOperation operation)
-            {
-                IEventReferenceOperation eventReference = operation.EventReference
-                    as IEventReferenceOperation
-                    ?? throw new AnalysisException(
-                        $"事件赋值缺少事件引用：{this.m_method.Id} @ {operation.Syntax.SpanStart}");
-                IEventSymbol eventSymbol = eventReference.Event;
-                IMethodSymbol accessor = (operation.Adds
-                        ? eventSymbol.AddMethod
-                        : eventSymbol.RemoveMethod)
-                    ?? throw new AnalysisException(
-                        $"事件缺少访问器：{this.m_method.Id} @ {operation.Syntax.SpanStart}");
-                this.m_calls.Add(CreateCall(
-                                    ReadCallKind(accessor),
-                                    ReadMethodReference(accessor),
-                                    accessor.IsStatic ? null : ReadValue(eventReference.Instance!),
-                                    new[]
-                                    {
-                        new BehaviorArgument(
-                            ReadValue(operation.HandlerValue),
-                            CatalogRefKind.None),
-                                    },
-                                    null,
-                                    operation.Syntax.SpanStart));
-                base.VisitEventAssignment(operation);
-            }
-
-            // 将条件访问中的占位接收者连接回问号左侧的真实对象。
-            public override void VisitConditionalAccess(IConditionalAccessOperation operation)
-            {
-                if (operation.Type?.SpecialType == SpecialType.System_Void)
-                {
-                    int receiverValueId = ReadValue(operation.Operation);
-                    this.m_conditionalReceivers.Push(receiverValueId);
-                    Visit(operation.WhenNotNull);
-                    this.m_conditionalReceivers.Pop();
-
-                    return;
-                }
-
-                ReadConditionalAccessValue(operation);
-            }
-
-            // 保证每次属性读取都产生一次 getter 调用事实。
-            public override void VisitPropertyReference(IPropertyReferenceOperation operation)
-            {
-                if (!this.m_writeTargets.Contains(operation))
-                {
-                    ReadPropertyValue(operation, operation);
-                }
-
-                base.VisitPropertyReference(operation);
-            }
-
-            // 记录用户自定义二元运算符调用。
-            public override void VisitBinaryOperator(IBinaryOperation operation)
-            {
-                ReadBinaryValue(operation);
-            }
-
-            // 记录用户自定义一元运算符调用。
-            public override void VisitUnaryOperator(IUnaryOperation operation)
-            {
-                ReadUnaryValue(operation);
-            }
-
-            // 记录条件语句中的模式输入和声明变量来源。
-            public override void VisitIsPattern(IIsPatternOperation operation)
-            {
-                ReadPatternValue(operation);
-            }
-
-            // 记录返回值与函数出口的关系。
-            public override void VisitReturn(IReturnOperation operation)
-            {
-                if (operation.ReturnedValue is IThrowOperation throwOperation)
-                {
-                    VisitThrow(throwOperation);
-
-                    return;
-                }
-
-                this.m_returns.Add(CreateReturn(
-                    operation.ReturnedValue == null ? null : ReadValue(operation.ReturnedValue),
-                    operation.Syntax.SpanStart));
-                base.VisitReturn(operation);
-            }
-
-            // 外层函数只保留局部函数定义或绑定，不读取其独立函数体。
-            public override void VisitLocalFunction(ILocalFunctionOperation operation)
-            {
-            }
-
-            // 外层函数只保留匿名函数绑定，不读取其独立函数体。
-            public override void VisitAnonymousFunction(IAnonymousFunctionOperation operation)
-            {
-            }
-
-            // 只遍历已经明确支持的源码容器和表达式，未知节点立即报告位置。
-            public override void DefaultVisit(IOperation operation)
-            {
-                if (!IsSupportedSourceOperation(operation))
-                {
-                    throw new AnalysisException(
-                        $"源码函数包含尚未支持的操作：{this.m_method.Id} "
-                            + $"@ {operation.Syntax.SpanStart} {operation.Kind}");
-                }
-
-                base.DefaultVisit(operation);
-            }
-
-            // 明确列出当前行为读取器已经理解或只负责承载子节点的操作。
-            private static bool IsSupportedSourceOperation(IOperation operation)
-            {
-                return operation is IBlockOperation
-                    or IExpressionStatementOperation
-                    or IVariableDeclarationGroupOperation
-                    or IVariableDeclarationOperation
-                    or IVariableDeclaratorOperation
-                    or IVariableInitializerOperation
-                    or IArgumentOperation
-                    or IFlowCaptureOperation
-                    or IFlowCaptureReferenceOperation
-                    or IFlowAnonymousFunctionOperation
-                    or IUsingDeclarationOperation
-                    or IUsingOperation
-                    or ILockOperation
-                    or IForEachLoopOperation
-                    or IForLoopOperation
-                    or IWhileLoopOperation
-                    or IBranchOperation
-                    or ILabeledOperation
-                    or IEmptyOperation
-                    or IReturnOperation
-                    or IThrowOperation
-                    or ITryOperation
-                    or ICatchClauseOperation
-                    or IObjectOrCollectionInitializerOperation
-                    or IMemberInitializerOperation
-                    or IArrayInitializerOperation
-                    or IInterpolationOperation
-                    or IInterpolatedStringTextOperation
-                    or IInstanceReferenceOperation
-                    or IConditionalAccessInstanceOperation
-                    or IParameterReferenceOperation
-                    or ILocalReferenceOperation
-                    or ICaughtExceptionOperation
-                    or ILiteralOperation
-                    or IFieldReferenceOperation
-                    or IEventReferenceOperation
-                    or IArrayElementReferenceOperation
-                    or IAddressOfOperation
-                    or IConversionOperation
-                    or IBinaryOperation
-                    or IUnaryOperation
-                    or IInvocationOperation
-                    or IObjectCreationOperation
-                    or ITypeParameterObjectCreationOperation
-                    or IArrayCreationOperation
-                    or ITypeOfOperation
-                    or IMethodReferenceOperation
-                    or IDelegateCreationOperation
-                    or IDefaultValueOperation
-                    or IPropertyReferenceOperation
-                    or IParenthesizedOperation
-                    or ICoalesceOperation
-                    or ICoalesceAssignmentOperation
-                    or ISimpleAssignmentOperation
-                    or IDeconstructionAssignmentOperation
-                    or ICompoundAssignmentOperation
-                    or IIncrementOrDecrementOperation
-                    or IConditionalAccessOperation
-                    or IConditionalOperation
-                    or IIsTypeOperation
-                    or IIsPatternOperation
-                    or IInterpolatedStringOperation
-                    or ITupleOperation
-                    or IEventAssignmentOperation
-                    or IDeclarationExpressionOperation
-                    or IDiscardOperation
-                    or ILocalFunctionOperation
-                    or IAnonymousFunctionOperation
-                    || operation.Kind == OperationKind.IsNull
-                    || IsPointerIndirection(operation);
-            }
-
-            // 将赋值目标归为局部关系、字段、数组、属性或引用位置。
-            private void RecordWrite(IOperation target, int valueId, int position)
-            {
-                switch (target)
-                {
-                    case ILocalReferenceOperation local:
-                        this.m_assignments.Add(CreateAssignment(
-                            GetLocalValueId(local.Local),
-                            valueId,
-                            position));
-                        break;
-                    case IFlowCaptureReferenceOperation capture:
-                        IOperation captured = this.m_captureOperations[capture.Id];
-                        if (captured is IFieldReferenceOperation
-                            or IPropertyReferenceOperation
-                            or IArrayElementReferenceOperation)
-                        {
-                            RecordWrite(captured, valueId, position);
-                        }
-                        else
-                        {
-                            this.m_assignments.Add(CreateAssignment(
-                                GetCaptureValueId(capture.Id),
-                                valueId,
-                                position));
-                        }
-
-                        break;
-                    case IParameterReferenceOperation parameter:
-                        if (parameter.Parameter.RefKind is RefKind.Ref or RefKind.Out)
-                        {
-                            this.m_writes.Add(CreateWrite(
-                                BehaviorWriteKind.Indirect,
-                                GetParameterValueId(parameter.Parameter),
-                                null,
-                                Array.Empty<int>(),
-                                valueId,
-                                position));
-                        }
-                        else
-                        {
-                            this.m_assignments.Add(CreateAssignment(
-                                GetParameterValueId(parameter.Parameter),
-                                valueId,
-                                position));
-                        }
-
-                        break;
-                    case IInstanceReferenceOperation:
-                        this.m_writes.Add(CreateWrite(
-                            BehaviorWriteKind.Indirect,
-                            GetCurrentInstanceValueId(),
-                            null,
-                            Array.Empty<int>(),
-                            valueId,
-                            position));
-                        break;
-                    case IFieldReferenceOperation field:
-                        this.m_writes.Add(CreateWrite(
-                            BehaviorWriteKind.Field,
-                            field.Field.IsStatic ? null : ReadValue(field.Instance!),
-                            ReadFieldReference(field.Field),
-                            Array.Empty<int>(),
-                            valueId,
-                            position));
-                        break;
-                    case IArrayElementReferenceOperation element:
-                        this.m_writes.Add(CreateWrite(
-                            BehaviorWriteKind.ArrayElement,
-                            ReadValue(element.ArrayReference),
-                            null,
-                            element.Indices.Select(ReadValue).ToArray(),
-                            valueId,
-                            position));
-                        break;
-                    case var pointer when IsPointerIndirection(pointer):
-                        this.m_writes.Add(CreateWrite(
-                            BehaviorWriteKind.Indirect,
-                            ReadValue(pointer.ChildOperations.Single()),
-                            null,
-                            Array.Empty<int>(),
-                            valueId,
-                            position));
-                        break;
-                    case IPropertyReferenceOperation property:
-                        RecordPropertyWrite(property, valueId, position);
-                        break;
-                    case IEventReferenceOperation eventReference:
-                        this.m_writes.Add(CreateWrite(
-                            BehaviorWriteKind.Field,
-                            eventReference.Event.IsStatic
-                                ? null
-                                : ReadValue(eventReference.Instance!),
-                            ReadEventReference(eventReference.Event),
-                            Array.Empty<int>(),
-                            valueId,
-                            position));
-                        break;
-                    case IDiscardOperation:
-                        break;
-                    default:
-                        throw new AnalysisException(
-                            $"源码函数包含尚未读取的赋值目标：{this.m_method.Id} "
-                                + $"@ {position} {target.Kind}");
-                }
-            }
-
-            // 按元组位置递归展开解构目标和值。
-            private void RecordDeconstruction(IOperation target, IOperation value, int position)
-            {
-                IOperation unwrappedValue = value is IConversionOperation conversion
-                    ? conversion.Operand
-                    : value;
-                if (target is ITupleOperation targetTuple
-                    && unwrappedValue is ITupleOperation valueTuple)
-                {
-                    if (targetTuple.Elements.Length != valueTuple.Elements.Length)
-                    {
-                        throw new AnalysisException(
-                            $"解构目标和值数量不同：{this.m_method.Id} @ {position}");
-                    }
-
-                    for (int index = 0; index < targetTuple.Elements.Length; index++)
-                    {
-                        RecordDeconstruction(
-                            targetTuple.Elements[index],
-                            valueTuple.Elements[index],
-                            position);
-                    }
-
-                    return;
-                }
-
-                this.m_writeTargets.Add(target);
-                RecordWrite(target, ReadValue(value), position);
-            }
-
-            // 把属性赋值转换为属性写入函数的普通调用事实。
-            private void RecordPropertyWrite(
-                IPropertyReferenceOperation property,
-                int valueId,
-                int position)
-            {
-                IMethodSymbol? setter = property.Property.SetMethod;
-                if (setter == null)
-                {
-                    this.m_writes.Add(CreateWrite(
-                        BehaviorWriteKind.Field,
-                        property.Property.IsStatic ? null : ReadValue(property.Instance!),
-                        BehaviorMemberReference.From(
-                            this.m_catalog.ReadSourcePropertyStorageReference(
-                                property.Property,
-                                this.m_method.AssemblyName)),
-                        Array.Empty<int>(),
-                        valueId,
-                        position));
-
-                    return;
-                }
-
-                BehaviorArgument[] arguments = property.Arguments
-                    .Select(argument => new BehaviorArgument(
-                        ReadValue(argument.Value),
-                        ReadRefKind(argument.Parameter?.RefKind ?? RefKind.None)))
-                    .Append(new BehaviorArgument(valueId, CatalogRefKind.None))
-                    .ToArray();
-                this.m_calls.Add(CreateCall(
-                    ReadCallKind(setter),
-                    ReadMethodReference(setter),
-                    setter.IsStatic ? null : ReadValue(property.Instance!),
-                    arguments,
-                    null,
-                    position));
-            }
-
-            // 记录一次源码调用并返回非 void 调用的结果值编号。
-            private int? RecordInvocation(IInvocationOperation operation)
-            {
-                if (this.m_recordedCalls.Contains(operation))
-                {
-                    return this.m_valueIds.GetValueOrDefault(operation);
-                }
-
-                if (TryReadArrayForEachCompilerCall(operation, out int? arrayResultValueId))
-                {
-                    this.m_recordedCalls.Add(operation);
-                    return arrayResultValueId;
-                }
-
-                IMethodSymbol target = operation.TargetMethod;
-                bool isReducedExtension = target.ReducedFrom != null;
-                List<BehaviorArgument> arguments = new();
-                int? receiverValueId = null;
-                if (isReducedExtension)
-                {
-                    arguments.Add(new BehaviorArgument(
-                        ReadValue(operation.Instance!),
-                        ReadRefKind(target.ReducedFrom!.Parameters[0].RefKind)));
-                }
-                else if (!target.IsStatic)
-                {
-                    receiverValueId = operation.Instance == null
-                        ? GetCurrentInstanceValueId()
-                        : ReadValue(operation.Instance);
-                }
-
-                arguments.AddRange(operation.Arguments
-                    .OrderBy(argument => argument.Parameter?.Ordinal ?? int.MaxValue)
-                    .Select(argument => new BehaviorArgument(
-                        argument.Parameter?.RefKind is RefKind.Ref or RefKind.Out or RefKind.In
-                            ? ReadAddress(argument.Value)
-                            : ReadValue(argument.Value),
-                        ReadRefKind(argument.Parameter?.RefKind ?? RefKind.None))));
-                int? resultValueId = target.ReturnsVoid
-                    ? null
-                    : AddOperationValue(
-                        operation,
-                        BehaviorValueKind.CallResult,
-                        target.MetadataName,
-                        arguments.Select(argument => argument.ValueId).ToArray());
-                this.m_calls.Add(CreateCall(
-                    ReadCallKind(operation),
-                    ReadMethodReference(target),
-                    receiverValueId,
-                    arguments,
-                    resultValueId,
-                    operation.Syntax.SpanStart,
-                    ReadConstrainedReceiverType(operation)));
-                this.m_recordedCalls.Add(operation);
-
-                return resultValueId;
-            }
-
-            // 读取会生成 constrained 调用前缀的实际值类型接收者。
-            private BehaviorTypeReference? ReadConstrainedReceiverType(
-                IInvocationOperation operation)
-            {
-                ITypeSymbol? type = operation.ConstrainedToType;
-                if (type == null && !operation.IsImplicit)
-                {
-                    return null;
-                }
-
-                IOperation? receiver = operation.Instance;
-                while (type == null && receiver != null)
-                {
-                    if (receiver is IConversionOperation conversion && conversion.IsImplicit)
-                    {
-                        receiver = conversion.Operand;
-                        continue;
-                    }
-
-                    if (receiver is IFlowCaptureReferenceOperation capture
-                        && this.m_captureOperations.TryGetValue(capture.Id, out IOperation? captured))
-                    {
-                        receiver = captured;
-                        continue;
-                    }
-
-                    type = receiver.Type;
-                    break;
-                }
-
-                if (!operation.IsVirtual
-                    || type == null
-                    || (!type.IsValueType && type.TypeKind != TypeKind.TypeParameter))
-                {
-                    return null;
-                }
-
-                return ReadTypeReference(type);
-            }
-
-            // 把控制流图为数组 foreach 伪造的枚举器调用还原成数组读取。
-            private bool TryReadArrayForEachCompilerCall(
-                IInvocationOperation operation,
-                out int? resultValueId)
-            {
-                if (!IsArrayForEachCompilerOperation(operation))
-                {
-                    resultValueId = null;
-                    return false;
-                }
-
-                List<int> inputs = operation.Arguments
-                    .Select(argument => ReadValue(argument.Value))
-                    .ToList();
-                if (operation.Instance != null)
-                {
-                    inputs.Insert(0, ReadValue(operation.Instance));
-                }
-                resultValueId = operation.TargetMethod.ReturnsVoid
-                    ? null
-                    : AddOperationValue(
-                        operation,
-                        operation.TargetMethod.MethodKind == MethodKind.PropertyGet
-                            ? BehaviorValueKind.ArrayElementRead
-                            : BehaviorValueKind.Computation,
-                        $"array-foreach:{operation.TargetMethod.MetadataName}",
-                        inputs);
-                return true;
-            }
-
-            // 判断隐式操作是否来自数组 foreach 的抽象枚举器模型。
-            private bool IsArrayForEachCompilerOperation(IOperation operation)
-            {
-                CommonForEachStatementSyntax? loop = operation.IsImplicit
-                    ? operation.Syntax.FirstAncestorOrSelf<CommonForEachStatementSyntax>()
-                    : null;
-                return loop != null
-                    && this.m_compilation.GetSemanticModel(loop.SyntaxTree)
-                        .GetTypeInfo(loop.Expression, this.m_cancellationToken).Type
-                        is IArrayTypeSymbol;
-            }
-
-            // 按调用节点的真实分派方式区分直接、可重写和委托调用。
-            private static BehaviorCallKind ReadCallKind(IInvocationOperation operation)
-            {
-                return operation.TargetMethod.MethodKind == MethodKind.DelegateInvoke
-                    ? BehaviorCallKind.Delegate
-                    : operation.IsVirtual
-                        ? BehaviorCallKind.Virtual
-                        : BehaviorCallKind.Direct;
-            }
-
-            // 根据源码函数符号区分普通、可重写、接口和委托调用。
-            private static BehaviorCallKind ReadCallKind(IMethodSymbol target)
-            {
-                if (target.MethodKind == MethodKind.DelegateInvoke)
-                {
-                    return BehaviorCallKind.Delegate;
-                }
-
-                return target.IsVirtual
-                    || target.IsAbstract
-                    || target.ContainingType.TypeKind == TypeKind.Interface
-                        ? BehaviorCallKind.Virtual
-                        : BehaviorCallKind.Direct;
-            }
-
-            // 将用户自定义运算符记录成普通函数调用并返回调用结果。
-            private int RecordOperator(
-                IOperation operation,
-                IMethodSymbol target,
-                IReadOnlyList<int> inputValueIds)
-            {
-                if (this.m_valueIds.TryGetValue(operation, out int existingId))
-                {
-                    return existingId;
-                }
-
-                int resultValueId = AddOperationValue(
-                    operation,
-                    BehaviorValueKind.CallResult,
-                    target.MetadataName,
-                    inputValueIds);
-                this.m_calls.Add(CreateCall(
-                    BehaviorCallKind.Direct,
-                    ReadMethodReference(target),
-                    null,
-                    inputValueIds.Select(valueId => new BehaviorArgument(
-                        valueId,
-                        CatalogRefKind.None)).ToArray(),
-                    resultValueId,
-                    operation.Syntax.SpanStart));
-
-                return resultValueId;
-            }
-
-            // 记录一次对象创建及其构造函数调用。
-            private int RecordObjectCreation(IObjectCreationOperation operation)
-            {
-                if (this.m_recordedCalls.Contains(operation))
-                {
-                    return this.m_valueIds[operation];
-                }
-
-                IMethodSymbol constructor = operation.Constructor
-                    ?? throw new AnalysisException(
-                        $"源码对象创建没有构造函数：{this.m_method.Id} @ {operation.Syntax.SpanStart}");
-                BehaviorArgument[] arguments = operation.Arguments
-                    .OrderBy(argument => argument.Parameter?.Ordinal ?? int.MaxValue)
-                    .Select(argument => new BehaviorArgument(
-                        argument.Parameter?.RefKind is RefKind.Ref or RefKind.Out or RefKind.In
-                            ? ReadAddress(argument.Value)
-                            : ReadValue(argument.Value),
-                        ReadRefKind(argument.Parameter?.RefKind ?? RefKind.None)))
-                    .ToArray();
-                int resultValueId = AddOperationValue(
-                    operation,
-                    BehaviorValueKind.NewObject,
-                    operation.Type?.ToDisplayString(),
-                    arguments.Select(argument => argument.ValueId).ToArray());
-                this.m_values[resultValueId] = this.m_values[resultValueId] with
-                {
-                    Type = operation.Type == null ? null : ReadTypeReference(operation.Type),
-                };
-                this.m_calls.Add(CreateCall(
-                    BehaviorCallKind.ObjectCreation,
-                    ReadMethodReference(constructor),
-                    null,
-                    arguments,
-                    resultValueId,
-                    operation.Syntax.SpanStart));
-                this.m_recordedCalls.Add(operation);
-
-                return resultValueId;
-            }
-
-            // 追加一个没有独立 Roslyn 调用节点的编译器隐含调用。
-            private int? RecordSyntheticCall(
-                IMethodSymbol target,
-                int? receiverValueId,
-                IReadOnlyList<BehaviorArgument> arguments,
-                int position)
-            {
-                int? resultValueId = target.ReturnsVoid
-                    ? null
-                    : AddValue(
-                        BehaviorValueKind.CallResult,
-                        target.MetadataName,
-                        null,
-                        arguments.Select(argument => argument.ValueId).ToArray());
-                this.m_calls.Add(CreateCall(
-                    ReadCallKind(target),
-                    ReadMethodReference(target),
-                    target.IsStatic ? null : receiverValueId,
-                    arguments,
-                    resultValueId,
-                    position));
-
-                return resultValueId;
-            }
-
-            // 读取 ref/out/in 实参所指向的准确位置。
-            private int ReadAddress(IOperation operation)
-            {
-                if (operation is IDeclarationExpressionOperation declaration)
-                {
-                    return ReadAddress(declaration.Expression);
-                }
-
-                if (operation is ILocalReferenceOperation local)
-                {
-                    return AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Address,
-                        local.Local.Name,
-                        new[] { GetLocalValueId(local.Local) });
-                }
-
-                if (operation is IParameterReferenceOperation parameter)
-                {
-                    return AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Address,
-                        parameter.Parameter.Name,
-                        new[] { GetParameterValueId(parameter.Parameter) });
-                }
-
-                if (operation is IInstanceReferenceOperation)
-                {
-                    return AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Address,
-                        "this",
-                        new[] { GetCurrentInstanceValueId() });
-                }
-
-                if (operation is IDiscardOperation)
-                {
-                    return AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Address,
-                        "discard",
-                        Array.Empty<int>());
-                }
-
-                if (operation is IFieldReferenceOperation field)
-                {
-                    int id = AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Address,
-                        field.Field.MetadataName,
-                        field.Field.IsStatic
-                            ? Array.Empty<int>()
-                            : new[] { ReadValue(field.Instance!) });
-                    this.m_values[id] = this.m_values[id] with
-                    {
-                        Member = ReadFieldReference(field.Field),
-                    };
-
-                    return id;
-                }
-
-                if (operation is IArrayElementReferenceOperation element)
-                {
-                    return AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Address,
-                        "array-element",
-                        element.Indices.Prepend(element.ArrayReference).Select(ReadValue).ToArray());
-                }
-
-                if (operation is IConversionOperation conversion)
-                {
-                    return ReadAddress(conversion.Operand);
-                }
-
-                throw new AnalysisException(
-                    $"源码函数包含尚未读取的引用实参：{this.m_method.Id} "
-                        + $"@ {operation.Syntax.SpanStart} {operation.Kind}");
-            }
-
-            // 将一个源码表达式转换为可被后续模块追踪的值来源。
-            private int ReadValue(IOperation operation)
-            {
-                if (this.m_valueIds.TryGetValue(operation, out int existing))
-                {
-                    return existing;
-                }
-
-                return operation switch
-                {
-                    IInstanceReferenceOperation instance => ReadInstanceValue(instance),
-                    IConditionalAccessInstanceOperation =>
-                        this.m_conditionalReceivers.TryPeek(out int conditionalReceiver)
-                            ? conditionalReceiver
-                            : throw new AnalysisException(
-                                $"条件访问接收者不在条件访问中：{this.m_method.Id} "
-                                    + $"@ {operation.Syntax.SpanStart}"),
-                    IParameterReferenceOperation parameter =>
-                        ReadSlotValue(
-                            operation,
-                            GetParameterValueId(parameter.Parameter),
-                            parameter.Parameter.Name),
-                    ILocalReferenceOperation local => ReadSlotValue(
-                        operation,
-                        GetLocalValueId(local.Local),
-                        local.Local.Name),
-                    IFlowCaptureReferenceOperation capture => ReadSlotValue(
-                        operation,
-                        GetCaptureValueId(capture.Id),
-                        $"capture:{capture.Id.GetHashCode().ToString()}"),
-                    ICaughtExceptionOperation => AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Exception,
-                        operation.Type?.ToDisplayString(),
-                        Array.Empty<int>()),
-                    ILiteralOperation literal => AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Constant,
-                        literal.ConstantValue.HasValue
-                            ? Convert.ToString(
-                                literal.ConstantValue.Value,
-                                System.Globalization.CultureInfo.InvariantCulture)
-                            : null,
-                        Array.Empty<int>()),
-                    IFieldReferenceOperation field => ReadFieldValue(operation, field),
-                    IEventReferenceOperation eventReference =>
-                        ReadEventValue(operation, eventReference),
-                    IArrayElementReferenceOperation element => AddOperationValue(
-                        operation,
-                        BehaviorValueKind.ArrayElementRead,
-                        null,
-                        element.Indices.Prepend(element.ArrayReference).Select(ReadValue).ToArray()),
-                    IAddressOfOperation address => ReadAddress(address.Reference),
-                    var pointer when IsPointerIndirection(pointer) => AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Computation,
-                        "pointer-read",
-                        new[] { ReadValue(pointer.ChildOperations.Single()) }),
-                    IConversionOperation conversion => ReadConversionValue(operation, conversion),
-                    IBinaryOperation binary => ReadBinaryValue(binary),
-                    IUnaryOperation unary => ReadUnaryValue(unary),
-                    IInvocationOperation invocation => RecordInvocation(invocation)
-                        ?? throw new AnalysisException(
-                            $"void 调用不能作为值使用：{this.m_method.Id} @ {operation.Syntax.SpanStart}"),
-                    IObjectCreationOperation creation => RecordObjectCreation(creation),
-                    ITypeParameterObjectCreationOperation creation =>
-                        ReadTypeParameterObjectCreation(creation),
-                    IArrayCreationOperation array => ReadArrayCreation(operation, array),
-                    ITypeOfOperation typeOf => ReadTypeValue(operation, typeOf.TypeOperand),
-                    IMethodReferenceOperation method => ReadMethodValue(operation, method),
-                    IDelegateCreationOperation delegateCreation =>
-                        RecordDelegateCreation(delegateCreation),
-                    IDefaultValueOperation defaultValue => AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Constant,
-                        $"default:{defaultValue.Type?.ToDisplayString()}",
-                        Array.Empty<int>()),
-                    IThrowOperation throwOperation => ReadThrowValue(operation, throwOperation),
-                    IPropertyReferenceOperation property => ReadPropertyValue(operation, property),
-                    IParenthesizedOperation parenthesized => ReadValue(parenthesized.Operand),
-                    ICoalesceOperation coalesce => ReadCoalesceValue(operation, coalesce),
-                    ICoalesceAssignmentOperation assignment =>
-                        ReadCoalesceAssignmentValue(assignment),
-                    ISimpleAssignmentOperation assignment =>
-                        ReadSimpleAssignmentValue(assignment),
-                    ICompoundAssignmentOperation assignment =>
-                        ReadCompoundAssignmentValue(assignment),
-                    IIncrementOrDecrementOperation increment =>
-                        ReadIncrementValue(increment),
-                    IConditionalAccessOperation conditionalAccess =>
-                        ReadConditionalAccessValue(conditionalAccess),
-                    IConditionalOperation conditional => AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Merge,
-                        null,
-                        new[]
-                        {
-                            ReadValue(conditional.WhenTrue),
-                                ReadValue(conditional.WhenFalse
-                                ?? throw new AnalysisException(
-                                    $"条件值缺少第二条分支：{this.m_method.Id} "
-                                        + $"@ {operation.Syntax.SpanStart}")),
-                        }),
-                    IIsTypeOperation isType => AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Computation,
-                        $"is:{isType.TypeOperand.ToDisplayString()}",
-                        new[] { ReadValue(isType.ValueOperand) }),
-                    var isNull when isNull.Kind == OperationKind.IsNull => AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Computation,
-                        "is-null",
-                        isNull.ChildOperations.Select(ReadValue).ToArray()),
-                    IIsPatternOperation isPattern => ReadPatternValue(isPattern),
-                    IInterpolatedStringOperation interpolated =>
-                        ReadInterpolatedStringValue(interpolated),
-                    ITupleOperation tuple => ReadTupleValue(tuple),
-                    _ => throw new AnalysisException(
-                        $"源码函数包含尚未读取的值：{this.m_method.Id} "
-                            + $"@ {operation.Syntax.SpanStart} {operation.Kind}"),
-                };
-            }
-
-            // 记录 new T() 的泛型类型身份，交给后续按实际类型闭合构造函数。
-            private int ReadTypeParameterObjectCreation(
-                ITypeParameterObjectCreationOperation operation)
-            {
-                ITypeSymbol type = operation.Type
-                    ?? throw new AnalysisException(
-                        $"泛型对象创建缺少类型：{this.m_method.Id} "
-                            + $"@ {operation.Syntax.SpanStart}");
-                int valueId = AddOperationValue(
-                    operation,
-                    BehaviorValueKind.NewObject,
-                    type.ToDisplayString(),
-                    Array.Empty<int>());
-                this.m_values[valueId] = this.m_values[valueId] with
-                {
-                    Type = ReadTypeReference(type),
-                };
-
-                return valueId;
-            }
-
-            // 将元组的每个元素合并成带结构化类型的值来源。
-            private int ReadTupleValue(ITupleOperation operation)
-            {
-                int valueId = AddOperationValue(
-                    operation,
-                    BehaviorValueKind.Computation,
-                    "tuple",
-                    operation.Elements.Select(ReadValue).ToArray());
-                if (operation.Type != null)
-                {
-                    this.m_values[valueId] = this.m_values[valueId] with
-                    {
-                        Type = ReadTypeReference(operation.Type),
-                    };
-                }
-
-                return valueId;
-            }
-
-            // 将插值字符串的文本、表达式、对齐和格式来源合并为结果值。
-            private int ReadInterpolatedStringValue(IInterpolatedStringOperation operation)
-            {
-                List<int> inputs = new();
-                foreach (IInterpolatedStringContentOperation part in operation.Parts)
-                {
-                    if (part is IInterpolatedStringTextOperation text)
-                    {
-                        inputs.Add(ReadValue(text.Text));
-                        continue;
-                    }
-
-                    if (part is not IInterpolationOperation interpolation)
-                    {
-                        throw new AnalysisException(
-                            $"源码插值字符串包含未知部分：{this.m_method.Id} "
-                                + $"@ {part.Syntax.SpanStart} {part.Kind}");
-                    }
-
-                    inputs.Add(ReadValue(interpolation.Expression));
-                    if (interpolation.Alignment != null)
-                    {
-                        inputs.Add(ReadValue(interpolation.Alignment));
-                    }
-
-                    if (interpolation.FormatString != null)
-                    {
-                        inputs.Add(ReadValue(interpolation.FormatString));
-                    }
-                }
-
-                return AddOperationValue(
-                    operation,
-                    BehaviorValueKind.Computation,
-                    "interpolated-string",
-                    inputs);
-            }
-
-            // 为控制流图临时槽建立可复用的局部值。
-            private int GetCaptureValueId(CaptureId captureId)
-            {
-                if (this.m_captureValueIds.TryGetValue(captureId, out int valueId))
-                {
-                    return valueId;
-                }
-
-                valueId = AddRootValue(
-                    BehaviorValueKind.Local,
-                    $"capture:{captureId.GetHashCode().ToString()}",
-                    null);
-                this.m_captureValueIds.Add(captureId, valueId);
-
-                return valueId;
-            }
-
-            // 记录简单赋值并将右侧值作为整个表达式的结果。
-            private int ReadSimpleAssignmentValue(ISimpleAssignmentOperation operation)
-            {
-                if (this.m_valueIds.TryGetValue(operation, out int existingId))
-                {
-                    return existingId;
-                }
-
-                int valueId = ReadValue(operation.Value);
-                this.m_writeTargets.Add(operation.Target);
-                RecordWrite(operation.Target, valueId, operation.Syntax.SpanStart);
-                this.m_valueIds.Add(operation, valueId);
-
-                return valueId;
-            }
-
-            // 记录复合赋值并返回运算后的值。
-            private int ReadCompoundAssignmentValue(ICompoundAssignmentOperation operation)
-            {
-                if (this.m_valueIds.TryGetValue(operation, out int existingId))
-                {
-                    return existingId;
-                }
-
-                int[] inputs = { ReadValue(operation.Target), ReadValue(operation.Value) };
-                int valueId = operation.OperatorMethod == null
-                    ? AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Computation,
-                        operation.OperatorKind.ToString(),
-                        inputs)
-                    : RecordOperator(operation, operation.OperatorMethod, inputs);
-                this.m_writeTargets.Add(operation.Target);
-                RecordWrite(operation.Target, valueId, operation.Syntax.SpanStart);
-
-                return valueId;
-            }
-
-            // 记录递增或递减并返回表达式值。
-            private int ReadIncrementValue(IIncrementOrDecrementOperation operation)
-            {
-                if (this.m_valueIds.TryGetValue(operation, out int existingId))
-                {
-                    return existingId;
-                }
-
-                int[] inputs = { ReadValue(operation.Target) };
-                int valueId = operation.OperatorMethod == null
-                    ? AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Computation,
-                        operation.Kind.ToString(),
-                        inputs)
-                    : RecordOperator(operation, operation.OperatorMethod, inputs);
-                this.m_writeTargets.Add(operation.Target);
-                RecordWrite(operation.Target, valueId, operation.Syntax.SpanStart);
-
-                return valueId;
-            }
-
-            // 读取类型、常量和组合模式，并保留声明变量的值来源。
-            private int ReadPatternValue(IIsPatternOperation operation)
-            {
-                int inputValueId = ReadValue(operation.Value);
-                List<int> inputs = new() { inputValueId };
-
-                ReadPattern(operation.Pattern, inputValueId, inputs);
-
-                return AddOperationValue(
-                    operation,
-                    BehaviorValueKind.Computation,
-                    $"pattern:{operation.Pattern.Kind}",
-                    inputs);
-            }
-
-            // 递归读取一种明确的模式写法。
-            private void ReadPattern(IPatternOperation pattern, int inputValueId, ICollection<int> inputs)
-            {
-                switch (pattern)
-                {
-                    case IDeclarationPatternOperation declaration:
-                        if (declaration.DeclaredSymbol is ILocalSymbol local)
-                        {
-                            this.m_assignments.Add(CreateAssignment(
-                                GetLocalValueId(local),
-                                inputValueId,
-                                declaration.Syntax.SpanStart));
-                        }
-
-                        break;
-                    case ITypePatternOperation:
-                        break;
-                    case IConstantPatternOperation constant:
-                        inputs.Add(ReadValue(constant.Value));
-                        break;
-                    case IRelationalPatternOperation relational:
-                        inputs.Add(ReadValue(relational.Value));
-                        break;
-                    case INegatedPatternOperation negated:
-                        ReadPattern(negated.Pattern, inputValueId, inputs);
-                        break;
-                    case IBinaryPatternOperation binary:
-                        ReadPattern(binary.LeftPattern, inputValueId, inputs);
-                        ReadPattern(binary.RightPattern, inputValueId, inputs);
-                        break;
-                    case IRecursivePatternOperation recursive:
-                        ReadRecursivePattern(recursive, inputValueId, inputs);
-                        break;
-                    default:
-                        throw new AnalysisException(
-                            $"源码函数包含尚未读取的模式：{this.m_method.Id} "
-                                + $"@ {pattern.Syntax.SpanStart} {pattern.Kind}");
-                }
-            }
-
-            // 读取递归模式声明、属性 getter 和位置解构调用。
-            private void ReadRecursivePattern(
-                IRecursivePatternOperation pattern,
-                int inputValueId,
-                ICollection<int> inputs)
-            {
-                if (pattern.DeclaredSymbol is ILocalSymbol local)
-                {
-                    this.m_assignments.Add(CreateAssignment(
-                        GetLocalValueId(local),
-                        inputValueId,
-                        pattern.Syntax.SpanStart));
-                }
-
-                foreach (IPropertySubpatternOperation property in pattern.PropertySubpatterns)
-                {
-                    this.m_implicitReceivers.Push(inputValueId);
-                    int memberValueId = ReadValue(property.Member);
-                    this.m_implicitReceivers.Pop();
-                    inputs.Add(memberValueId);
-                    ReadPattern(property.Pattern, memberValueId, inputs);
-                }
-
-                IMethodSymbol? deconstruct = pattern.DeconstructSymbol as IMethodSymbol;
-                if (deconstruct == null && pattern.DeconstructionSubpatterns.Length > 0)
-                {
-                    throw new AnalysisException(
-                        $"位置模式没有解构函数：{this.m_method.Id} "
-                            + $"@ {pattern.Syntax.SpanStart}");
-                }
-
-                if (deconstruct != null)
-                {
-                    int[] outputValueIds = pattern.DeconstructionSubpatterns
-                        .Select((_, index) => AddRootValue(
-                            BehaviorValueKind.Local,
-                            $"pattern-output:{index.ToString()}",
-                            null))
-                        .ToArray();
-                    RecordSyntheticCall(
-                        deconstruct,
-                        inputValueId,
-                        outputValueIds.Select(valueId => new BehaviorArgument(
-                            AddValue(
-                                BehaviorValueKind.Address,
-                                "pattern-output",
-                                null,
-                                new[] { valueId }),
-                            CatalogRefKind.Out)).ToArray(),
-                        pattern.Syntax.SpanStart);
-                    for (int index = 0; index < outputValueIds.Length; index++)
-                    {
-                        inputs.Add(outputValueIds[index]);
-                        ReadPattern(
-                            pattern.DeconstructionSubpatterns[index],
-                            outputValueIds[index],
-                            inputs);
-                    }
-                }
-            }
-
-            // 区分当前对象、对象初始化器接收者和条件访问接收者。
-            private int ReadInstanceValue(IInstanceReferenceOperation operation)
-            {
-                if (operation.ReferenceKind == InstanceReferenceKind.ImplicitReceiver
-                    && this.m_implicitReceivers.TryPeek(out int receiver))
-                {
-                    return receiver;
-                }
-
-                if (this.m_method.Kind is CatalogMethodKind.AnonymousFunction
-                    or CatalogMethodKind.LocalFunction)
-                {
-                    this.m_capturedInstanceValueId ??= AddRootValue(
-                        BehaviorValueKind.Captured,
-                        $"this:{this.m_method.TypeId}",
-                        null);
-                    return this.m_capturedInstanceValueId.Value;
-                }
-
-                return GetCurrentInstanceValueId();
-            }
-
-            // 读取可能由用户函数实现的类型转换。
-            private int ReadConversionValue(
-                IOperation operation,
-                IConversionOperation conversion)
-            {
-                int operandValueId = ReadValue(conversion.Operand);
-                int valueId = conversion.OperatorMethod == null
-                    ? AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Conversion,
-                        conversion.Type?.ToDisplayString(),
-                        new[] { operandValueId })
-                    : RecordOperator(
-                        operation,
-                        conversion.OperatorMethod,
-                        new[] { operandValueId });
-                if (conversion.Type != null)
-                {
-                    this.m_values[valueId] = this.m_values[valueId] with
-                    {
-                        Type = ReadTypeReference(conversion.Type),
-                    };
-                }
-
-                return valueId;
-            }
-
-            // 读取二元计算或其用户自定义运算符调用。
-            private int ReadBinaryValue(IBinaryOperation operation)
-            {
-                int[] inputs = { ReadValue(operation.LeftOperand), ReadValue(operation.RightOperand) };
-
-                return operation.OperatorMethod == null
-                    ? AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Computation,
-                        operation.OperatorKind.ToString(),
-                        inputs)
-                    : RecordOperator(operation, operation.OperatorMethod, inputs);
-            }
-
-            // 读取一元计算或其用户自定义运算符调用。
-            private int ReadUnaryValue(IUnaryOperation operation)
-            {
-                int[] inputs = { ReadValue(operation.Operand) };
-
-                return operation.OperatorMethod == null
-                    ? AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Computation,
-                        operation.OperatorKind.ToString(),
-                        inputs)
-                    : RecordOperator(operation, operation.OperatorMethod, inputs);
-            }
-
-            // 返回空值赋值在保留旧值和新值后的汇合结果。
-            private int ReadCoalesceAssignmentValue(ICoalesceAssignmentOperation operation)
-            {
-                VisitCoalesceAssignment(operation);
-
-                return this.m_valueIds[operation];
-            }
-
-            // 将条件访问占位接收者连回问号左侧对象并返回非空分支结果。
-            private int ReadConditionalAccessValue(IConditionalAccessOperation operation)
-            {
-                if (this.m_valueIds.TryGetValue(operation, out int existingId))
-                {
-                    return existingId;
-                }
-
-                int receiverValueId = ReadValue(operation.Operation);
-                this.m_conditionalReceivers.Push(receiverValueId);
-                int resultValueId = ReadValue(operation.WhenNotNull);
-                this.m_conditionalReceivers.Pop();
-
-                return AddOperationValue(
-                    operation,
-                    BehaviorValueKind.Merge,
-                    "conditional-access",
-                    new[] { resultValueId });
-            }
-
-            // 读取空值合并表达式并排除不会产生值的 throw 分支。
-            private int ReadCoalesceValue(IOperation operation, ICoalesceOperation coalesce)
-            {
-                List<int> inputs = new() { ReadValue(coalesce.Value) };
-                IOperation whenNull = coalesce.WhenNull;
-                while (whenNull is IConversionOperation conversion)
-                {
-                    whenNull = conversion.Operand;
-                }
-
-                if (whenNull is IThrowOperation throwOperation)
-                {
-                    VisitThrow(throwOperation);
-                }
-                else
-                {
-                    inputs.Add(ReadValue(coalesce.WhenNull));
-                }
-
-                return AddOperationValue(
-                    operation,
-                    BehaviorValueKind.Merge,
-                    "coalesce",
-                    inputs);
-            }
-
-            // 记录 throw 表达式中的异常来源并明确标记该分支不会产生返回值。
-            private int ReadThrowValue(IOperation operation, IThrowOperation throwOperation)
-            {
-                int[] inputs = throwOperation.Exception == null
-                    ? Array.Empty<int>()
-                    : new[] { ReadValue(throwOperation.Exception) };
-
-                return AddOperationValue(
-                    operation,
-                    BehaviorValueKind.NoReturn,
-                    "throw",
-                    inputs);
-            }
-
-            // 记录源码方法组或匿名函数到委托对象的绑定事实。
-            private int RecordDelegateCreation(IDelegateCreationOperation operation)
-            {
-                if (this.m_recordedCalls.Contains(operation))
-                {
-                    return this.m_valueIds[operation];
-                }
-
-                INamedTypeSymbol delegateType = operation.Type as INamedTypeSymbol
-                    ?? throw new AnalysisException(
-                        $"委托创建缺少委托类型：{this.m_method.Id} @ {operation.Syntax.SpanStart}");
-                IMethodSymbol constructor = delegateType.InstanceConstructors.Single(method =>
-                    method.Parameters.Length == 2);
-                int functionValueId;
-                int receiverValueId;
-                if (operation.Target is IMethodReferenceOperation method)
-                {
-                    functionValueId = ReadMethodValue(method, method);
-                    receiverValueId = method.Instance == null
-                        ? AddValue(
-                            BehaviorValueKind.Constant,
-                            null,
-                            null,
-                            Array.Empty<int>())
-                        : ReadValue(method.Instance);
-                }
-                else if (operation.Target is IAnonymousFunctionOperation anonymous)
-                {
-                    BehaviorCaptureBinding[] captures = ReadFunctionCaptureSources(
-                        anonymous.Symbol,
-                        anonymous.Body);
-                    functionValueId = AddOperationValue(
-                        anonymous,
-                        BehaviorValueKind.Function,
-                        anonymous.Symbol.MetadataName,
-                        captures.Select(capture => capture.ValueId).ToArray());
-                    this.m_values[functionValueId] = this.m_values[functionValueId] with
-                    {
-                        Captures = captures,
-                        Method = ReadMethodReference(anonymous.Symbol),
-                    };
-                    receiverValueId = AddValue(
-                        BehaviorValueKind.Constant,
-                        null,
-                        null,
-                        Array.Empty<int>());
-                }
-                else if (operation.Target is IFlowAnonymousFunctionOperation flowAnonymous)
-                {
-                    BehaviorCaptureBinding[] captures = ReadAnonymousCaptureSources(flowAnonymous);
-                    functionValueId = AddOperationValue(
-                        flowAnonymous,
-                        BehaviorValueKind.Function,
-                        flowAnonymous.Symbol.MetadataName,
-                        captures.Select(capture => capture.ValueId).ToArray());
-                    this.m_values[functionValueId] = this.m_values[functionValueId] with
-                    {
-                        Captures = captures,
-                        Method = ReadMethodReference(flowAnonymous.Symbol),
-                    };
-                    receiverValueId = AddValue(
-                        BehaviorValueKind.Constant,
-                        null,
-                        null,
-                        Array.Empty<int>());
-                }
-                else
-                {
-                    throw new AnalysisException(
-                        $"委托创建目标不是函数：{this.m_method.Id} "
-                            + $"@ {operation.Syntax.SpanStart} {operation.Target.Kind}");
-                }
-
-                int resultValueId = AddOperationValue(
-                    operation,
-                    BehaviorValueKind.NewObject,
-                    delegateType.ToDisplayString(),
-                    new[] { receiverValueId, functionValueId });
-                this.m_values[resultValueId] = this.m_values[resultValueId] with
-                {
-                    Type = ReadTypeReference(delegateType),
-                };
-                this.m_calls.Add(CreateCall(
-                    BehaviorCallKind.ObjectCreation,
-                    ReadMethodReference(constructor),
-                    null,
-                    new[]
-                    {
-                        new BehaviorArgument(receiverValueId, CatalogRefKind.None),
-                        new BehaviorArgument(functionValueId, CatalogRefKind.None),
-                    },
-                    resultValueId,
-                    operation.Syntax.SpanStart));
-                this.m_recordedCalls.Add(operation);
-
-                return resultValueId;
-            }
-
-            // 按稳定捕获键收集控制流匿名函数引用的外层值。
-            private BehaviorCaptureBinding[] ReadAnonymousCaptureSources(
-                IFlowAnonymousFunctionOperation operation)
-            {
-                SemanticModel model = this.m_compilation.GetSemanticModel(operation.Syntax.SyntaxTree);
-                IAnonymousFunctionOperation anonymous = model.GetOperation(
-                        operation.Syntax,
-                        this.m_cancellationToken) as IAnonymousFunctionOperation
-                    ?? throw new AnalysisException(
-                        $"控制流匿名函数没有原始操作树：{this.m_method.Id} "
-                            + $"@ {operation.Syntax.SpanStart}");
-                return ReadFunctionCaptureSources(anonymous.Symbol, anonymous.Body);
-            }
-
-            // 按稳定键收集内部函数引用的所有外层值。
-            private BehaviorCaptureBinding[] ReadFunctionCaptureSources(
-                IMethodSymbol function,
-                IOperation body)
-            {
-                Dictionary<string, int> captures = new(StringComparer.Ordinal);
-                foreach (IOperation descendant in EnumerateOperations(body))
-                {
-                    if (descendant is IParameterReferenceOperation parameter
-                        && !SymbolEqualityComparer.Default.Equals(
-                            parameter.Parameter.ContainingSymbol,
-                            function))
-                    {
-                        captures.TryAdd(
-                            ReadCaptureKey(parameter.Parameter),
-                            GetParameterValueId(parameter.Parameter));
-                    }
-                    else if (descendant is ILocalReferenceOperation local
-                        && !SymbolEqualityComparer.Default.Equals(
-                            local.Local.ContainingSymbol,
-                            function))
-                    {
-                        captures.TryAdd(
-                            ReadCaptureKey(local.Local),
-                            GetLocalValueId(local.Local));
-                    }
-                    else if (descendant is IInstanceReferenceOperation instance
-                        && instance.ReferenceKind == InstanceReferenceKind.ContainingTypeInstance)
-                    {
-                        captures.TryAdd(
-                            $"this:{this.m_method.TypeId}",
-                            GetCurrentInstanceValueId());
-                    }
-                }
-
-                return captures.OrderBy(item => item.Key)
-                    .Select(item => new BehaviorCaptureBinding(item.Key, item.Value))
-                    .ToArray();
-            }
-
-            // 递归列出一个操作树，忽略其中再次嵌套的函数体。
-            private static IEnumerable<IOperation> EnumerateOperations(IOperation root)
-            {
-                foreach (IOperation child in root.ChildOperations)
-                {
-                    yield return child;
-                    if (child is IAnonymousFunctionOperation or ILocalFunctionOperation)
-                    {
-                        continue;
-                    }
-
-                    foreach (IOperation descendant in EnumerateOperations(child))
-                    {
-                        yield return descendant;
-                    }
-                }
-            }
-
-            // 读取字段值并附加结构化字段身份。
-            private int ReadFieldValue(IOperation operation, IFieldReferenceOperation field)
-            {
-                if (field.Field.HasConstantValue)
-                {
-                    return AddOperationValue(
-                        operation,
-                        BehaviorValueKind.Constant,
-                        Convert.ToString(
-                            field.Field.ConstantValue,
-                            System.Globalization.CultureInfo.InvariantCulture),
-                        Array.Empty<int>());
-                }
-
-                int id = AddOperationValue(
-                    operation,
-                    BehaviorValueKind.FieldRead,
-                    field.Field.MetadataName,
-                    field.Field.IsStatic
-                        ? Array.Empty<int>()
-                        : new[] { ReadValue(field.Instance!) });
-                this.m_values[id] = this.m_values[id] with
-                {
-                    Member = ReadFieldReference(field.Field),
-                };
-
-                return id;
-            }
-
-            // 判断 Roslyn 尚未公开专用接口的指针解引用操作。
-            private static bool IsPointerIndirection(IOperation operation)
-            {
-                return operation.Kind == OperationKind.None
-                    && operation.Syntax is PrefixUnaryExpressionSyntax prefix
-                    && prefix.IsKind(SyntaxKind.PointerIndirectionExpression);
-            }
-
-            // 读取字段式事件值并附加结构化事件存储身份。
-            private int ReadEventValue(
-                IOperation operation,
-                IEventReferenceOperation eventReference)
-            {
-                int id = AddOperationValue(
-                    operation,
-                    BehaviorValueKind.FieldRead,
-                    eventReference.Event.MetadataName,
-                    eventReference.Event.IsStatic
-                        ? Array.Empty<int>()
-                        : new[] { ReadValue(eventReference.Instance!) });
-                this.m_values[id] = this.m_values[id] with
-                {
-                    Member = ReadEventReference(eventReference.Event),
-                };
-
-                return id;
-            }
-
-            // 追加一个没有独立操作树节点但带结构化字段身份的值。
-            private int AddMemberValue(
-                BehaviorValueKind kind,
-                BehaviorMemberReference member,
-                IReadOnlyList<int> inputValueIds)
-            {
-                int id = AddValue(kind, member.Name, null, inputValueIds);
-                this.m_values[id] = this.m_values[id] with { Member = member };
-
-                return id;
-            }
-
-            // 读取数组创建值和全部维度来源。
-            private int ReadArrayCreation(IOperation operation, IArrayCreationOperation array)
-            {
-                if (this.m_valueIds.TryGetValue(operation, out int existingId))
-                {
-                    return existingId;
-                }
-
-                int id = AddOperationValue(
-                    operation,
-                    BehaviorValueKind.NewArray,
-                    array.Type?.ToDisplayString(),
-                    array.DimensionSizes.Select(ReadValue).ToArray());
-                this.m_values[id] = this.m_values[id] with
-                {
-                    Type = array.Type == null ? null : ReadTypeReference(array.Type),
-                };
-                if (array.Initializer != null
-                    && this.m_recordedInitializers.Add(array.Initializer))
-                {
-                    RecordArrayInitializer(id, array.Initializer, Array.Empty<int>());
-                }
-
-                return id;
-            }
-
-            // 递归记录矩形或交错数组初始化器写入的每个下标和值。
-            private void RecordArrayInitializer(
-                int arrayValueId,
-                IArrayInitializerOperation initializer,
-                IReadOnlyList<int> parentIndexes)
-            {
-                for (int index = 0; index < initializer.ElementValues.Length; index++)
-                {
-                    IOperation element = initializer.ElementValues[index];
-                    int indexValueId = AddValue(
-                        BehaviorValueKind.Constant,
-                        index.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                        null,
-                        Array.Empty<int>());
-                    int[] indexes = parentIndexes.Append(indexValueId).ToArray();
-                    if (element is IArrayInitializerOperation nested)
-                    {
-                        RecordArrayInitializer(arrayValueId, nested, indexes);
-                    }
-                    else
-                    {
-                        this.m_writes.Add(CreateWrite(
-                            BehaviorWriteKind.ArrayElement,
-                            arrayValueId,
-                            null,
-                            indexes,
-                            ReadValue(element),
-                            element.Syntax.SpanStart));
-                    }
-                }
-            }
-
-            // 读取 typeof 表达式中的结构化类型。
-            private int ReadTypeValue(IOperation operation, ITypeSymbol type)
-            {
-                int id = AddOperationValue(
-                    operation,
-                    BehaviorValueKind.Type,
-                    type.ToDisplayString(),
-                    Array.Empty<int>());
-                this.m_values[id] = this.m_values[id] with
-                {
-                    Type = ReadTypeReference(type),
-                };
-
-                return id;
-            }
-
-            // 读取方法组绑定的结构化函数和接收对象。
-            private int ReadMethodValue(IOperation operation, IMethodReferenceOperation method)
-            {
-                List<int> inputValueIds = new();
-                BehaviorCaptureBinding[] captures = Array.Empty<BehaviorCaptureBinding>();
-                if (method.Instance != null)
-                {
-                    inputValueIds.Add(ReadValue(method.Instance));
-                }
-
-                if (method.Method.MethodKind == MethodKind.LocalFunction)
-                {
-                    captures = ReadLocalFunctionCaptureSources(method.Method);
-                    inputValueIds.AddRange(captures.Select(capture => capture.ValueId));
-                }
-
-                int id = AddOperationValue(
-                    operation,
-                    BehaviorValueKind.Function,
-                    method.Method.MetadataName,
-                    inputValueIds);
-                this.m_values[id] = this.m_values[id] with
-                {
-                    Captures = captures,
-                    Method = ReadMethodReference(method.Method),
-                };
-
-                return id;
-            }
-
-            // 读取属性 getter 调用及其结果值。
-            private int ReadPropertyValue(IOperation operation, IPropertyReferenceOperation property)
-            {
-                if (this.m_valueIds.TryGetValue(operation, out int existingId))
-                {
-                    return existingId;
-                }
-
-                if (IsArrayForEachCompilerOperation(operation))
-                {
-                    return AddOperationValue(
-                        operation,
-                        BehaviorValueKind.ArrayElementRead,
-                        "foreach-element",
-                        property.Instance == null
-                            ? Array.Empty<int>()
-                            : new[] { ReadValue(property.Instance) });
-                }
-
-                IMethodSymbol getter = property.Property.GetMethod
-                    ?? throw new AnalysisException(
-                        $"源码属性没有读取函数：{this.m_method.Id} @ {operation.Syntax.SpanStart}");
-                BehaviorArgument[] arguments = property.Arguments
-                    .Select(argument => new BehaviorArgument(
-                        ReadValue(argument.Value),
-                        ReadRefKind(argument.Parameter?.RefKind ?? RefKind.None)))
-                    .ToArray();
-                int resultValueId = AddOperationValue(
-                    operation,
-                    BehaviorValueKind.CallResult,
-                    getter.MetadataName,
-                    arguments.Select(argument => argument.ValueId).ToArray());
-                this.m_calls.Add(CreateCall(
-                    ReadCallKind(getter),
-                    ReadMethodReference(getter),
-                    getter.IsStatic ? null : ReadValue(property.Instance!),
-                    arguments,
-                    resultValueId,
-                    operation.Syntax.SpanStart));
-
-                return resultValueId;
-            }
-
-            // 建立一个操作树节点对应的稳定值来源。
-            private int AddOperationValue(
-                IOperation operation,
-                BehaviorValueKind kind,
-                string? reference,
-                IReadOnlyList<int> inputValueIds)
-            {
-                if (this.m_valueIds.TryGetValue(operation, out int existingId))
-                {
-                    this.m_values[existingId] = this.m_values[existingId] with
-                    {
-                        Kind = kind,
-                        Reference = reference,
-                        InputValueIds = inputValueIds,
-                    };
-
-                    return existingId;
-                }
-
-                int id = this.m_values.Count;
-                this.m_values.Add(new BehaviorValue(
-                    id,
-                    kind,
-                    reference,
-                    null,
-                    inputValueIds)
-                {
-                    Point = NextPoint(),
-                });
-                this.m_valueIds.Add(operation, id);
-
-                return id;
-            }
-
-            // 追加当前执行位置产生且不依赖具体操作树节点的值来源。
-            private int AddValue(
-                BehaviorValueKind kind,
-                string? reference,
-                int? parameterIndex,
-                IReadOnlyList<int> inputValueIds)
-            {
-                int id = this.m_values.Count;
-                this.m_values.Add(new BehaviorValue(
-                    id,
-                    kind,
-                    reference,
-                    parameterIndex,
-                    inputValueIds)
-                {
-                    Point = NextPoint(),
-                });
-
-                return id;
-            }
-
-            // 追加没有执行位置的稳定根槽。
-            private int AddRootValue(
-                BehaviorValueKind kind,
-                string? reference,
-                int? parameterIndex)
-            {
-                int id = this.m_values.Count;
-                this.m_values.Add(new BehaviorValue(
-                    id,
-                    kind,
-                    reference,
-                    parameterIndex,
-                    Array.Empty<int>()));
-
-                return id;
-            }
-
-            // 返回当前对象在本函数中的唯一值来源。
-            private int GetCurrentInstanceValueId()
-            {
-                this.m_currentInstanceValueId ??= AddRootValue(
-                    BehaviorValueKind.CurrentInstance,
-                    null,
-                    null);
-
-                return this.m_currentInstanceValueId.Value;
-            }
-
-            // 返回一个函数参数在本函数中的唯一值来源。
-            private int GetParameterValueId(IParameterSymbol parameter)
-            {
-                if (!SymbolEqualityComparer.Default.Equals(
-                        parameter.ContainingSymbol,
-                        this.m_method.SourceSymbol))
-                {
-                    return GetCapturedValueId(parameter);
-                }
-
-                if (!this.m_parameterValueIds.TryGetValue(parameter, out int id))
-                {
-                    id = AddRootValue(
-                        BehaviorValueKind.Parameter,
-                        parameter.Name,
-                        parameter.Ordinal);
-                    this.m_parameterValueIds.Add(parameter, id);
-                }
-
-                return id;
-            }
-
-            // 返回一个局部变量在本函数中的唯一值来源。
-            private int GetLocalValueId(ILocalSymbol local)
-            {
-                if (!SymbolEqualityComparer.Default.Equals(
-                        local.ContainingSymbol,
-                        this.m_method.SourceSymbol))
-                {
-                    return GetCapturedValueId(local);
-                }
-
-                if (!this.m_localValueIds.TryGetValue(local, out int id))
-                {
-                    id = AddRootValue(
-                        BehaviorValueKind.Local,
-                        local.Name,
-                        null);
-                    this.m_localValueIds.Add(local, id);
-                }
-
-                return id;
-            }
-
-            // 读取局部函数绑定时由外层函数提供的捕获值。
-            private BehaviorCaptureBinding[] ReadLocalFunctionCaptureSources(IMethodSymbol method)
-            {
-                SyntaxNode syntax = method.DeclaringSyntaxReferences.Single()
-                    .GetSyntax(this.m_cancellationToken);
-                SemanticModel model = this.m_compilation.GetSemanticModel(syntax.SyntaxTree);
-                ILocalFunctionOperation localFunction = model.GetOperation(
-                        syntax,
-                        this.m_cancellationToken) as ILocalFunctionOperation
-                    ?? throw new AnalysisException(
-                        $"局部函数没有操作树：{this.m_method.Id} @ {syntax.SpanStart}");
-
-                return ReadFunctionCaptureSources(
-                    localFunction.Symbol,
-                    localFunction.Body
-                        ?? throw new AnalysisException(
-                            $"局部函数没有函数体：{this.m_method.Id} @ {syntax.SpanStart}"));
-            }
-
-            // 返回匿名函数或局部函数捕获的外层值来源。
-            private int GetCapturedValueId(ISymbol symbol)
-            {
-                if (!this.m_capturedValueIds.TryGetValue(symbol, out int id))
-                {
-                    id = AddRootValue(
-                        BehaviorValueKind.Captured,
-                        ReadCaptureKey(symbol),
-                        null);
-                    this.m_capturedValueIds.Add(symbol, id);
-                }
-
-                return id;
-            }
-
-            // 建立绑定处与内部函数体共同使用的稳定捕获键。
-            private string ReadCaptureKey(ISymbol symbol)
-            {
-                if (symbol is IParameterSymbol parameter
-                    && this.m_sourceMethodIds.TryGetValue(
-                        parameter.ContainingSymbol.OriginalDefinition,
-                        out string? methodId))
-                {
-                    return $"{methodId}:parameter:{parameter.Ordinal.ToString()}";
-                }
-
-                FileLinePositionSpan location = symbol.Locations.Single(item => item.IsInSource)
-                    .GetLineSpan();
-                return $"{Path.GetFullPath(location.Path)}:{location.StartLinePosition.Line.ToString()}:"
-                    + location.StartLinePosition.Character.ToString();
-            }
-
-            // 读取源码函数引用并转换为公开结构。
-            private BehaviorMethodReference ReadMethodReference(IMethodSymbol method)
-            {
-                try
-                {
-                    IMethodSymbol definition = (method.ReducedFrom ?? method).OriginalDefinition;
-                    this.m_sourceMethodIds.TryGetValue(definition, out string? knownMethodId);
-                    return BehaviorMethodReference.From(this.m_catalog.ReadSourceMethodReference(
-                        method,
-                        this.m_method.AssemblyName)) with
-                    {
-                        KnownMethodId = knownMethodId,
-                    };
-                }
-                catch (AnalysisException exception)
-                {
-                    throw new AnalysisException(
-                        $"读取源码调用引用失败：{method.ToDisplayString()} => {exception.Message}");
-                }
-            }
-
-            // 读取源码字段引用并转换为公开结构。
-            private BehaviorMemberReference ReadFieldReference(IFieldSymbol field)
-            {
-                return BehaviorMemberReference.From(this.m_catalog.ReadSourceFieldReference(
-                    field,
-                    this.m_method.AssemblyName));
-            }
-
-            // 读取源码字段式事件引用并转换为公开结构。
-            private BehaviorMemberReference ReadEventReference(IEventSymbol eventSymbol)
-            {
-                return BehaviorMemberReference.From(this.m_catalog.ReadSourceEventReference(
-                    eventSymbol,
-                    this.m_method.AssemblyName));
-            }
-
-            // 读取源码类型引用并转换为公开结构。
-            private BehaviorTypeReference ReadTypeReference(ITypeSymbol type)
-            {
-                try
-                {
-                    return BehaviorTypeReference.From(this.m_catalog.ReadSourceTypeReference(
-                        type,
-                        this.m_method.AssemblyName));
-                }
-                catch (AnalysisException exception)
-                {
-                    throw new AnalysisException(
-                        $"读取源码类型引用失败：{type.Kind} {type.ToDisplayString()} "
-                            + $"=> {exception.Message}");
-                }
-            }
-
-            // 把 Roslyn 参数传递方式转换为函数总表使用的枚举。
-            private static CatalogRefKind ReadRefKind(RefKind refKind)
-            {
-                return refKind switch
-                {
-                    RefKind.Ref => CatalogRefKind.Ref,
-                    RefKind.Out => CatalogRefKind.Out,
-                    RefKind.In or RefKind.RefReadOnlyParameter => CatalogRefKind.In,
-                    _ => CatalogRefKind.None,
-                };
-            }
-
-            // 为参数、局部值或控制流临时槽的本次读取建立独立快照。
-            private int ReadSlotValue(IOperation operation, int slotValueId, string reference)
-            {
-                return AddOperationValue(
-                    operation,
-                    BehaviorValueKind.SlotRead,
-                    reference,
-                    new[] { slotValueId });
-            }
-
-        }
 
         /// <summary>
         /// 读取托管指令栈并建立本函数的事实集合。
@@ -3237,6 +193,7 @@ namespace SetterChecker.Core
             // 沿所有实际控制流路径读取函数体并在路径汇合处合并值来源。
             public MethodBehavior Read(Cil.MethodBody body)
             {
+                Mono.Cecil.Rocks.MethodBodyRocks.SimplifyMacros(body);
                 Cil.Instruction[] instructions = body.Instructions.ToArray();
                 IReadOnlyDictionary<int, Cil.Instruction> instructionsByOffset = instructions
                     .ToDictionary(instruction => instruction.Offset);
@@ -3278,7 +235,6 @@ namespace SetterChecker.Core
                     foreach (int successor in ReadSuccessors(instruction, instructionsByOffset))
                     {
                         int[] successorStack = instruction.OpCode.Code is Cil.Code.Leave
-                            or Cil.Code.Leave_S
                             ? Array.Empty<int>()
                             : outgoingStack;
                         AddIncomingStack(successor, successorStack, pending);
@@ -3625,7 +581,7 @@ namespace SetterChecker.Core
                     };
                 }
 
-                bool isLeave = instruction.OpCode.Code is Cil.Code.Leave or Cil.Code.Leave_S;
+                bool isLeave = instruction.OpCode.Code == Cil.Code.Leave;
                 bool isConditional = instruction.OpCode.FlowControl == Cil.FlowControl.Cond_Branch;
                 IEnumerable<int?> targets = instruction.OpCode.FlowControl switch
                 {
@@ -3936,18 +892,12 @@ namespace SetterChecker.Core
                     return;
                 }
 
-                if (code == OpCodes.Br
-                    || code == OpCodes.Br_S
-                    || code == OpCodes.Leave
-                    || code == OpCodes.Leave_S)
+                if (code == OpCodes.Br || code == OpCodes.Leave)
                 {
                     return;
                 }
 
-                if (code == OpCodes.Brfalse
-                    || code == OpCodes.Brfalse_S
-                    || code == OpCodes.Brtrue
-                    || code == OpCodes.Brtrue_S)
+                if (code == OpCodes.Brfalse || code == OpCodes.Brtrue)
                 {
                     Pop(code, offset);
 
@@ -3966,8 +916,9 @@ namespace SetterChecker.Core
                     return;
                 }
 
-                if (TryReadArgumentAddress(code, operand, out int argumentAddressIndex))
+                if (code == OpCodes.Ldarga)
                 {
+                    int argumentAddressIndex = ReadArgumentIndex(code, operand);
                     this.m_stack.Push(AddValue(
                         BehaviorValueKind.Address,
                         $"argument:{argumentAddressIndex}",
@@ -3977,10 +928,10 @@ namespace SetterChecker.Core
                     return;
                 }
 
-                if (TryWriteArgument(code, operand, out int writtenArgumentIndex))
+                if (code == OpCodes.Starg)
                 {
                     this.m_assignments[offset] = new BehaviorAssignment(
-                        GetArgumentValueId(writtenArgumentIndex),
+                        GetArgumentValueId(ReadArgumentIndex(code, operand)),
                         Pop(code, offset),
                         offset)
                     {
@@ -3990,9 +941,9 @@ namespace SetterChecker.Core
                     return;
                 }
 
-                if (TryReadArgument(code, operand, out int argumentIndex))
+                if (code == OpCodes.Ldarg)
                 {
-                    int slotId = GetArgumentValueId(argumentIndex);
+                    int slotId = GetArgumentValueId(ReadArgumentIndex(code, operand));
                     this.m_stack.Push(this.m_values[slotId].Kind == BehaviorValueKind.CurrentInstance
                         ? slotId
                         : ReadSlot(slotId));
@@ -4000,11 +951,11 @@ namespace SetterChecker.Core
                     return;
                 }
 
-                if (TryReadIntegerConstant(code, operand, out int constant))
+                if (code == OpCodes.Ldc_I4)
                 {
                     this.m_stack.Push(AddValue(
                         BehaviorValueKind.Constant,
-                        constant.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        RequireOperand<int>(instruction).ToString(System.Globalization.CultureInfo.InvariantCulture),
                         null,
                         Array.Empty<int>()));
 
@@ -4059,15 +1010,16 @@ namespace SetterChecker.Core
                     return;
                 }
 
-                if (TryReadLocal(code, operand, out int localIndex))
+                if (code == OpCodes.Ldloc)
                 {
-                    this.m_stack.Push(ReadSlot(GetLocalValueId(localIndex)));
+                    this.m_stack.Push(ReadSlot(GetLocalValueId(RequireOperand<Cil.VariableDefinition>(instruction).Index)));
 
                     return;
                 }
 
-                if (TryReadLocalAddress(code, operand, out localIndex))
+                if (code == OpCodes.Ldloca)
                 {
+                    int localIndex = RequireOperand<Cil.VariableDefinition>(instruction).Index;
                     this.m_stack.Push(AddValue(
                         BehaviorValueKind.Address,
                         $"local:{localIndex}",
@@ -4077,10 +1029,10 @@ namespace SetterChecker.Core
                     return;
                 }
 
-                if (TryWriteLocal(code, operand, out localIndex))
+                if (code == OpCodes.Stloc)
                 {
                     this.m_assignments[offset] = new BehaviorAssignment(
-                        GetLocalValueId(localIndex),
+                        GetLocalValueId(RequireOperand<Cil.VariableDefinition>(instruction).Index),
                         Pop(code, offset),
                         offset)
                     {
@@ -4170,7 +1122,8 @@ namespace SetterChecker.Core
 
                 if (code == OpCodes.Ldfld)
                 {
-                    this.m_stack.Push(AddFieldRead(
+                    this.m_stack.Push(AddMemberValue(
+                        BehaviorValueKind.FieldRead,
                         ReadFieldReference(RequireOperand<Cecil.FieldReference>(instruction)),
                         new[] { Pop(code, offset) }));
 
@@ -4189,7 +1142,8 @@ namespace SetterChecker.Core
 
                 if (code == OpCodes.Ldsfld)
                 {
-                    this.m_stack.Push(AddFieldRead(
+                    this.m_stack.Push(AddMemberValue(
+                        BehaviorValueKind.FieldRead,
                         ReadFieldReference(RequireOperand<Cecil.FieldReference>(instruction)),
                         Array.Empty<int>()));
 
@@ -4458,11 +1412,9 @@ namespace SetterChecker.Core
                         or Cil.Code.Ldind_I4 or Cil.Code.Ldind_I8 or Cil.Code.Ldind_R4
                         or Cil.Code.Ldind_R8 or Cil.Code.Ldind_Ref or Cil.Code.Ldind_U1
                         or Cil.Code.Ldind_U2 or Cil.Code.Ldind_U4 => (1, 1),
-                    Cil.Code.Beq or Cil.Code.Beq_S or Cil.Code.Bne_Un or Cil.Code.Bne_Un_S
-                        or Cil.Code.Bge or Cil.Code.Bge_S or Cil.Code.Bge_Un or Cil.Code.Bge_Un_S
-                        or Cil.Code.Bgt or Cil.Code.Bgt_S or Cil.Code.Bgt_Un or Cil.Code.Bgt_Un_S
-                        or Cil.Code.Ble or Cil.Code.Ble_S or Cil.Code.Ble_Un or Cil.Code.Ble_Un_S
-                        or Cil.Code.Blt or Cil.Code.Blt_S or Cil.Code.Blt_Un or Cil.Code.Blt_Un_S => (2, 0),
+                    Cil.Code.Beq or Cil.Code.Bne_Un or Cil.Code.Bge or Cil.Code.Bge_Un
+                        or Cil.Code.Bgt or Cil.Code.Bgt_Un or Cil.Code.Ble or Cil.Code.Ble_Un
+                        or Cil.Code.Blt or Cil.Code.Blt_Un => (2, 0),
                     Cil.Code.Switch or Cil.Code.Throw or Cil.Code.Endfilter => (1, 0),
                     Cil.Code.Rethrow or Cil.Code.Endfinally or Cil.Code.Volatile
                         or Cil.Code.Readonly or Cil.Code.Constrained or Cil.Code.Unaligned
@@ -4504,16 +1456,16 @@ namespace SetterChecker.Core
                     this.m_catalog.ReadManagedMethodReference(
                         method,
                         this.m_method.AssemblyPath!);
-                Cecil.MethodDefinition definition = method.Resolve()
-                    ?? throw new AnalysisException(
-                        $"托管调用目标无法解析：{this.m_method.Id} @ {offset} => {reference.Identity.Text}");
+                MethodEntry definition = this.m_catalog.ResolveMethodDefinition(
+                    reference,
+                    searchInherited: code != OpCodes.Newobj).Method;
                 BehaviorArgument[] arguments = new BehaviorArgument[reference.Identity.Parameters.Count];
 
                 for (int index = arguments.Length - 1; index >= 0; index--)
                 {
                     arguments[index] = new BehaviorArgument(
                         Pop(code, offset),
-                        MethodCatalog.ReadManagedRefKind(definition.Parameters[index]));
+                        definition.Parameters[index].RefKind);
                 }
 
                 int? receiverValueId = reference.HasInstance && code != OpCodes.Newobj
@@ -4623,16 +1575,17 @@ namespace SetterChecker.Core
             }
 
             // 按真实函数定义区分委托、可重写调用和普通直接调用。
-            private static BehaviorCallKind ReadCallKind(
+            private BehaviorCallKind ReadCallKind(
                 OpCode code,
-                Cecil.MethodDefinition definition)
+                MethodEntry definition)
             {
                 if (code == OpCodes.Newobj)
                 {
                     return BehaviorCallKind.ObjectCreation;
                 }
 
-                if (definition.Name == "Invoke" && IsDelegateType(definition.DeclaringType))
+                if (definition.Name == "Invoke"
+                    && this.m_catalog.IsDelegateType(this.m_catalog.TypesById[definition.TypeId]))
                 {
                     return BehaviorCallKind.Delegate;
                 }
@@ -4640,69 +1593,6 @@ namespace SetterChecker.Core
                 return code == OpCodes.Callvirt && definition.IsVirtual
                     ? BehaviorCallKind.Virtual
                     : BehaviorCallKind.Direct;
-            }
-
-            // 沿类型定义基类确认 Invoke 是否属于真实委托类型。
-            private static bool IsDelegateType(Cecil.TypeDefinition type)
-            {
-                Cecil.TypeDefinition? current = type;
-                while (current != null)
-                {
-                    if (current.FullName == "System.MulticastDelegate")
-                    {
-                        return true;
-                    }
-
-                    if (current.BaseType == null)
-                    {
-                        return false;
-                    }
-
-                    current = current.BaseType.Resolve()
-                        ?? throw new AnalysisException(
-                            $"委托基类无法解析：{current.BaseType.FullName}");
-                }
-
-                return false;
-            }
-
-            // 识别所有短格式和长格式的参数读取指令。
-            private bool TryReadArgument(OpCode code, object? operand, out int argumentIndex)
-            {
-                argumentIndex = code.Code switch
-                {
-                    Cil.Code.Ldarg_0 => 0,
-                    Cil.Code.Ldarg_1 => 1,
-                    Cil.Code.Ldarg_2 => 2,
-                    Cil.Code.Ldarg_3 => 3,
-                    Cil.Code.Ldarg or Cil.Code.Ldarg_S => ReadArgumentIndex(code, operand),
-                    _ => -1,
-                };
-                return argumentIndex >= 0;
-            }
-
-            // 识别参数地址读取并返回包含当前对象的真实参数槽。
-            private bool TryReadArgumentAddress(
-                OpCode code,
-                object? operand,
-                out int argumentIndex)
-            {
-                argumentIndex = code.Code is Cil.Code.Ldarga or Cil.Code.Ldarga_S
-                    ? ReadArgumentIndex(code, operand)
-                    : -1;
-                return argumentIndex >= 0;
-            }
-
-            // 识别参数槽写入并返回包含当前对象的真实参数槽。
-            private bool TryWriteArgument(
-                OpCode code,
-                object? operand,
-                out int argumentIndex)
-            {
-                argumentIndex = code.Code is Cil.Code.Starg or Cil.Code.Starg_S
-                    ? ReadArgumentIndex(code, operand)
-                    : -1;
-                return argumentIndex >= 0;
             }
 
             // 把 Cecil 参数定义转换为包含当前对象槽的参数编号。
@@ -4713,72 +1603,6 @@ namespace SetterChecker.Core
                     operand,
                     this.m_currentOffset).Index;
                 return this.m_method.IsStatic ? index : index + 1;
-            }
-
-            // 识别所有短格式和长格式的局部变量读取指令。
-            private static bool TryReadLocal(OpCode code, object? operand, out int localIndex)
-            {
-                localIndex = code.Code switch
-                {
-                    Cil.Code.Ldloc_0 => 0,
-                    Cil.Code.Ldloc_1 => 1,
-                    Cil.Code.Ldloc_2 => 2,
-                    Cil.Code.Ldloc_3 => 3,
-                    Cil.Code.Ldloc or Cil.Code.Ldloc_S => ReadLocalIndex(code, operand),
-                    _ => -1,
-                };
-                return localIndex >= 0;
-            }
-
-            // 识别局部变量地址读取并返回 Cecil 已解析的槽编号。
-            private static bool TryReadLocalAddress(
-                OpCode code,
-                object? operand,
-                out int localIndex)
-            {
-                localIndex = code.Code is Cil.Code.Ldloca or Cil.Code.Ldloca_S
-                    ? ReadLocalIndex(code, operand)
-                    : -1;
-                return localIndex >= 0;
-            }
-
-            // 识别所有短格式和长格式的局部变量写入指令。
-            private static bool TryWriteLocal(OpCode code, object? operand, out int localIndex)
-            {
-                localIndex = code.Code switch
-                {
-                    Cil.Code.Stloc_0 => 0,
-                    Cil.Code.Stloc_1 => 1,
-                    Cil.Code.Stloc_2 => 2,
-                    Cil.Code.Stloc_3 => 3,
-                    Cil.Code.Stloc or Cil.Code.Stloc_S => ReadLocalIndex(code, operand),
-                    _ => -1,
-                };
-                return localIndex >= 0;
-            }
-
-            // 返回 Cecil 已解析的局部变量槽编号。
-            private static int ReadLocalIndex(OpCode code, object? operand)
-            {
-                return RequireOperand<Cil.VariableDefinition>(code, operand, -1).Index;
-            }
-
-            // 识别整型常量的短格式与普通格式。
-            private static bool TryReadIntegerConstant(
-                OpCode code,
-                object? operand,
-                out int value)
-            {
-                value = code.Code switch
-                {
-                    >= Cil.Code.Ldc_I4_0 and <= Cil.Code.Ldc_I4_8 =>
-                        code.Code - Cil.Code.Ldc_I4_0,
-                    Cil.Code.Ldc_I4_M1 => -1,
-                    Cil.Code.Ldc_I4 => RequireOperand<int>(code, operand, -1),
-                    Cil.Code.Ldc_I4_S => RequireOperand<sbyte>(code, operand, -1),
-                    _ => 0,
-                };
-                return code.Code is >= Cil.Code.Ldc_I4_M1 and <= Cil.Code.Ldc_I4;
             }
 
             // 判断一条指令是否把值写入一维数组元素。
@@ -4931,16 +1755,6 @@ namespace SetterChecker.Core
                 return id;
             }
 
-            // 追加一个带结构化字段身份的读取值。
-            private int AddFieldRead(
-                BehaviorMemberReference member,
-                IReadOnlyList<int> inputValueIds)
-            {
-                int id = AddValue(BehaviorValueKind.FieldRead, member.Name, null, inputValueIds);
-                this.m_values[id] = this.m_values[id] with { Member = member };
-                return id;
-            }
-
             // 追加一个带结构化字段身份的字段读取或字段地址值。
             private int AddMemberValue(
                 BehaviorValueKind kind,
@@ -4984,7 +1798,9 @@ namespace SetterChecker.Core
             private BehaviorMemberReference ReadFieldReference(Cecil.FieldReference field)
             {
                 ManagedFieldReferenceInfo reference =
-                    this.m_catalog.ReadManagedFieldReference(field);
+                    this.m_catalog.ReadManagedFieldReference(
+                        field,
+                        this.m_method.AssemblyPath!);
 
                 return BehaviorMemberReference.From(reference);
             }
@@ -5027,17 +1843,6 @@ namespace SetterChecker.Core
     }
 
     /// <summary>
-    /// 区分调用时立即执行的函数体和枚举时才执行的迭代器函数体。
-    /// </summary>
-    public enum BehaviorExecutionKind
-    {
-        /// <summary>普通调用会立即执行函数体。</summary>
-        Immediate,
-        /// <summary>调用只创建迭代器，函数体事实要到枚举时才执行。</summary>
-        IteratorBody,
-    }
-
-    /// <summary>
     /// 保存行为事实所在的控制流块和块内执行次序。
     /// </summary>
     public readonly record struct BehaviorFlowPoint(
@@ -5062,22 +1867,16 @@ namespace SetterChecker.Core
     /// </summary>
     public enum BehaviorFlowBranchSemantics
     {
-        /// <summary>没有可执行转移。</summary>
-        None,
         /// <summary>普通控制流转移。</summary>
         Regular,
         /// <summary>函数返回。</summary>
         Return,
         /// <summary>结构化异常处理内部转移。</summary>
         StructuredExceptionHandling,
-        /// <summary>程序终止。</summary>
-        ProgramTermination,
         /// <summary>抛出异常。</summary>
         Throw,
         /// <summary>重新抛出当前异常。</summary>
         Rethrow,
-        /// <summary>编译器报告的错误控制流。</summary>
-        Error,
     }
 
     /// <summary>
@@ -5087,8 +1886,6 @@ namespace SetterChecker.Core
     {
         /// <summary>完整函数区域。</summary>
         Root,
-        /// <summary>局部变量和临时值生命周期区域。</summary>
-        LocalLifetime,
         /// <summary>try 区域。</summary>
         Try,
         /// <summary>异常筛选区域。</summary>
@@ -5105,10 +1902,6 @@ namespace SetterChecker.Core
         TryAndFinally,
         /// <summary>IL fault 区域。</summary>
         Fault,
-        /// <summary>静态局部变量初始化区域。</summary>
-        StaticLocalInitializer,
-        /// <summary>编译错误函数体区域。</summary>
-        ErroneousBody,
     }
 
     /// <summary>
@@ -5152,8 +1945,6 @@ namespace SetterChecker.Core
         CurrentInstance,
         /// <summary>函数参数。</summary>
         Parameter,
-        /// <summary>匿名函数或局部函数捕获的外层值。</summary>
-        Captured,
         /// <summary>局部变量槽。</summary>
         Local,
         /// <summary>编译期常量。</summary>
@@ -5182,8 +1973,6 @@ namespace SetterChecker.Core
         Exception,
         /// <summary>由明确托管操作码计算出的值。</summary>
         Computation,
-        /// <summary>throw 等明确不会产生普通结果的表达式分支。</summary>
-        NoReturn,
         /// <summary>在一个执行位置读取参数、局部值、捕获值或控制流临时槽。</summary>
         SlotRead,
     }
@@ -5240,17 +2029,7 @@ namespace SetterChecker.Core
         /// <summary>派生值被读取或产生的执行位置；根槽可以为空。</summary>
         public BehaviorFlowPoint? Point { get; init; }
 
-        /// <summary>函数值捕获键与绑定处稳定槽的明确对应关系。</summary>
-        public IReadOnlyList<BehaviorCaptureBinding> Captures { get; init; } =
-            Array.Empty<BehaviorCaptureBinding>();
     }
-
-    /// <summary>
-    /// 保存一个内部函数捕获键在绑定处对应的稳定槽。
-    /// </summary>
-    public sealed record BehaviorCaptureBinding(
-        string Key,
-        int ValueId);
 
     /// <summary>
     /// 保存局部槽或参数槽之间的一次赋值关系。
@@ -5274,6 +2053,9 @@ namespace SetterChecker.Core
         string? TargetAssemblyIdentity,
         string? ReferringAssemblyPath)
     {
+        /// <summary>当前模块中的类型定义物理身份。</summary>
+        public string? KnownTypeId { get; init; }
+
         internal TypeIdentityTemplate Identity { get; init; } = null!;
 
         internal TypeIdentityTemplate DefinitionIdentity { get; init; } = null!;
@@ -5291,6 +2073,7 @@ namespace SetterChecker.Core
                 reference.TargetAssemblyIdentity,
                 reference.ReferringAssemblyPath)
             {
+                KnownTypeId = reference.KnownTypeId,
                 Identity = reference.Identity,
                 DefinitionIdentity = reference.Definition,
                 ArgumentIdentities = reference.Arguments,
@@ -5308,6 +2091,15 @@ namespace SetterChecker.Core
         string Name,
         string FieldTypeId)
     {
+        /// <summary>当前模块中的字段声明类型物理身份。</summary>
+        public string? KnownDeclaringTypeId { get; init; }
+
+        /// <summary>外部字段声明类型所在程序集的完整身份。</summary>
+        public string TargetAssemblyIdentity { get; init; } = string.Empty;
+
+        /// <summary>读取字段引用的真实程序集路径。</summary>
+        public string? ReferringAssemblyPath { get; init; }
+
         internal TypeIdentityTemplate DeclaringTypeIdentity { get; init; } = null!;
 
         internal TypeIdentityTemplate FieldTypeIdentity { get; init; } = null!;
@@ -5322,6 +2114,9 @@ namespace SetterChecker.Core
                 reference.Name,
                 reference.FieldType.StableText)
             {
+                KnownDeclaringTypeId = reference.KnownDeclaringTypeId,
+                TargetAssemblyIdentity = reference.TargetAssemblyIdentity,
+                ReferringAssemblyPath = reference.ReferringAssemblyPath,
                 DeclaringTypeIdentity = reference.DeclaringType,
                 FieldTypeIdentity = reference.FieldType,
             };
@@ -5366,8 +2161,14 @@ namespace SetterChecker.Core
         string TargetAssemblyIdentity,
         string? ReferringAssemblyPath)
     {
-        /// <summary>源码总表中已经精确命中的物理函数身份。</summary>
-        public string? KnownMethodId { get; init; }
+        /// <summary>调用在原始模块内使用的函数引用标记。</summary>
+        public int ReferenceMetadataToken { get; init; }
+
+        /// <summary>当前模块中的函数声明类型物理身份。</summary>
+        public string? KnownDeclaringTypeId { get; init; }
+
+        /// <summary>当前模块中的函数定义标记。</summary>
+        public int? KnownMetadataToken { get; init; }
 
         internal MethodIdentityTemplate Identity { get; init; } = null!;
 
@@ -5390,6 +2191,9 @@ namespace SetterChecker.Core
                 reference.TargetAssemblyIdentity,
                 reference.ReferringAssemblyPath)
             {
+                ReferenceMetadataToken = reference.ReferenceMetadataToken,
+                KnownDeclaringTypeId = reference.KnownDeclaringTypeId,
+                KnownMetadataToken = reference.KnownMetadataToken,
                 Identity = reference.Identity,
                 GenericArgumentIdentities = reference.GenericArguments,
             };
@@ -5450,7 +2254,6 @@ namespace SetterChecker.Core
             IReadOnlyList<BehaviorCall> calls,
             IReadOnlyList<BehaviorReturn> returns,
             NativeBoundary? nativeBoundary = null,
-            BehaviorExecutionKind executionKind = BehaviorExecutionKind.Immediate,
             IReadOnlyList<BehaviorFlowBlock>? blocks = null,
             IReadOnlyList<BehaviorFlowRegion>? regions = null)
         {
@@ -5462,7 +2265,6 @@ namespace SetterChecker.Core
             this.Calls = calls;
             this.Returns = returns;
             this.NativeBoundary = nativeBoundary;
-            this.ExecutionKind = executionKind;
             this.Blocks = blocks ?? Array.Empty<BehaviorFlowBlock>();
             this.Regions = regions ?? Array.Empty<BehaviorFlowRegion>();
         }
@@ -5472,9 +2274,6 @@ namespace SetterChecker.Core
 
         /// <summary>函数体来源种类。</summary>
         public MethodBodyKind BodyKind { get; }
-
-        /// <summary>函数体事实会在调用时还是枚举时执行。</summary>
-        public BehaviorExecutionKind ExecutionKind { get; }
 
         /// <summary>函数体的控制流块。</summary>
         public IReadOnlyList<BehaviorFlowBlock> Blocks { get; }

@@ -43,7 +43,100 @@ namespace SetterChecker.Core.Tests
 
         public string ForwardTargetPath { get; }
 
+        public string MissingForwardTargetPath => Path.Combine(this.RootPath, "MissingForwardTarget.dll");
+
+        public string MismatchedForwardConsumerPath => Path.Combine(this.RootPath, "MismatchedForwardConsumer.dll");
+
         public string AnalyzerPath { get; }
+
+        public string UnityReferencePath => Path.Combine(
+            this.RootPath,
+            "Data",
+            "NetStandard",
+            "ref",
+            "2.1.0",
+            "UnityFacade.dll");
+
+        public string UnityRuntimeFacadePath => Path.Combine(
+            this.RootPath,
+            "Data",
+            "MonoBleedingEdge",
+            "lib",
+            "mono",
+            "unityjit-win32",
+            "Facades",
+            "UnityFacade.dll");
+
+        public string UnityRuntimeTargetPath => Path.Combine(
+            this.RootPath,
+            "Data",
+            "MonoBleedingEdge",
+            "lib",
+            "mono",
+            "unityjit-win32",
+            "UnityFacadeTarget.dll");
+
+        public string UnityReferenceTargetFacadePath => Path.Combine(
+            this.RootPath,
+            "Data",
+            "UnityReferenceAssemblies",
+            "unity-4.8-api",
+            "Facades",
+            "TargetFacade.dll");
+
+        public string UnityRuntimeTargetFacadePath => Path.Combine(
+            this.RootPath,
+            "Data",
+            "MonoBleedingEdge",
+            "lib",
+            "mono",
+            "unityjit-win32",
+            "Facades",
+            "TargetFacade.dll");
+
+        public string UnityReferenceSiblingPath => Path.Combine(
+            Path.GetDirectoryName(this.UnityReferencePath)!,
+            "ReferenceOnlyTarget.dll");
+
+        public string ConvergingReferenceAliasPath => Path.Combine(
+            Path.GetDirectoryName(this.UnityReferencePath)!,
+            "ConvergingAlias.dll");
+
+        public string ConvergingRuntimeAliasPath => Path.Combine(
+            Path.GetDirectoryName(this.UnityRuntimeFacadePath)!,
+            "ConvergingAlias.dll");
+
+        public string ConvergingRootShimPath => Path.Combine(
+            Path.GetDirectoryName(this.UnityReferencePath)!,
+            "ConvergingRootShim.dll");
+
+        public string ConvergingMiddleAPath => Path.Combine(
+            Path.GetDirectoryName(this.UnityRuntimeTargetPath)!,
+            "ConvergingMiddleA.dll");
+
+        public string ConvergingMiddleBPath => Path.Combine(
+            Path.GetDirectoryName(this.UnityRuntimeTargetPath)!,
+            "ConvergingMiddleB.dll");
+
+        public string ConvergingAlternateFinalPath => Path.Combine(
+            Path.GetDirectoryName(this.UnityRuntimeTargetPath)!,
+            "ConvergingAlternateFinal.dll");
+
+        public string UnityFrameworkReferencePath => Path.Combine(
+            this.RootPath,
+            "Data",
+            "UnityReferenceAssemblies",
+            "unity-4.8-api",
+            "UnityFramework.dll");
+
+        public string UnityRuntimeFrameworkPath => Path.Combine(
+            this.RootPath,
+            "Data",
+            "MonoBleedingEdge",
+            "lib",
+            "mono",
+            "unityjit-win32",
+            "UnityFramework.dll");
 
         // 建立包含一个源码依赖和一个外部文件的最小工程。
         public static TestProject Create()
@@ -301,6 +394,20 @@ namespace SetterChecker.Core.Tests
             return project;
         }
 
+        // 把同一份调用写法分别作为源码与真实 DLL 纳入材料。
+        /// <summary>
+        /// 建立包含同一组调用写法的源码与托管对照材料。
+        /// </summary>
+        public static TestProject CreateWithCallTargets(string source)
+        {
+            TestProject project = Create(includeDependency: false);
+            File.WriteAllText(project.RootSourcePath, source.Replace("namespace Samples;", "namespace SourceSamples;"));
+            File.Delete(project.ExternalAssemblyPath);
+            WriteAssembly(project.ExternalAssemblyPath, "External", source.Replace("namespace Samples;", "namespace ExternalSamples;"));
+            AppendCoreLibraryReference(project);
+            return project;
+        }
+
         // 把源码依赖移入目标包以验证统一纳入规则。
         /// <summary>
         /// 建立目标包内部还包含源码依赖的工程。
@@ -351,6 +458,447 @@ namespace SetterChecker.Core.Tests
             return project;
         }
 
+        // 建立Unity参考文件与当前运行目录候选版本不同的最小工程。
+        /// <summary>
+        /// 建立可切换门面形态、位置和版本的Unity运行目录。
+        /// </summary>
+        public static TestProject CreateWithUnityRuntimeCandidate(
+            bool runtimeIsForwardingFacade,
+            bool placeInFacadeDirectory = true,
+            string referenceVersion = "2.0.0.0",
+            string runtimeVersion = "2.1.0.0",
+            string runtimeAssemblyName = "UnityFacade")
+        {
+            TestProject project = Create(includeDependency: false);
+            string referencePath = project.UnityReferencePath;
+            string targetPath = project.UnityRuntimeTargetPath;
+            string facadePath = placeInFacadeDirectory
+                ? project.UnityRuntimeFacadePath
+                : Path.Combine(
+                    Path.GetDirectoryName(Path.GetDirectoryName(project.UnityRuntimeFacadePath)!)!,
+                    "UnityFacade.dll");
+
+            Directory.CreateDirectory(Path.GetDirectoryName(referencePath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(project.UnityRuntimeFacadePath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(facadePath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+            Directory.CreateDirectory(Path.Combine(project.RootPath, "Data", "Managed"));
+            WriteUnityMonoRemappingEvidence(project, "KnownFramework", onlyLowerVersions: false);
+            WriteAssembly(
+                referencePath,
+                "UnityFacade",
+                $"using System.Reflection; [assembly: AssemblyVersion(\"{referenceVersion}\")] "
+                    + "namespace UnityFacadeTypes { public class BaseType { } }");
+            WriteAssembly(
+                targetPath,
+                "UnityFacadeTarget",
+                "namespace UnityFacadeTypes { public class BaseType { } }");
+            WriteAssembly(
+                facadePath,
+                runtimeAssemblyName,
+                runtimeIsForwardingFacade
+                    ? $"using System.Reflection; using System.Runtime.CompilerServices; "
+                        + $"[assembly: AssemblyVersion(\"{runtimeVersion}\")] "
+                        + "[assembly: TypeForwardedTo(typeof(UnityFacadeTypes.BaseType))]"
+                    : $"using System.Reflection; [assembly: AssemblyVersion(\"{runtimeVersion}\")] "
+                        + "namespace UnityFacadeTypes { public class BaseType { } }",
+                runtimeIsForwardingFacade ? new[] { targetPath } : Array.Empty<string>());
+            WriteAssembly(
+                project.ExternalAssemblyPath,
+                "External",
+                "namespace UnityFacadeConsumer { "
+                    + "public sealed class Derived : UnityFacadeTypes.BaseType { } }",
+                referencePath);
+            File.AppendAllLines(
+                project.RootResponsePath,
+                new[]
+                {
+                    "-define:UNITY_EDITOR_WIN",
+                    $"-r:\"{Relative(project.RootPath, referencePath)}\"",
+                });
+            AppendCoreLibraryReference(project);
+
+            return project;
+        }
+
+        // 建立参考和运行目录同时含同身份类型转交目标的工程。
+        /// <summary>
+        /// 两份目标都是纯转交文件，但只有当前Unity运行目录中的文件是运行载体。
+        /// </summary>
+        public static TestProject CreateWithUnityForwardingTargetCollision(bool includeRuntimeCarrier = true)
+        {
+            TestProject project = Create(includeDependency: false);
+            string referencePath = project.UnityReferencePath;
+            string referenceTargetPath = project.UnityReferenceTargetFacadePath;
+            string runtimeTargetPath = project.UnityRuntimeTargetFacadePath;
+            string implementationPath = project.UnityRuntimeTargetPath;
+
+            Directory.CreateDirectory(Path.GetDirectoryName(referencePath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(referenceTargetPath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(runtimeTargetPath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(implementationPath)!);
+            Directory.CreateDirectory(Path.Combine(project.RootPath, "Data", "Managed"));
+            WriteUnityMonoRemappingEvidence(project, "KnownFramework", onlyLowerVersions: false);
+            WriteAssembly(implementationPath, "UnityFacadeTarget",
+                "namespace UnityFacadeTypes { public class BaseType { } }");
+            WriteAssembly(referenceTargetPath, "TargetFacade",
+                "namespace UnityFacadeTypes { public class BaseType { } }");
+            WriteAssembly(referencePath, "UnityFacade",
+                "using System.Runtime.CompilerServices; using UnityFacadeTypes; "
+                    + "[assembly: TypeForwardedTo(typeof(BaseType))]",
+                referenceTargetPath);
+            File.Delete(referenceTargetPath);
+            WriteAssembly(referenceTargetPath, "TargetFacade",
+                "using System.Runtime.CompilerServices; using UnityFacadeTypes; "
+                    + "[assembly: TypeForwardedTo(typeof(BaseType))]",
+                implementationPath);
+            if (includeRuntimeCarrier)
+            {
+                WriteAssembly(runtimeTargetPath, "TargetFacade",
+                    "using System.Runtime.CompilerServices; using UnityFacadeTypes; "
+                        + "[assembly: TypeForwardedTo(typeof(BaseType))]",
+                    implementationPath);
+            }
+            WriteAssembly(project.ExternalAssemblyPath, "External",
+                "namespace UnityFacadeConsumer { public sealed class Derived "
+                    + ": UnityFacadeTypes.BaseType { } }",
+                referencePath,
+                referenceTargetPath,
+                implementationPath);
+            File.AppendAllLines(project.RootResponsePath,
+                new[]
+                {
+                    "-define:UNITY_EDITOR_WIN",
+                    $"-r:\"{Relative(project.RootPath, referencePath)}\"",
+                    $"-r:\"{Relative(project.RootPath, referenceTargetPath)}\"",
+                });
+            AppendCoreLibraryReference(project);
+
+            return project;
+        }
+
+        // 建立同时含已承载与缺失类型转交分支的工程。
+        /// <summary>
+        /// 根源码只使用UsedType，独立消费者动态链接到已删除载体中的MissingType。
+        /// </summary>
+        public static TestProject CreateWithPartiallyMissingForwarders()
+        {
+            TestProject project = Create(includeDependency: false);
+            string facadePath = project.ExternalReferencePath;
+            string usedTargetPath = project.ForwardTargetPath;
+            string missingTargetPath = project.MissingForwardTargetPath;
+
+            WriteAssembly(usedTargetPath, "UsedForwardTarget",
+                "namespace PartialForwarding { public class UsedType { public virtual int Read() => 1; } }");
+            WriteAssembly(missingTargetPath, "MissingForwardTarget",
+                "namespace PartialForwarding { public class MissingType { public virtual int Read() => 1; } }");
+            WriteAssembly(facadePath, "PartialFacade",
+                "using System.Runtime.CompilerServices; using PartialForwarding; "
+                    + "[assembly: TypeForwardedTo(typeof(UsedType))] "
+                    + "[assembly: TypeForwardedTo(typeof(MissingType))]",
+                usedTargetPath,
+                missingTargetPath);
+            WriteAssembly(project.ExternalAssemblyPath, "External",
+                "namespace PartialForwardingConsumer { public sealed class MissingConsumer "
+                    + ": PartialForwarding.MissingType { public override int Read() => 2; } }",
+                facadePath,
+                missingTargetPath);
+            File.Delete(missingTargetPath);
+            File.WriteAllText(project.RootSourcePath,
+                "namespace PartialForwardingConsumer { public sealed class RootType "
+                    + ": PartialForwarding.UsedType { public override int Read() => 2; } }");
+            File.AppendAllLines(project.RootResponsePath,
+                new[]
+                {
+                    $"-r:\"{Relative(project.RootPath, facadePath)}\"",
+                    $"-r:\"{Relative(project.RootPath, usedTargetPath)}\"",
+                });
+            AppendCoreLibraryReference(project);
+
+            return project;
+        }
+
+        // 建立参考门面同目录只有参考目标副本的Unity工程。
+        /// <summary>
+        /// 门面转交到同目录的普通参考定义，当前运行目录故意没有该身份。
+        /// </summary>
+        public static TestProject CreateWithReferenceSiblingForwarderStub()
+        {
+            TestProject project = Create(includeDependency: false);
+            string facadePath = project.UnityReferencePath;
+            string referenceTargetPath = project.UnityReferenceSiblingPath;
+
+            Directory.CreateDirectory(Path.GetDirectoryName(facadePath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(project.UnityRuntimeTargetPath)!);
+            Directory.CreateDirectory(Path.Combine(project.RootPath, "Data", "Managed"));
+            WriteUnityMonoRemappingEvidence(project, "KnownFramework", onlyLowerVersions: false);
+            WriteAssembly(referenceTargetPath, "ReferenceOnlyTarget",
+                "using System.Runtime.CompilerServices; [assembly: ReferenceAssembly] "
+                    + "namespace ReferenceOnlyTypes { public class BaseType { "
+                    + "public virtual int Read() => 1; } }");
+            WriteAssembly(facadePath, "UnityFacade",
+                "using System.Runtime.CompilerServices; using ReferenceOnlyTypes; "
+                    + "[assembly: TypeForwardedTo(typeof(BaseType))]",
+                referenceTargetPath);
+            WriteAssembly(project.ExternalAssemblyPath, "External",
+                "namespace ReferenceOnlyConsumer { public sealed class Derived "
+                    + ": ReferenceOnlyTypes.BaseType { public override int Read() => 2; } }",
+                facadePath,
+                referenceTargetPath);
+            File.AppendAllLines(project.RootResponsePath,
+                new[]
+                {
+                    "-define:UNITY_EDITOR_WIN",
+                    $"-r:\"{Relative(project.RootPath, facadePath)}\"",
+                });
+            AppendCoreLibraryReference(project);
+
+            return project;
+        }
+
+        // 建立两条同身份类型转交分支会合或分歧的Unity工程。
+        /// <summary>
+        /// 参考Alias和运行Alias具有同一完整身份，分别经过MiddleA与MiddleB到达最终定义。
+        /// </summary>
+        public static TestProject CreateWithConvergingForwardingBranches(bool differentEndpoints = false)
+        {
+            TestProject project = Create(includeDependency: false);
+            string referenceAliasPath = project.ConvergingReferenceAliasPath;
+            string runtimeAliasPath = project.ConvergingRuntimeAliasPath;
+            string rootShimPath = project.ConvergingRootShimPath;
+            string middleAPath = project.ConvergingMiddleAPath;
+            string middleBPath = project.ConvergingMiddleBPath;
+            string finalAPath = project.UnityRuntimeTargetPath;
+            string finalBPath = project.ConvergingAlternateFinalPath;
+
+            Directory.CreateDirectory(Path.GetDirectoryName(referenceAliasPath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(runtimeAliasPath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(finalAPath)!);
+            Directory.CreateDirectory(Path.Combine(project.RootPath, "Data", "Managed"));
+            WriteUnityMonoRemappingEvidence(project, "KnownFramework", onlyLowerVersions: false);
+            WriteAssembly(finalAPath, "ConvergingFinal",
+                "namespace Converging { public class ForwardedType { public virtual int Touch() => 1; } }");
+            if (differentEndpoints)
+            {
+                WriteAssembly(finalBPath, "ConvergingAlternateFinal",
+                    "namespace Converging { public class ForwardedType { public virtual int Touch() => 1; } }");
+            }
+
+            WriteAssembly(middleAPath, "ConvergingMiddleA",
+                "namespace Converging { public class ForwardedType { public virtual int Touch() => 1; } }");
+            WriteAssembly(middleBPath, "ConvergingMiddleB",
+                "namespace Converging { public class ForwardedType { public virtual int Touch() => 1; } }");
+            WriteAssembly(referenceAliasPath, "ConvergingAlias",
+                "using System.Runtime.CompilerServices; using Converging; "
+                    + "[assembly: TypeForwardedTo(typeof(ForwardedType))]",
+                middleAPath);
+            WriteAssembly(runtimeAliasPath, "ConvergingAlias",
+                "namespace Converging { public class ForwardedType { public virtual int Touch() => 1; } }");
+            WriteAssembly(rootShimPath, "ConvergingRootShim",
+                "using System.Runtime.CompilerServices; using Converging; "
+                    + "[assembly: TypeForwardedTo(typeof(ForwardedType))]",
+                runtimeAliasPath);
+            File.Delete(runtimeAliasPath);
+            WriteAssembly(runtimeAliasPath, "ConvergingAlias",
+                "using System.Runtime.CompilerServices; using Converging; "
+                    + "[assembly: TypeForwardedTo(typeof(ForwardedType))]",
+                middleBPath);
+            WriteAssembly(project.ExternalAssemblyPath, "External",
+                "namespace ConvergingConsumer { public sealed class Derived "
+                    + ": Converging.ForwardedType { public override int Touch() => 2; } }",
+                referenceAliasPath,
+                middleAPath);
+            RewriteBaseTypeAssemblyScope(
+                project.ExternalAssemblyPath,
+                "ConvergingConsumer.Derived",
+                referenceAliasPath);
+            File.Delete(middleAPath);
+            WriteAssembly(middleAPath, "ConvergingMiddleA",
+                "using System.Runtime.CompilerServices; using Converging; "
+                    + "[assembly: TypeForwardedTo(typeof(ForwardedType))]",
+                finalAPath);
+            File.Delete(middleBPath);
+            WriteAssembly(middleBPath, "ConvergingMiddleB",
+                "using System.Runtime.CompilerServices; using Converging; "
+                    + "[assembly: TypeForwardedTo(typeof(ForwardedType))]",
+                differentEndpoints ? finalBPath : finalAPath);
+            File.AppendAllLines(project.RootResponsePath,
+                new[]
+                {
+                    "-define:UNITY_EDITOR_WIN",
+                    $"-r:\"{Relative(project.RootPath, referenceAliasPath)}\"",
+                    $"-r:\"{Relative(project.RootPath, rootShimPath)}\"",
+                });
+            AppendCoreLibraryReference(project);
+
+            return project;
+        }
+
+        // 建立一条会合分支缺失实际中间载体的错误工程。
+        /// <summary>
+        /// 保留同身份门面的两条分支，并让派生类型按门面身份触发完整链解析。
+        /// </summary>
+        public static TestProject CreateWithMissingConvergingForwardingBranch()
+        {
+            TestProject project = CreateWithConvergingForwardingBranches();
+            File.Delete(project.ConvergingMiddleBPath);
+            return project;
+        }
+
+        // 建立纯参考门面与同身份真实运行定义并存的Unity工程。
+        /// <summary>
+        /// 编译仍使用参考门面，运行材料必须只选择当前Unity的真实定义。
+        /// </summary>
+        public static TestProject CreateWithUnityPureReferenceAndRuntimeDefinition()
+        {
+            TestProject project = CreateWithUnityRuntimeCandidate(
+                runtimeIsForwardingFacade: false,
+                referenceVersion: "2.0.0.0",
+                runtimeVersion: "2.0.0.0");
+            File.Delete(project.UnityReferencePath);
+            WriteAssembly(
+                project.UnityReferencePath,
+                "UnityFacade",
+                "using System.Reflection; using System.Runtime.CompilerServices; "
+                    + "[assembly: AssemblyVersion(\"2.0.0.0\")] "
+                    + "[assembly: TypeForwardedTo(typeof(UnityFacadeTypes.BaseType))]",
+                project.UnityRuntimeTargetPath);
+            return project;
+        }
+
+        // 建立接口契约经候选基类传递到派生实现的工程。
+        /// <summary>
+        /// 接口和抽象基类只存在于查找目录，启动材料只直接包含派生类程序集。
+        /// </summary>
+        public static TestProject CreateWithTransitiveInterfaceHierarchy()
+        {
+            TestProject project = Create(includeDependency: false);
+
+            WriteAssembly(
+                project.ExternalReferencePath,
+                "LookupContract",
+                "namespace LookupContract { public interface IRun { void Run(); } }");
+            WriteAssembly(
+                project.ForwardTargetPath,
+                "LookupBase",
+                "namespace LookupBase { public abstract class Base : LookupContract.IRun { "
+                    + "public abstract void Run(); } }",
+                project.ExternalReferencePath);
+            File.Delete(project.ExternalAssemblyPath);
+            WriteAssembly(
+                project.ExternalAssemblyPath,
+                "External",
+                "namespace LookupConsumer { public sealed class Derived : LookupBase.Base { "
+                    + "public override void Run() { } } }",
+                project.ForwardTargetPath,
+                project.ExternalReferencePath);
+            AppendCoreLibraryReference(project);
+
+            return project;
+        }
+
+        // 建立由Unity Mono框架表明确允许版本重映射的工程。
+        /// <summary>
+        /// 可切换表项、版本方向、公钥标记和本地证据。
+        /// </summary>
+        public static TestProject CreateWithUnityFrameworkVersionRemapping(
+            bool includeTableEntry = true,
+            bool onlyLowerVersions = false,
+            bool changeRuntimeToken = false,
+            bool includeEvidence = true,
+            bool runtimeRowContainsUnavailableVersion = false,
+            bool includeOldVersionReference = true)
+        {
+            TestProject project = Create(includeDependency: false);
+            string referencePath = project.UnityFrameworkReferencePath;
+            string runtimePath = project.UnityRuntimeFrameworkPath;
+
+            Directory.CreateDirectory(Path.GetDirectoryName(referencePath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(runtimePath)!);
+            Directory.CreateDirectory(Path.Combine(project.RootPath, "Data", "Managed"));
+            WriteAssembly(referencePath, "UnityFramework",
+                "using System.Reflection; using System.Runtime.CompilerServices; "
+                    + "[assembly: AssemblyVersion(\"4.2.0.0\")] [assembly: ReferenceAssembly] "
+                    + "namespace UnityFrameworkTypes { public class BaseType { "
+                    + "public virtual int Read() => 1; } }");
+            WriteAssembly(runtimePath, "UnityFramework",
+                "using System.Reflection; [assembly: AssemblyVersion(\"4.0.0.0\")] "
+                    + "namespace UnityFrameworkTypes { public class BaseType { "
+                    + "public virtual int Read() => 1; } }");
+            if (changeRuntimeToken)
+            {
+                RewriteAssemblyPublicKey(runtimePath, typeof(object).Assembly.GetName().GetPublicKey()!);
+            }
+
+            WriteAssembly(project.ExternalAssemblyPath, "External",
+                "namespace UnityFrameworkConsumer { public sealed class Derived "
+                    + ": UnityFrameworkTypes.BaseType { public override int Read() => 2; } }",
+                referencePath);
+            File.AppendAllLines(project.RootResponsePath,
+                new[]
+                {
+                    "-define:UNITY_EDITOR_WIN",
+                    $"-r:\"{Relative(project.RootPath, includeOldVersionReference ? referencePath : runtimePath)}\"",
+                });
+            AppendCoreLibraryReference(project);
+            if (includeEvidence)
+            {
+                WriteUnityMonoRemappingEvidence(project,
+                    includeTableEntry ? "UnityFramework" : "KnownFramework",
+                    onlyLowerVersions,
+                    runtimeRowContainsUnavailableVersion);
+            }
+            else
+            {
+                WriteUnityRuntimeCoreLibrary(project);
+            }
+
+            return project;
+        }
+
+        // 建立参考文件只向不同名真实程序集转交类型的 Unity 输入。
+        /// <summary>
+        /// 同名运行候选版本故意不同，实际实现必须由参考转交表决定。
+        /// </summary>
+        public static TestProject CreateWithForwardingUnityReference()
+        {
+            TestProject project = CreateWithUnityRuntimeCandidate(runtimeIsForwardingFacade: true);
+            File.Delete(project.UnityReferencePath);
+            WriteAssembly(project.UnityReferencePath, "UnityFacade",
+                "using System.Reflection; using System.Runtime.CompilerServices; "
+                    + "[assembly: AssemblyVersion(\"4.1.3.0\")] "
+                    + "[assembly: TypeForwardedTo(typeof(UnityFacadeTypes.BaseType))]",
+                project.UnityRuntimeTargetPath);
+            File.AppendAllLines(project.RootResponsePath,
+                new[] { $"-r:\"{Relative(project.RootPath, project.UnityRuntimeTargetPath)}\"" });
+            return project;
+        }
+
+        // 建立同名但版本不同的普通外部参考和实现。
+        /// <summary>
+        /// 建立不属于Unity门面规则的外部程序集版本反例。
+        /// </summary>
+        public static TestProject CreateWithVersionedExternalReference()
+        {
+            TestProject project = CreateWithExternalReference();
+
+            File.Delete(project.ExternalReferencePath);
+            File.Delete(project.ExternalAssemblyPath);
+            WriteAssembly(
+                project.ExternalReferencePath,
+                "External",
+                "using System.Reflection; [assembly: AssemblyVersion(\"1.0.0.0\")] "
+                    + "public sealed class ExternalType { }");
+            WriteAssembly(
+                project.ExternalAssemblyPath,
+                "External",
+                "using System.Reflection; [assembly: AssemblyVersion(\"2.0.0.0\")] "
+                    + "public sealed class ExternalType { }");
+            AppendCoreLibraryReference(project);
+
+            return project;
+        }
+
         // 建立参考文件与候选实现身份不同的最小工程。
         /// <summary>
         /// 建立参考程序集身份与候选实现身份不同的工程。
@@ -389,7 +937,7 @@ namespace SetterChecker.Core.Tests
                 """
                 namespace ForwardedNamespace
                 {
-                    public sealed class ForwardedType { }
+                    public class ForwardedType { public virtual int Read() => 1; }
                     public sealed class CollisionType { }
                 }
                 """);
@@ -413,6 +961,308 @@ namespace SetterChecker.Core.Tests
             return project;
         }
 
+        // 建立同一运行文件既保留本地定义又按名称转交该类型的工程。
+        /// <summary>
+        /// 本地元数据标记继续指向原定义，外部类型引用按 Unity Mono 的名称表转到目标文件。
+        /// </summary>
+        public static TestProject CreateWithDefinitionAndSameFileForwarder()
+        {
+            TestProject project = Create(includeDependency: false);
+            File.Delete(project.ExternalReferencePath);
+            WriteAssembly(
+                project.ExternalReferencePath,
+                "SameFileFacade",
+                """
+                using System;
+                namespace SameFileForwarding
+                {
+                    public class Entry
+                    {
+                        public Action Callback;
+                        public Entry() { }
+                        public int Marker() => 1;
+                        public virtual int Touch() => 1;
+                        public void Invoke() => Callback();
+                    }
+
+                    public sealed class LocalDerived : Entry
+                    {
+                        public override int Touch() => 2;
+                        public void FieldLocal()
+                        {
+                            Entry value = new Entry();
+                            value.Callback = LocalCallback;
+                            value.Invoke();
+                        }
+                        private void LocalCallback() { }
+                    }
+                }
+                """);
+            WriteAssembly(
+                project.ForwardTargetPath,
+                "SameFileTarget",
+                """
+                using System;
+                namespace SameFileForwarding
+                {
+                    public class Entry
+                    {
+                        public Action Callback;
+                        public Entry() { }
+                        public int Marker() => 3;
+                        public virtual int Touch() => 3;
+                        public void Invoke() => Callback();
+                    }
+                }
+                """);
+            File.Delete(project.ExternalAssemblyPath);
+            WriteAssembly(
+                project.ExternalAssemblyPath,
+                "External",
+                """
+                namespace SameFileForwardingConsumer
+                {
+                    public sealed class ExternalDerived : SameFileForwarding.Entry
+                    {
+                        public override int Touch() => 4;
+                        public void FieldExternal()
+                        {
+                            SameFileForwarding.Entry value = new SameFileForwarding.Entry();
+                            value.Callback = ExternalCallback;
+                            value.Invoke();
+                        }
+                        private void ExternalCallback() { }
+                    }
+                }
+                """,
+                project.ExternalReferencePath);
+            AddForwardedType(
+                project.ExternalReferencePath,
+                "SameFileForwarding",
+                "Entry",
+                project.ForwardTargetPath);
+            AppendCoreLibraryReference(project);
+
+            return project;
+        }
+
+        // 建立返回值和参数均引用转交泛型嵌套类型的真实调用。
+        /// <summary>
+        /// 复刻参考库的集合遍历器签名映射到运行库的写法。
+        /// </summary>
+        public static TestProject CreateWithForwardedMethodSignature()
+        {
+            TestProject project = Create(includeDependency: false);
+            const string definition = """
+                namespace ForwardedSignature
+                {
+                    public class Value { }
+                    public interface IUse { Value Convert(Value value); }
+                    public interface IGenericUse<T> { T Convert(T value); }
+                    public class Base { public virtual Value Convert(Value value) => value; }
+                    public class GenericBase<T> { public virtual T Convert(T value) => value; }
+                    public class Bag<T>
+                    {
+                        public struct Enumerator { }
+                        public Enumerator GetEnumerator() => default;
+                        public void Accept(Enumerator value) { }
+                    }
+                }
+                """;
+            WriteAssembly(project.ForwardTargetPath, "SignatureImplementation", definition);
+            WriteAssembly(project.ExternalReferencePath, "SignatureFacade", definition);
+            File.Delete(project.ExternalAssemblyPath);
+            WriteAssembly(project.ExternalAssemblyPath, "External", """
+                using ForwardedSignature;
+                public sealed class Worker : IUse
+                {
+                    public Value Convert(Value value) => value;
+                }
+                public sealed class ExplicitWorker : IUse
+                {
+                    Value IUse.Convert(Value value) => value;
+                }
+                public sealed class GenericWorker : IGenericUse<Value>
+                {
+                    public Value Convert(Value value) => value;
+                }
+                public sealed class ExplicitGenericWorker : IGenericUse<Value>
+                {
+                    Value IGenericUse<Value>.Convert(Value value) => value;
+                }
+                public sealed class DerivedWorker : Base
+                {
+                    public override Value Convert(Value value) => value;
+                }
+                public sealed class NestedWorker<T> : IGenericUse<Bag<Value>>
+                {
+                    public Bag<Value> Convert(Bag<Value> value) => value;
+                }
+                public sealed class ExplicitNestedWorker<T> : IGenericUse<Bag<Value>>
+                {
+                    Bag<Value> IGenericUse<Bag<Value>>.Convert(Bag<Value> value) => value;
+                }
+                public class Middle<T> : GenericBase<Bag<T>> { }
+                public sealed class DerivedGenericWorker<T> : Middle<Value>
+                {
+                    public override Bag<Value> Convert(Bag<Value> value) => value;
+                }
+                public sealed class SignatureConsumer
+                {
+                    public void Run()
+                    {
+                        ForwardedSignature.Bag<int> bag = new ForwardedSignature.Bag<int>();
+                        ForwardedSignature.Bag<int>.Enumerator value = bag.GetEnumerator();
+                        bag.Accept(value);
+                    }
+                }
+                """, project.ExternalReferencePath);
+            File.Delete(project.ExternalReferencePath);
+            WriteAssembly(project.ExternalReferencePath, "SignatureFacade", """
+                using System.Runtime.CompilerServices;
+                [assembly: TypeForwardedTo(typeof(ForwardedSignature.Value))]
+                [assembly: TypeForwardedTo(typeof(ForwardedSignature.IUse))]
+                [assembly: TypeForwardedTo(typeof(ForwardedSignature.IGenericUse<>))]
+                [assembly: TypeForwardedTo(typeof(ForwardedSignature.Base))]
+                [assembly: TypeForwardedTo(typeof(ForwardedSignature.GenericBase<>))]
+                [assembly: TypeForwardedTo(typeof(ForwardedSignature.Bag<>))]
+                """, project.ForwardTargetPath);
+            AppendCoreLibraryReference(project);
+
+            return project;
+        }
+
+        // 建立两层门面连续转交到真实类型的工程。
+        /// <summary>
+        /// 建立外层门面、中间门面和最终类型的三段材料。
+        /// </summary>
+        public static TestProject CreateWithTwoForwardingFacades()
+        {
+            TestProject project = Create(includeDependency: false);
+            string middleFacadePath = Path.Combine(project.RootPath, "MiddleFacade.dll");
+
+            WriteAssembly(
+                project.ForwardTargetPath,
+                "FinalImplementation",
+                "namespace ForwardedNamespace { public class ForwardedType { "
+                    + "public virtual void Touch() { } } }");
+            WriteAssembly(
+                middleFacadePath,
+                "MiddleFacade",
+                "namespace ForwardedNamespace { public sealed class ForwardedType { } }");
+            WriteAssembly(
+                project.ExternalReferencePath,
+                "OuterFacade",
+                "namespace ForwardedNamespace { public class ForwardedType { "
+                    + "public virtual void Touch() { } } }");
+            File.Delete(project.ExternalAssemblyPath);
+            WriteAssembly(
+                project.ExternalAssemblyPath,
+                "External",
+                "namespace ForwardedConsumer { public sealed class Derived "
+                    + ": ForwardedNamespace.ForwardedType { "
+                    + "public override void Touch() { } "
+                    + "public void Call(ForwardedNamespace.ForwardedType target) { "
+                    + "target.Touch(); } } }",
+                project.ExternalReferencePath);
+            File.Delete(project.ExternalReferencePath);
+            WriteAssembly(
+                project.ExternalReferencePath,
+                "OuterFacade",
+                "using System.Runtime.CompilerServices; using ForwardedNamespace; "
+                    + "[assembly: TypeForwardedTo(typeof(ForwardedType))]",
+                middleFacadePath);
+            File.Delete(middleFacadePath);
+            WriteAssembly(
+                middleFacadePath,
+                "MiddleFacade",
+                "using System.Runtime.CompilerServices; using ForwardedNamespace; "
+                    + "[assembly: TypeForwardedTo(typeof(ForwardedType))]",
+                project.ForwardTargetPath);
+            AppendCoreLibraryReference(project);
+
+            return project;
+        }
+
+        // 建立外层和中间门面相互转交的错误工程。
+        /// <summary>
+        /// 建立可由真实继承关系触发的两节点转交循环。
+        /// </summary>
+        public static TestProject CreateWithForwardingCycle()
+        {
+            TestProject project = CreateWithTwoForwardingFacades();
+            string middleFacadePath = Path.Combine(project.RootPath, "MiddleFacade.dll");
+            string outerDefinitionPath = Path.Combine(project.RootPath, "OuterDefinition.dll");
+
+            WriteAssembly(
+                outerDefinitionPath,
+                "OuterFacade",
+                "namespace ForwardedNamespace { public sealed class ForwardedType { } }");
+            File.Delete(middleFacadePath);
+            WriteAssembly(
+                middleFacadePath,
+                "MiddleFacade",
+                "using System.Runtime.CompilerServices; using ForwardedNamespace; "
+                    + "[assembly: TypeForwardedTo(typeof(ForwardedType))]",
+                outerDefinitionPath);
+            File.Delete(outerDefinitionPath);
+
+            return project;
+        }
+
+        // 建立外层和最终程序集同名但版本不同的转交链。
+        /// <summary>
+        /// 建立需要同时使用类型逻辑身份和完整程序集身份的三段材料。
+        /// </summary>
+        public static TestProject CreateWithSameNameVersionedForwardingFacades()
+        {
+            TestProject project = Create(includeDependency: false);
+            string middleFacadePath = Path.Combine(project.RootPath, "MiddleFacade.dll");
+
+            WriteAssembly(
+                project.ForwardTargetPath,
+                "VersionedFacade",
+                "using System.Reflection; [assembly: AssemblyVersion(\"4.0.0.0\")] "
+                    + "namespace ForwardedNamespace { public class ForwardedType { "
+                    + "public virtual void Touch() { } } }");
+            WriteAssembly(
+                middleFacadePath,
+                "MiddleFacade",
+                "namespace ForwardedNamespace { public sealed class ForwardedType { } }");
+            WriteAssembly(
+                project.ExternalReferencePath,
+                "VersionedFacade",
+                "using System.Reflection; [assembly: AssemblyVersion(\"4.1.3.0\")] "
+                    + "namespace ForwardedNamespace { public class ForwardedType { "
+                    + "public virtual void Touch() { } } }");
+            File.Delete(project.ExternalAssemblyPath);
+            WriteAssembly(
+                project.ExternalAssemblyPath,
+                "External",
+                "namespace ForwardedConsumer { public sealed class Derived "
+                    + ": ForwardedNamespace.ForwardedType { "
+                    + "public override void Touch() { } } }",
+                project.ExternalReferencePath);
+            File.Delete(project.ExternalReferencePath);
+            WriteAssembly(
+                project.ExternalReferencePath,
+                "VersionedFacade",
+                "using System.Reflection; using System.Runtime.CompilerServices; "
+                    + "using ForwardedNamespace; [assembly: AssemblyVersion(\"4.1.3.0\")] "
+                    + "[assembly: TypeForwardedTo(typeof(ForwardedType))]",
+                middleFacadePath);
+            File.Delete(middleFacadePath);
+            WriteAssembly(
+                middleFacadePath,
+                "MiddleFacade",
+                "using System.Runtime.CompilerServices; using ForwardedNamespace; "
+                    + "[assembly: TypeForwardedTo(typeof(ForwardedType))]",
+                project.ForwardTargetPath);
+            AppendCoreLibraryReference(project);
+
+            return project;
+        }
+
         // 建立外部程序集通过普通类型关系引用同目录程序集的工程。
         /// <summary>
         /// 建立间接基类程序集只在闭合层级时才载入的测试工程。
@@ -425,7 +1275,7 @@ namespace SetterChecker.Core.Tests
                 project.ForwardTargetPath,
                 "ForwardTarget",
                 "namespace TransitiveSamples { public class BaseType { "
-                    + "public virtual void Touch() { } } "
+                    + "public virtual void Touch() { } public void BaseOnly() { } } "
                     + "public class GenericBase<T> { "
                     + "public virtual TValue Echo<TValue>(TValue value) => value; } }");
             File.Delete(project.ExternalAssemblyPath);
@@ -434,7 +1284,8 @@ namespace SetterChecker.Core.Tests
                 "External",
                 "namespace TransitiveSamples { public sealed class DerivedType : BaseType { "
                     + "public override void Touch() { } "
-                    + "public void Call(BaseType target) { target.Touch(); } } "
+                    + "public void Call(BaseType target) { target.Touch(); } "
+                    + "public void CallInherited(DerivedType target) { target.BaseOnly(); } } "
                     + "public sealed class GenericDerived : GenericBase<int> { "
                     + "public override TValue Echo<TValue>(TValue value) => value; } }",
                 project.ForwardTargetPath);
@@ -471,6 +1322,14 @@ namespace SetterChecker.Core.Tests
                 "Facade",
                 "using System.Runtime.CompilerServices; [assembly: TypeForwardedTo(typeof(N.T))]",
                 secondTargetPath);
+            File.AppendAllLines(
+                this.RootResponsePath,
+                new[]
+                {
+                    $"-r:\"{Relative(this.RootPath, secondFacadePath)}\"",
+                    $"-r:\"{Relative(this.RootPath, secondTargetPath)}\"",
+                });
+            AppendCoreLibraryReference(this);
         }
 
         // 建立转交记录与目标程序集身份不一致的最小工程。
@@ -478,11 +1337,20 @@ namespace SetterChecker.Core.Tests
         {
             TestProject project = CreateWithForwardedType();
 
+            WriteAssembly(
+                project.MismatchedForwardConsumerPath,
+                "MismatchedForwardConsumer",
+                "namespace ForwardedConsumer { public sealed class Derived "
+                    + ": ForwardedNamespace.ForwardedType { public override int Read() => 2; } }",
+                project.ExternalAssemblyPath,
+                project.ForwardTargetPath);
             File.Delete(project.ForwardTargetPath);
             WriteAssembly(
                 project.ForwardTargetPath,
                 "WrongForwardTarget",
                 "public sealed class WrongType { }");
+            File.AppendAllLines(project.RootResponsePath,
+                new[] { $"-r:\"{Relative(project.RootPath, project.MismatchedForwardConsumerPath)}\"" });
 
             return project;
         }
@@ -1308,23 +2176,135 @@ namespace SetterChecker.Core.Tests
             }
         }
 
+        // 写入测试Unity安装的Mono框架版本重映射证据。
+        private static void WriteUnityMonoRemappingEvidence(
+            TestProject project,
+            string frameworkName,
+            bool onlyLowerVersions,
+            bool runtimeRowContainsUnavailableVersion = false)
+        {
+            string metadataDirectory = Path.Combine(project.RootPath, "Data", "il2cpp", "external",
+                "mono", "mono", "metadata");
+            Directory.CreateDirectory(metadataDirectory);
+            File.WriteAllText(Path.Combine(metadataDirectory, "assembly.c"), $$"""
+                static const AssemblyVersionMap framework_assemblies [] = {
+                    {"{{frameworkName}}", 0, NULL, {{(onlyLowerVersions ? "TRUE" : "FALSE")}}},
+                    FACADE_ASSEMBLY ("KnownFacade"),
+                };
+                """);
+            string versionSets = runtimeRowContainsUnavailableVersion
+                ? "{4,0,0,0}, NOT_AVAIL, {4,0,0,0}, {4,0,0,0}, {4,0,0,0}"
+                : "{4,0,0,0}, {10,0,0,0}, {4,0,0,0}, {4,0,0,0}, {4,0,0,0}";
+            File.WriteAllText(Path.Combine(metadataDirectory, "domain.c"), $$"""
+                static const MonoRuntimeInfo supported_runtimes[] = {
+                    {"v4.0.30319","4.5", { {{versionSets}} } },
+                };
+                """);
+            WriteUnityRuntimeCoreLibrary(project);
+        }
+
+        // 写入用于选中当前Mono运行版本的核心程序集。
+        private static void WriteUnityRuntimeCoreLibrary(TestProject project)
+        {
+            string path = Path.Combine(project.RootPath, "Data", "MonoBleedingEdge", "lib", "mono",
+                "unityjit-win32", "mscorlib.dll");
+            WriteAssembly(path, "mscorlib",
+                "using System.Reflection; [assembly: AssemblyVersion(\"4.0.0.0\")] public sealed class RuntimeMarker { }");
+        }
+
+        // 改写测试程序集的公钥以构造身份反例。
+        private static void RewriteAssemblyPublicKey(string path, byte[] publicKey)
+        {
+            string outputPath = path + ".token";
+            using Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(path,
+                new Mono.Cecil.ReaderParameters { InMemory = true });
+            module.Assembly.Name.PublicKey = publicKey;
+            module.Assembly.Name.HasPublicKey = true;
+            module.Write(outputPath);
+            File.Move(outputPath, path, overwrite: true);
+        }
+
+        // 把派生类型的基类引用改回指定程序集的完整身份。
+        private static void RewriteBaseTypeAssemblyScope(
+            string path,
+            string derivedTypeName,
+            string assemblyPath)
+        {
+            string outputPath = path + ".rewritten";
+            using Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(
+                path,
+                new Mono.Cecil.ReaderParameters { InMemory = true });
+            using Mono.Cecil.ModuleDefinition assemblyModule = Mono.Cecil.ModuleDefinition.ReadModule(
+                assemblyPath,
+                new Mono.Cecil.ReaderParameters { InMemory = true });
+            Mono.Cecil.AssemblyNameDefinition identity = assemblyModule.Assembly.Name;
+            Mono.Cecil.AssemblyNameReference? scope = module.AssemblyReferences.SingleOrDefault(
+                reference => reference.FullName == identity.FullName);
+            if (scope == null)
+            {
+                scope = new Mono.Cecil.AssemblyNameReference(identity.Name, identity.Version)
+                {
+                    Culture = identity.Culture,
+                    PublicKeyToken = identity.PublicKeyToken,
+                };
+                module.AssemblyReferences.Add(scope);
+            }
+
+            Mono.Cecil.TypeDefinition derivedType = module.GetType(derivedTypeName);
+            Mono.Cecil.TypeReference originalBaseType = derivedType.BaseType;
+            derivedType.BaseType = new Mono.Cecil.TypeReference(
+                originalBaseType.Namespace,
+                originalBaseType.Name,
+                module,
+                scope);
+            module.Write(outputPath);
+            File.Move(outputPath, path, overwrite: true);
+        }
+
+        // 向指定程序集注入一条真实类型转交记录。
+        private static void AddForwardedType(
+            string path,
+            string typeNamespace,
+            string typeName,
+            string targetAssemblyPath)
+        {
+            string outputPath = path + ".rewritten";
+            using Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(
+                path,
+                new Mono.Cecil.ReaderParameters { InMemory = true });
+            using Mono.Cecil.ModuleDefinition targetModule = Mono.Cecil.ModuleDefinition.ReadModule(
+                targetAssemblyPath,
+                new Mono.Cecil.ReaderParameters { InMemory = true });
+            Mono.Cecil.AssemblyNameDefinition identity = targetModule.Assembly.Name;
+            Mono.Cecil.AssemblyNameReference scope = new(identity.Name, identity.Version)
+            {
+                Culture = identity.Culture,
+                PublicKeyToken = identity.PublicKeyToken,
+            };
+            module.AssemblyReferences.Add(scope);
+            module.ExportedTypes.Add(new Mono.Cecil.ExportedType(
+                typeNamespace,
+                typeName,
+                module,
+                scope)
+            {
+                Attributes = Mono.Cecil.TypeAttributes.Public | Mono.Cecil.TypeAttributes.Forwarder,
+            });
+            module.Write(outputPath);
+            File.Move(outputPath, path, overwrite: true);
+        }
+
         // 编译类型定义或类型转交测试程序集。
         private static void WriteAssembly(
             string path,
             string assemblyName,
             string source,
-            string? additionalReference = null,
-            bool allowUnsafe = false)
+            params string[] additionalReferences)
         {
             IEnumerable<string> platformPaths = ((string)AppContext.GetData(
                 "TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator);
 
-            if (additionalReference != null)
-            {
-                platformPaths = platformPaths.Append(additionalReference);
-            }
-
-            PortableExecutableReference[] references = platformPaths
+            PortableExecutableReference[] references = platformPaths.Concat(additionalReferences)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Select(item => MetadataReference.CreateFromFile(item))
                 .ToArray();
@@ -1332,9 +2312,7 @@ namespace SetterChecker.Core.Tests
                 assemblyName,
                 new[] { CSharpSyntaxTree.ParseText(source) },
                 references,
-                new CSharpCompilationOptions(
-                    OutputKind.DynamicallyLinkedLibrary,
-                    allowUnsafe: allowUnsafe));
+                new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
 
             using FileStream stream = File.Create(path);
             Microsoft.CodeAnalysis.Emit.EmitResult result = compilation.Emit(stream);

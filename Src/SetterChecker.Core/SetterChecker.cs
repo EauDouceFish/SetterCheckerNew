@@ -64,7 +64,9 @@ namespace SetterChecker.Core
         bool IsReportAssembly,
         CSharpCompilation Compilation,
         IReadOnlyList<string> SourcePaths,
-        IReadOnlyList<string> ReportSourcePaths);
+        IReadOnlyList<string> ReportSourcePaths,
+        string AssemblyPath,
+        byte[] AssemblyImage);
 
     /// <summary>
     /// 表示一个编译引用及其真实函数内容所在文件。
@@ -83,5 +85,16 @@ namespace SetterChecker.Core
         IReadOnlyList<ExternalAssemblyMaterial> ExternalAssemblies,
         IReadOnlyList<string> AssemblyLookupPaths,
         IReadOnlyList<string> AnalyzerPaths,
-        TimeSpan Elapsed);
+        TimeSpan Elapsed)
+    {
+        /// <summary>材料耗时中用于把当前源码编译到内存的部分，不重复计入总耗时。</summary>
+        public TimeSpan CompilationElapsed { get; init; }
+
+        /// <summary>Unity 当前运行配置中经过验证的纯类型转交门面。</summary>
+        public IReadOnlyList<string> UnityRuntimeFacadePaths { get; init; } = Array.Empty<string>();
+
+        /// <summary>参考完整身份到材料模块已唯一选定的真实文件。</summary>
+        public IReadOnlyDictionary<string, string> AssemblyRedirects { get; init; } =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    }
 }
