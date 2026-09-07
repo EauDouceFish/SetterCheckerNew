@@ -1322,7 +1322,7 @@ namespace SetterChecker.Core
                 {
                     Cecil.MethodReference methodReference =
                         RequireOperand<Cecil.MethodReference>(instruction);
-                    ManagedMethodReferenceInfo reference =
+                    BehaviorMethodReference reference =
                         this.m_catalog.ReadManagedMethodReference(
                             methodReference,
                             this.m_method.AssemblyPath!);
@@ -1331,7 +1331,7 @@ namespace SetterChecker.Core
                         : Array.Empty<int>();
                     this.m_stack.Push(AddMethodValue(
                         BehaviorValueKind.Function,
-                        BehaviorMethodReference.From(reference),
+                        reference,
                         inputs));
 
                     return;
@@ -1452,7 +1452,7 @@ namespace SetterChecker.Core
             {
                 OpCode code = instruction.OpCode;
                 int offset = instruction.Offset;
-                ManagedMethodReferenceInfo reference =
+                BehaviorMethodReference reference =
                     this.m_catalog.ReadManagedMethodReference(
                         method,
                         this.m_method.AssemblyPath!);
@@ -1474,7 +1474,7 @@ namespace SetterChecker.Core
                 BehaviorCallKind kind = ReadCallKind(code, definition);
                 int? resultValueId = null;
 
-                if (code == OpCodes.Newobj || !reference.ReturnsVoid)
+                if (code == OpCodes.Newobj || reference.ReturnTypeId != "System.Void")
                 {
                     resultValueId = AddValue(
                         code == OpCodes.Newobj
@@ -1510,7 +1510,7 @@ namespace SetterChecker.Core
 
                 this.m_calls[offset] = new BehaviorCall(
                     kind,
-                    BehaviorMethodReference.From(reference),
+                    reference,
                     receiverValueId,
                     arguments,
                     resultValueId,
@@ -1797,32 +1797,19 @@ namespace SetterChecker.Core
             // 从字段定义或成员引用标记读取结构化字段身份。
             private BehaviorMemberReference ReadFieldReference(Cecil.FieldReference field)
             {
-                ManagedFieldReferenceInfo reference =
-                    this.m_catalog.ReadManagedFieldReference(
-                        field,
-                        this.m_method.AssemblyPath!);
-
-                return BehaviorMemberReference.From(reference);
+                return this.m_catalog.ReadManagedFieldReference(field, this.m_method.AssemblyPath!);
             }
 
             // 从类型定义、引用或规格标记读取结构化类型身份。
             private BehaviorTypeReference ReadTypeReference(Cecil.TypeReference type)
             {
-                ManagedTypeReferenceInfo reference =
-                    this.m_catalog.ReadManagedTypeReference(
-                        type,
-                        this.m_method.AssemblyPath!);
-
-                return BehaviorTypeReference.From(reference);
+                return this.m_catalog.ReadManagedTypeReference(type, this.m_method.AssemblyPath!);
             }
 
             // 从 Cecil 函数引用读取结构化调用身份。
             private BehaviorMethodReference ReadMethodReference(Cecil.MethodReference method)
             {
-                return BehaviorMethodReference.From(
-                    this.m_catalog.ReadManagedMethodReference(
-                        method,
-                        this.m_method.AssemblyPath!));
+                return this.m_catalog.ReadManagedMethodReference(method, this.m_method.AssemblyPath!);
             }
         }
     }
@@ -2063,20 +2050,26 @@ namespace SetterChecker.Core
         internal IReadOnlyList<TypeIdentityTemplate> ArgumentIdentities { get; init; } =
             Array.Empty<TypeIdentityTemplate>();
 
-        // 把函数总表使用的类型身份转换为公开行为事实。
-        internal static BehaviorTypeReference From(ManagedTypeReferenceInfo reference)
+        // 同时保存结构化类型身份和公开展示，不再经另一套引用对象中转。
+        internal static BehaviorTypeReference Create(
+            TypeIdentityTemplate identity,
+            TypeIdentityTemplate definition,
+            IReadOnlyList<TypeIdentityTemplate> arguments,
+            string? targetAssemblyIdentity,
+            string? referringAssemblyPath,
+            string? knownTypeId)
         {
             return new BehaviorTypeReference(
-                reference.Identity.StableText,
-                reference.Definition.StableText,
-                reference.Arguments.Select(type => type.StableText).ToArray(),
-                reference.TargetAssemblyIdentity,
-                reference.ReferringAssemblyPath)
+                identity.StableText,
+                definition.StableText,
+                arguments.Select(type => type.StableText).ToArray(),
+                targetAssemblyIdentity,
+                referringAssemblyPath)
             {
-                KnownTypeId = reference.KnownTypeId,
-                Identity = reference.Identity,
-                DefinitionIdentity = reference.Definition,
-                ArgumentIdentities = reference.Arguments,
+                KnownTypeId = knownTypeId,
+                Identity = identity,
+                DefinitionIdentity = definition,
+                ArgumentIdentities = arguments,
             };
         }
     }
@@ -2091,6 +2084,9 @@ namespace SetterChecker.Core
         string Name,
         string FieldTypeId)
     {
+        /// <summary>当前函数内容中字段引用的原始标记，用于还原完整类型来源。</summary>
+        public int ReferenceMetadataToken { get; init; }
+
         /// <summary>当前模块中的字段声明类型物理身份。</summary>
         public string? KnownDeclaringTypeId { get; init; }
 
@@ -2103,24 +2099,6 @@ namespace SetterChecker.Core
         internal TypeIdentityTemplate DeclaringTypeIdentity { get; init; } = null!;
 
         internal TypeIdentityTemplate FieldTypeIdentity { get; init; } = null!;
-
-        // 把函数总表使用的字段身份转换为公开行为事实。
-        internal static BehaviorMemberReference From(ManagedFieldReferenceInfo reference)
-        {
-            return new BehaviorMemberReference(
-                reference.DeclaringType.StableText,
-                reference.DeclaringTypeDefinition.StableText,
-                reference.DeclaringTypeArguments.Select(type => type.StableText).ToArray(),
-                reference.Name,
-                reference.FieldType.StableText)
-            {
-                KnownDeclaringTypeId = reference.KnownDeclaringTypeId,
-                TargetAssemblyIdentity = reference.TargetAssemblyIdentity,
-                ReferringAssemblyPath = reference.ReferringAssemblyPath,
-                DeclaringTypeIdentity = reference.DeclaringType,
-                FieldTypeIdentity = reference.FieldType,
-            };
-        }
     }
 
     /// <summary>
@@ -2174,30 +2152,6 @@ namespace SetterChecker.Core
 
         internal IReadOnlyList<TypeIdentityTemplate> GenericArgumentIdentities { get; init; } =
             Array.Empty<TypeIdentityTemplate>();
-
-        // 把函数总表使用的函数身份转换为公开行为事实。
-        internal static BehaviorMethodReference From(ManagedMethodReferenceInfo reference)
-        {
-            return new BehaviorMethodReference(
-                reference.Identity.DeclaringType.StableText,
-                reference.DeclaringTypeDefinition.StableText,
-                reference.DeclaringTypeArguments.Select(type => type.StableText).ToArray(),
-                reference.Identity.Name,
-                reference.Identity.GenericArity,
-                reference.Identity.Parameters.Select(type => type.StableText).ToArray(),
-                reference.Identity.ReturnType.StableText,
-                reference.GenericArguments.Select(type => type.StableText).ToArray(),
-                reference.HasInstance,
-                reference.TargetAssemblyIdentity,
-                reference.ReferringAssemblyPath)
-            {
-                ReferenceMetadataToken = reference.ReferenceMetadataToken,
-                KnownDeclaringTypeId = reference.KnownDeclaringTypeId,
-                KnownMetadataToken = reference.KnownMetadataToken,
-                Identity = reference.Identity,
-                GenericArgumentIdentities = reference.GenericArguments,
-            };
-        }
     }
 
     /// <summary>

@@ -6,6 +6,42 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class BehaviorReaderTests
     {
+        // 验证泛型调用保留原始方法规格标记，同时另存实际本地定义标记。
+        /// <summary>
+        /// 源码内存产物和 DLL 的泛型调用都使用原始 MethodSpec，而不是解包后的 MethodDef。
+        /// </summary>
+        [TestMethod]
+        public async Task ReadAsyncPreservesOriginalGenericCallMetadataToken()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Calls
+                {
+                    public static T Echo<T>(T value) => value;
+                    public static int Run() => Echo(1);
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls")
+                .SelectMany(catalog.GetMethods).Where(method => method.Name == "Run").ToArray();
+            Assert.HasCount(2, roots);
+
+            BehaviorReadResult result = await new BehaviorReader().ReadAsync(material, catalog, roots, 2);
+
+            foreach (MethodBehavior body in result.Methods)
+            {
+                BehaviorMethodReference reference = body.Calls.Single().Target;
+                Assert.AreEqual(0x2b000000, reference.ReferenceMetadataToken & unchecked((int)0xff000000));
+                Assert.IsNotNull(reference.KnownMetadataToken);
+                Assert.AreEqual(0x06000000, reference.KnownMetadataToken.Value & unchecked((int)0xff000000));
+                MethodEntry caller = roots.Single(method => method.Id == body.MethodId);
+                MethodEntry target = catalog.GetMethods(catalog.TypesById[caller.TypeId]).Single(method => method.Name == "Echo");
+                Assert.AreEqual(target.MetadataToken, reference.KnownMetadataToken.Value);
+                CollectionAssert.AreEqual(new[] { "System.Int32" }, reference.GenericArgumentTypeIds.ToArray());
+            }
+        }
+
         // 验证函数参数和返回值经过类型转交后仍定位同一真实声明。
         /// <summary>
         /// 参考库中的泛型嵌套类型与运行库中的定义不能按程序集名称误判不同。

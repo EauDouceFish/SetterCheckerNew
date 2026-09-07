@@ -8,6 +8,41 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class MethodCatalogTests
     {
+        // 验证真实方法实现表指定了接口成员时，公开同名方法不再占用该接口关系。
+        /// <summary>
+        /// 源码和 DLL 的类、结构体均按同一条显式接口优先规则建表。
+        /// </summary>
+        [TestMethod]
+        [DataRow("class")]
+        [DataRow("struct")]
+        public async Task GetMethodsExcludesImplicitRelationWhenExplicitImplementationExists(string kind)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public interface IView<T> { T this[int index] { get; } }
+                public KIND Sample<T> : IView<T>
+                {
+                    public T this[int index] => default;
+                    T IView<T>.this[int index] => default;
+                }
+                """.Replace("KIND", kind, StringComparison.Ordinal));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult result = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry[] types = result.Types.Where(type => type.FullName is "SourceSamples.Sample<T>" or "ExternalSamples.Sample<T>").ToArray();
+            Assert.HasCount(2, types);
+
+            foreach (TypeEntry type in types)
+            {
+                MethodEntry[] getters = result.GetMethods(type).Where(method => method.Kind == CatalogMethodKind.PropertyGetter).ToArray();
+                Assert.HasCount(2, getters);
+                Assert.IsEmpty(getters.Single(method => method.IsPublic).RelatedMethodIds);
+                TypeEntry contract = result.Types.Single(item => item.FullName is "SourceSamples.IView<T>" or "ExternalSamples.IView<T>"
+                    && item.AssemblyPath == type.AssemblyPath);
+                CollectionAssert.AreEqual(new[] { result.GetMethods(contract).Single().LogicalId },
+                    getters.Single(method => !method.IsPublic).RelatedMethodIds.ToArray());
+            }
+        }
+
         // 检查源码函数种类、标签、参数和统计范围。
         /// <summary>
         /// 验证总表保留全部分析节点，但只报告日志工具处理的函数。
@@ -198,9 +233,8 @@ namespace SetterChecker.Core.Tests
                 result.DerivedTypesByBaseId[baseType.LogicalId].Select(type => type.Id).ToArray(),
                 derived.Id);
             CollectionAssert.Contains(
-                result.OverridesByMethodId[baseMethod.LogicalId]
-                    .Select(method => method.Id).ToArray(),
-                derivedMethod.Id);
+                derivedMethod.RelatedMethodIds.ToArray(),
+                baseMethod.LogicalId);
         }
 
         // 检查 Cecil 对普通、泛型、接口、重写和访问器函数的读取。
