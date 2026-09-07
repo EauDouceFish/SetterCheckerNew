@@ -19,8 +19,11 @@ namespace SetterChecker.Cli
             try
             {
                 (string projectPath, int jobs) = ParseArguments(arguments);
-                (MaterialSet material, MethodCatalogResult catalog) = await new SetterChecker.Core.SetterChecker()
-                    .AnalyzeAsync(new MaterialRequest(projectPath, jobs));
+                (
+                    MaterialSet material,
+                    MethodCatalogResult catalog,
+                    BehaviorReadResult behaviors) = await new SetterChecker.Core.SetterChecker()
+                        .AnalyzeAsync(new MaterialRequest(projectPath, jobs));
 
                 Console.WriteLine($"源码程序集：{material.SourceAssemblies.Count}");
                 Console.WriteLine($"源码文件：{material.SourceAssemblies.Sum(item => item.SourcePaths.Count)}");
@@ -31,6 +34,8 @@ namespace SetterChecker.Cli
                 Console.WriteLine($"已建立全部类型：{catalog.Types.Count}");
                 Console.WriteLine($"khengine 可报告函数：{catalog.Methods.Count(method => method.IsReportable)}");
                 Console.WriteLine($"函数总表耗时：{catalog.Elapsed.TotalMilliseconds:F0} 毫秒");
+                Console.WriteLine($"已读取函数行为：{behaviors.Methods.Count}");
+                Console.WriteLine($"函数行为读取耗时：{behaviors.Elapsed.TotalMilliseconds:F0} 毫秒");
 
                 return 0;
             }

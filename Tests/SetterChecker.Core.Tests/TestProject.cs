@@ -282,6 +282,25 @@ namespace SetterChecker.Core.Tests
             return project;
         }
 
+        // 建立源码与真实动态链接库各含一组相同行为写法的工程。
+        /// <summary>
+        /// 建立用于核对源码和托管函数行为事实一致性的工程。
+        /// </summary>
+        public static TestProject CreateWithBehaviorMethods()
+        {
+            TestProject project = Create(includeDependency: false);
+
+            File.WriteAllText(project.RootSourcePath, BuildBehaviorSource("SourceSamples"));
+            File.Delete(project.ExternalAssemblyPath);
+            WriteAssembly(
+                project.ExternalAssemblyPath,
+                "External",
+                BuildBehaviorSource("ExternalSamples"));
+            AppendCoreLibraryReference(project);
+
+            return project;
+        }
+
         // 把源码依赖移入目标包以验证统一纳入规则。
         /// <summary>
         /// 建立目标包内部还包含源码依赖的工程。
@@ -551,6 +570,637 @@ namespace SetterChecker.Core.Tests
                 externalReferencePath,
                 forwardTargetPath,
                 analyzerPath);
+        }
+
+        // 生成覆盖基础写入、调用、创建和返回事实的测试源码。
+        private static string BuildBehaviorSource(string namespaceName)
+        {
+            return $$"""
+                namespace {{namespaceName}}
+                {
+                    public class Box<T>
+                    {
+                        public T Value = default!;
+
+                        public T Echo(T value) => value;
+                    }
+
+                    public interface IBehavior
+                    {
+                        void Apply();
+                    }
+
+                    public sealed class EffectResource : System.IDisposable
+                    {
+                        public static int Changes;
+
+                        public void Dispose()
+                        {
+                            Changes++;
+                        }
+                    }
+
+                    public sealed class OperatorValue
+                    {
+                        public static int Changes;
+
+                        public static OperatorValue operator +(
+                            OperatorValue left,
+                            OperatorValue right)
+                        {
+                            Changes++;
+                            return left;
+                        }
+                    }
+
+                    public sealed class EffectSequence
+                    {
+                        public Enumerator GetEnumerator() => new();
+
+                        public struct Enumerator : System.IDisposable
+                        {
+                            public int Current => 1;
+
+                            public bool MoveNext() => false;
+
+                            public void Dispose()
+                            {
+                                EffectResource.Changes++;
+                            }
+                        }
+                    }
+
+                    public static class StaticDefaults
+                    {
+                        public static readonly BehaviorSample Instance = new();
+
+                        public static readonly System.Collections.Generic.List<int> Values =
+                            new() { 1 };
+                    }
+
+                    public static class InterleavedInitializers
+                    {
+                        public static int FieldFirst = Mark(1);
+
+                        public static int PropertySecond { get; } = Mark(2);
+
+                        public static int FieldThird = Mark(3);
+
+                        private static int Mark(int value) => value;
+                    }
+
+                    public class BaseInitialized
+                    {
+                        public static int Changes;
+
+                        public BaseInitialized()
+                        {
+                            Changes++;
+                        }
+                    }
+
+                    public sealed class ImplicitDerived : BaseInitialized
+                    {
+                    }
+
+                    public class BehaviorSample
+                    {
+                        private int m_value;
+                        private static int s_value;
+                        private BehaviorSample? m_child;
+                        private object m_marker = new object();
+
+                        public int Value { get; set; }
+
+                        public int ExpressionProperty => this.m_value;
+
+                        public int this[int index] => this.m_value + index;
+
+                        public event System.Action? Changed;
+
+                        public BehaviorSample()
+                        {
+                            this.m_value = 1;
+                        }
+
+                        public virtual int Read(int input) => input;
+
+                        public int ExpressionMethod() => this.m_value;
+
+                        public override string ToString()
+                        {
+                            return base.ToString()!;
+                        }
+
+                        public void Apply() { }
+
+                        public void WriteField(int input)
+                        {
+                            this.m_value = input;
+                        }
+
+                        public int AssignAndReturn(BehaviorSample target, int input)
+                        {
+                            return target.m_value = input;
+                        }
+
+                        public int AddAndReturn(BehaviorSample target, int input)
+                        {
+                            return target.m_value += input;
+                        }
+
+                        public int IncrementAndReturn(BehaviorSample target)
+                        {
+                            return ++target.m_value;
+                        }
+
+                        public static void WriteStatic(int input)
+                        {
+                            s_value = input;
+                        }
+
+                        public void WriteArray(int[] values, int input)
+                        {
+                            values[0] = input;
+                        }
+
+                        public void WriteReference(ref int target, int input)
+                        {
+                            target = input;
+                        }
+
+                        public int Call(BehaviorSample target, int input)
+                        {
+                            return target.Read(input);
+                        }
+
+                        public BehaviorSample CreateAndReturn()
+                        {
+                            BehaviorSample result = new();
+                            result.m_value = 1;
+                            return result;
+                        }
+
+                        public BehaviorSample ChooseAndWrite(
+                            BehaviorSample first,
+                            BehaviorSample second,
+                            bool chooseFirst)
+                        {
+                            BehaviorSample result;
+                            if (chooseFirst)
+                            {
+                                result = first;
+                            }
+                            else
+                            {
+                                result = second;
+                            }
+
+                            result.m_value = this.m_value;
+                            return result;
+                        }
+
+                        public void WriteAfterNewOverwrite(BehaviorSample external)
+                        {
+                            BehaviorSample target = external;
+                            target = new BehaviorSample();
+                            target.m_value = 1;
+                        }
+
+                        public void WriteAfterExternalOverwrite(BehaviorSample external)
+                        {
+                            BehaviorSample target = new BehaviorSample();
+                            target = external;
+                            target.m_value = 1;
+                        }
+
+                        public void WriteAfterBranch(
+                            BehaviorSample external,
+                            bool useExternal)
+                        {
+                            BehaviorSample target;
+                            if (useExternal)
+                            {
+                                target = external;
+                            }
+                            else
+                            {
+                                target = new BehaviorSample();
+                            }
+
+                            target.m_value = 1;
+                        }
+
+                        private static void ConsumePair(
+                            BehaviorSample first,
+                            BehaviorSample second)
+                        {
+                        }
+
+                        private static void Observe(BehaviorSample value)
+                        {
+                        }
+
+                        private static void Replace(out BehaviorSample value)
+                        {
+                            value = new BehaviorSample();
+                        }
+
+                        public void ConsumeOldThenOverwrite(BehaviorSample external)
+                        {
+                            BehaviorSample target = external;
+                            ConsumePair(target, target = new BehaviorSample());
+                        }
+
+                        public void ReadAroundOutput(BehaviorSample external)
+                        {
+                            BehaviorSample target = external;
+                            Observe(target);
+                            Replace(out target);
+                            Observe(target);
+                        }
+
+                        public void CaptureThenOverwrite(BehaviorSample external)
+                        {
+                            BehaviorSample target = external;
+                            System.Action captured = () => Observe(target);
+                            Observe(target);
+                            target = new BehaviorSample();
+                            Observe(target);
+                            Register(captured);
+                        }
+
+                        public void SetProperty(BehaviorSample target, int input)
+                        {
+                            target.Value = input;
+                        }
+
+                        public void AddEvent(BehaviorSample target, System.Action handler)
+                        {
+                            target.Changed += handler;
+                        }
+
+                        public void AddCollection(
+                            System.Collections.Generic.List<int> values,
+                            int input)
+                        {
+                            values.Add(input);
+                        }
+
+                        public int UseBox(Box<int> box, int input)
+                        {
+                            box.Value = input;
+                            return box.Echo(input);
+                        }
+
+                        public static T Identity<T>(T value) => value;
+
+                        public int UseGeneric(int input) => Identity<int>(input);
+
+                        public static T CreateGeneric<T>() where T : new()
+                        {
+                            return new T();
+                        }
+
+                        public (int Left, int Right) Pair(int left, int right)
+                        {
+                            return (left, right);
+                        }
+
+                        public System.Collections.Generic.IEnumerable<int> YieldWrite(
+                            BehaviorSample target,
+                            int input)
+                        {
+                            target.m_value = input;
+                            yield return target.m_value;
+                        }
+
+                        private static void Register(System.Action action)
+                        {
+                        }
+
+                        public void RegisterCaptured(int input)
+                        {
+                            int local = 1;
+                            Register(() => this.m_value = input + local);
+                        }
+
+                        public void WriteChosen(
+                            BehaviorSample first,
+                            BehaviorSample second,
+                            bool chooseFirst,
+                            int input)
+                        {
+                            (chooseFirst ? first : second).m_value = input;
+                        }
+
+                        private static void Assign(ref int target, int input)
+                        {
+                            target = input;
+                        }
+
+                        public void PassFieldByReference(int input)
+                        {
+                            Assign(ref this.m_value, input);
+                        }
+
+                        public void PassArrayByReference(int[] values, int input)
+                        {
+                            Assign(ref values[0], input);
+                        }
+
+                        public int ReadArray(int[] values, int index)
+                        {
+                            return values[index];
+                        }
+
+                        public int InvokeDelegate(System.Func<int, int> action, int input)
+                        {
+                            return action(input);
+                        }
+
+                        public System.Func<int, int> BindDelegate()
+                        {
+                            return this.Read;
+                        }
+
+                        public System.Func<int> BindCaptured(int input, bool first)
+                        {
+                            System.Func<int> left = () => input;
+                            System.Func<int> right = () => input + 1;
+                            return first ? left : right;
+                        }
+
+                        public System.Func<int> BindLocal(int input)
+                        {
+                            int ReadCaptured() => input;
+                            return ReadCaptured;
+                        }
+
+                        public BehaviorSample CastSample(object value)
+                        {
+                            return (BehaviorSample)value;
+                        }
+
+                        public BehaviorSample? TryCastSample(object value)
+                        {
+                            return value as BehaviorSample;
+                        }
+
+                        public void SkipConstantFalse(BehaviorSample target)
+                        {
+                            if (false)
+                            {
+                                target.m_value = 1;
+                                target.Apply();
+                            }
+                        }
+
+                        public string Interpolate(int input)
+                        {
+                            return $"Value:{input}";
+                        }
+
+                        public int ReturnMinValue()
+                        {
+                            return int.MinValue;
+                        }
+
+                        public string CatchMessage()
+                        {
+                            try
+                            {
+                                throw new System.InvalidOperationException();
+                            }
+                            catch (System.Exception exception)
+                            {
+                                return exception.Message;
+                            }
+                        }
+
+                        public void CatchInsideFinally()
+                        {
+                            try
+                            {
+                                try
+                                {
+                                    throw new System.InvalidOperationException();
+                                }
+                                catch (System.InvalidOperationException)
+                                {
+                                    Apply();
+                                }
+                            }
+                            finally
+                            {
+                                WriteStatic(1);
+                            }
+                        }
+
+                        public void LeaveNestedFinally()
+                        {
+                            try
+                            {
+                                try
+                                {
+                                    Apply();
+                                }
+                                finally
+                                {
+                                    WriteStatic(1);
+                                }
+                            }
+                            finally
+                            {
+                                WriteStatic(2);
+                            }
+                        }
+
+                        public static void SetOutput(out int value)
+                        {
+                            value = 1;
+                        }
+
+                        public void DisposeBoxed(EffectSequence.Enumerator enumerator)
+                        {
+                            ((System.IDisposable)enumerator).Dispose();
+                        }
+
+                        public int ConditionalTryGet(
+                            System.Collections.Generic.Dictionary<int, int>? values,
+                            int key)
+                        {
+                            int result;
+                            return values?.TryGetValue(key, out result) == true ? result : 0;
+                        }
+
+                        public void RegisterType(
+                            System.Collections.Generic.Dictionary<int, System.Type> types,
+                            int key)
+                        {
+                            types[key] = typeof(BehaviorSample);
+                        }
+
+                        public int ReadMatrix(int[,] values)
+                        {
+                            return values[0, 0];
+                        }
+
+                        public void WriteMatrix(int[,] values, int input)
+                        {
+                            values[0, 0] = input;
+                        }
+
+                        public int[,] CreateMatrix()
+                        {
+                            return new int[2, 3];
+                        }
+
+                        public ref int MatrixAddress(int[,] values)
+                        {
+                            return ref values[0, 0];
+                        }
+
+                        public object[] CreateArray(int length)
+                        {
+                            return new object[length];
+                        }
+
+                        public System.Type ReadType()
+                        {
+                            return typeof(BehaviorSample);
+                        }
+
+                        public string ReturnText()
+                        {
+                            return "Foo";
+                        }
+
+                        public BehaviorSample EnsureChild()
+                        {
+                            return this.m_child ??= new BehaviorSample();
+                        }
+
+                        public void DeconstructWrite(
+                            BehaviorSample first,
+                            BehaviorSample second,
+                            int left,
+                            int right)
+                        {
+                            (first.m_value, second.m_value) = (left, right);
+                        }
+
+                        public BehaviorSample CreateInitialized(int input)
+                        {
+                            return new BehaviorSample { m_value = input };
+                        }
+
+                        public System.Collections.Generic.List<int> CreateCollection(int input)
+                        {
+                            return new System.Collections.Generic.List<int> { input };
+                        }
+
+                        public int[] CreateInitializedArray(int input)
+                        {
+                            return new[] { input };
+                        }
+
+                        public int ConditionalRead(BehaviorSample? target, int input)
+                        {
+                            return target?.Read(input) ?? input;
+                        }
+
+                        public void ConditionalCall(BehaviorSample? target)
+                        {
+                            target?.Apply();
+                        }
+
+                        public int ReadPropertyInCondition(BehaviorSample target)
+                        {
+                            return target.Value > 0 ? 1 : 0;
+                        }
+
+                        public bool IsBehavior(object value)
+                        {
+                            return value is BehaviorSample;
+                        }
+
+                        public void MatchBehavior(object value)
+                        {
+                            if (value is BehaviorSample sample)
+                            {
+                                sample.WriteField(1);
+                            }
+                        }
+
+                        public OperatorValue Add(OperatorValue left, OperatorValue right)
+                        {
+                            return left + right;
+                        }
+
+                        public void UseResource()
+                        {
+                            using (new EffectResource())
+                            {
+                            }
+                        }
+
+                        public void UseResourceDeclaration()
+                        {
+                            using EffectResource resource = new();
+                        }
+
+                        public void UseLock(object gate)
+                        {
+                            lock (gate)
+                            {
+                            }
+                        }
+
+                        public int UseSequence(EffectSequence sequence)
+                        {
+                            int total = 0;
+                            foreach (int item in sequence)
+                            {
+                                total += item;
+                            }
+
+                            return total;
+                        }
+
+                        public int UseArray(int[] values)
+                        {
+                            int total = 0;
+                            foreach (int item in values)
+                            {
+                                total += item;
+                            }
+
+                            return total;
+                        }
+
+                        public void MatchRecursive(object value)
+                        {
+                            if (value is BehaviorSample { Value: > 0 } sample)
+                            {
+                                sample.WriteField(1);
+                            }
+                        }
+
+                        public BehaviorSample ReturnOrThrow(
+                            BehaviorSample value,
+                            bool succeeds)
+                        {
+                            return succeeds ? value : throw new System.InvalidOperationException();
+                        }
+
+                        [System.Runtime.InteropServices.DllImport(
+                            "behavior-native",
+                            EntryPoint = "behavior_entry")]
+                        public static extern int Native(ref int value);
+                    }
+                }
+                """;
         }
 
         // 复制根响应文件以构造当前编译不唯一的工程。

@@ -7,11 +7,14 @@ namespace SetterChecker.Core
     /// </summary>
     public sealed class SetterChecker
     {
-        // 依次读取材料并建立函数总表。
+        // 建立材料和函数目录，并从 khengine 可报告函数开始读取行为。
         /// <summary>
         /// 运行当前已经完成的分析步骤。
         /// </summary>
-        public async Task<(MaterialSet Material, MethodCatalogResult Catalog)> AnalyzeAsync(
+        public async Task<(
+            MaterialSet Material,
+            MethodCatalogResult Catalog,
+            BehaviorReadResult Behaviors)> AnalyzeAsync(
             MaterialRequest request,
             CancellationToken cancellationToken = default)
         {
@@ -22,8 +25,14 @@ namespace SetterChecker.Core
                 material,
                 request.Jobs,
                 cancellationToken).ConfigureAwait(false);
+            BehaviorReadResult behaviors = await new BehaviorReader().ReadAsync(
+                material,
+                catalog,
+                catalog.Methods.Where(method => method.IsReportable).ToArray(),
+                request.Jobs,
+                cancellationToken).ConfigureAwait(false);
 
-            return (material, catalog);
+            return (material, catalog, behaviors);
         }
     }
 

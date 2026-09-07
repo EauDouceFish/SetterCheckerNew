@@ -521,7 +521,6 @@ namespace SetterChecker.Core
                 identity,
                 !target.IsStatic,
                 target.ReturnsVoid,
-                target.Parameters.Select(ReadSourceRefKind).ToArray(),
                 methodArguments,
                 TypeIdentityTemplate.NamedType(SourceNamedTypeDefinitionId(
                     target.ContainingType.OriginalDefinition,
@@ -1198,7 +1197,7 @@ namespace SetterChecker.Core
         }
 
         // 读取 Cecil 参数的引用传递方式。
-        private static CatalogRefKind ReadManagedRefKind(Cecil.ParameterDefinition parameter)
+        internal static CatalogRefKind ReadManagedRefKind(Cecil.ParameterDefinition parameter)
         {
             if (parameter.ParameterType is not Cecil.ByReferenceType)
             {
@@ -1601,7 +1600,6 @@ namespace SetterChecker.Core
         MethodIdentityTemplate Identity,
         bool HasInstance,
         bool ReturnsVoid,
-        IReadOnlyList<CatalogRefKind> ParameterRefKinds,
         IReadOnlyList<TypeIdentityTemplate> GenericArguments,
         TypeIdentityTemplate DeclaringTypeDefinition,
         IReadOnlyList<TypeIdentityTemplate> DeclaringTypeArguments,
@@ -1961,39 +1959,7 @@ namespace SetterChecker.Core
             System.Reflection.AssemblyName identity,
             string referringAssemblyPath)
         {
-            string assemblyName = identity.Name
-                ?? throw new AnalysisException("程序集引用没有名称。");
-            string siblingPath = Path.Combine(
-                Path.GetDirectoryName(referringAssemblyPath)!,
-                $"{assemblyName}.dll");
-            string[] candidates = this.m_lookupPathsByAssemblyName.TryGetValue(
-                    assemblyName,
-                    out IReadOnlyList<string>? knownPaths)
-                ? knownPaths.Where(path => MatchesAssemblyIdentity(path, identity)).ToArray()
-                : Array.Empty<string>();
-            if (File.Exists(siblingPath) && MatchesAssemblyIdentity(siblingPath, identity))
-            {
-                candidates = candidates.Append(Path.GetFullPath(siblingPath))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToArray();
-            }
-
-            string[] localCandidates = candidates.Where(path => string.Equals(
-                    Path.GetDirectoryName(path),
-                    Path.GetDirectoryName(referringAssemblyPath),
-                    StringComparison.OrdinalIgnoreCase))
-                .ToArray();
-            string path = localCandidates.Length == 1
-                ? localCandidates[0]
-                : candidates.Length switch
-                {
-                    1 => candidates[0],
-                    0 => throw new AnalysisException(
-                        $"托管程序集依赖不存在：{referringAssemblyPath} => {identity.FullName}"),
-                    _ => throw new AnalysisException(
-                        $"托管程序集依赖不唯一：{referringAssemblyPath} => {identity.FullName}："
-                            + string.Join("; ", candidates)),
-                };
+            string path = ResolveAssemblyPath(identity, referringAssemblyPath);
             lock (this.m_loadedTypeLock)
             {
                 if (!this.m_loadedPartsByPath.TryGetValue(
@@ -2035,6 +2001,46 @@ namespace SetterChecker.Core
 
                 return part.Types;
             }
+        }
+
+        // 为函数总表与函数体读取共用同一套完整程序集身份定位规则。
+        internal string ResolveAssemblyPath(
+            System.Reflection.AssemblyName identity,
+            string referringAssemblyPath)
+        {
+            string assemblyName = identity.Name
+                ?? throw new AnalysisException("程序集引用没有名称。");
+            string siblingPath = Path.Combine(
+                Path.GetDirectoryName(referringAssemblyPath)!,
+                $"{assemblyName}.dll");
+            string[] candidates = this.m_lookupPathsByAssemblyName.TryGetValue(
+                    assemblyName,
+                    out IReadOnlyList<string>? knownPaths)
+                ? knownPaths.Where(path => MatchesAssemblyIdentity(path, identity)).ToArray()
+                : Array.Empty<string>();
+            if (File.Exists(siblingPath) && MatchesAssemblyIdentity(siblingPath, identity))
+            {
+                candidates = candidates.Append(Path.GetFullPath(siblingPath))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+            }
+
+            string[] localCandidates = candidates.Where(path => string.Equals(
+                    Path.GetDirectoryName(path),
+                    Path.GetDirectoryName(referringAssemblyPath),
+                    StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            return localCandidates.Length == 1
+                ? localCandidates[0]
+                : candidates.Length switch
+                {
+                    1 => candidates[0],
+                    0 => throw new AnalysisException(
+                        $"托管程序集依赖不存在：{referringAssemblyPath} => {identity.FullName}"),
+                    _ => throw new AnalysisException(
+                        $"托管程序集依赖不唯一：{referringAssemblyPath} => {identity.FullName}："
+                            + string.Join("; ", candidates)),
+                };
         }
 
         // 核对候选文件与调用点记录的完整程序集身份。
@@ -2178,20 +2184,10 @@ namespace SetterChecker.Core
                 ? generic.GenericArguments.Select(argument =>
                     MethodCatalog.ManagedTypeIdentity(argument, this.m_assemblyNames)).ToArray()
                 : Array.Empty<TypeIdentityTemplate>();
-            Cecil.MethodReference element = method.GetElementMethod();
-
             return new ManagedMethodReferenceInfo(
                 identity,
                 method.HasThis,
                 identity.ReturnType.Text == "System.Void",
-                element.Parameters.Select(parameter =>
-                    parameter.ParameterType is Cecil.ByReferenceType
-                        ? parameter.IsOut
-                            ? CatalogRefKind.Out
-                            : parameter.IsIn
-                                ? CatalogRefKind.In
-                                : CatalogRefKind.Ref
-                        : CatalogRefKind.None).ToArray(),
                 genericArguments,
                 TypeIdentityTemplate.NamedType(MethodCatalog.ManagedNamedTypeDefinitionId(
                     MethodCatalog.ManagedNamedTypeElement(method.DeclaringType),
