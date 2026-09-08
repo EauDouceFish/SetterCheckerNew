@@ -710,6 +710,96 @@ namespace SetterChecker.Core.Tests
             StringAssert.Contains(exception.Message, secondResponsePath);
         }
 
+        // 验证保留两次构建材料时，以 Unity 实际使用的构建记录选择当前参数。
+        /// <summary>复刻 khengine 同时保留普通和调试构建的情况，不按修改时间猜选。</summary>
+        [TestMethod]
+        public async Task LoadAsyncSelectsRecordedUnityBuildWhenOldArtifactsRemain()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            string second = project.CopyRootResponseToSecondBuild();
+            File.AppendAllText(second, Environment.NewLine + "/define:CURRENT_BUILD" + Environment.NewLine);
+            File.SetLastWriteTimeUtc(project.RootResponsePath, DateTime.UtcNow.AddHours(1));
+            string build = Path.GetFileName(Path.GetDirectoryName(second)!);
+            File.WriteAllText(Path.Combine(project.RootPath, "Library", "Bee", build), "test graph");
+            File.WriteAllText(Path.Combine(project.RootPath, "Library", "Bee", "tundra.log.json"),
+                System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    msg = "init",
+                    dagFile = "Library/Bee/" + build,
+                    targets = new[] { "ScriptAssemblies" },
+                }) + Environment.NewLine);
+
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+
+            SourceAssemblyMaterial root = material.SourceAssemblies.Single(source => source.IsReportAssembly);
+            var options = (Microsoft.CodeAnalysis.CSharp.CSharpParseOptions)root.Compilation.SyntaxTrees.First().Options;
+            CollectionAssert.Contains(options.PreprocessorSymbolNames.ToArray(), "CURRENT_BUILD");
+        }
+
+        // 验证当前构建缺材料时，不拿唯一残留的旧编译参数继续分析。
+        /// <summary>当前记录优先于旧文件，非脚本构建记录也不能猜成有效输入。</summary>
+        [TestMethod]
+        [DataRow("ScriptAssemblies", "当前构建缺少响应文件")]
+        [DataRow("Player", "不是脚本程序集构建")]
+        public async Task LoadAsyncRejectsUnusableRecordedBuildWithoutSelectingOldResponse(string target, string message)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            File.WriteAllText(Path.Combine(project.RootPath, "Library", "Bee", "missing.dag"), "test graph");
+            File.WriteAllText(Path.Combine(project.RootPath, "Library", "Bee", "tundra.log.json"),
+                System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    msg = "init",
+                    dagFile = "Library/Bee/missing.dag",
+                    targets = new[] { target },
+                }) + Environment.NewLine);
+
+            AnalysisException error = await Assert.ThrowsAsync<AnalysisException>(() =>
+                new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2)));
+
+            StringAssert.Contains(error.Message, message);
+            StringAssert.Contains(error.Message, "tundra.log.json");
+        }
+
+        // 验证残留参数和日志不能替代已经缺失的当前构建图。
+        /// <summary>已删除的构建图不再提供有效材料选择证据。</summary>
+        [TestMethod]
+        public async Task LoadAsyncRejectsRecordedBuildWithoutItsGraph()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            string graph = "Library/Bee/" + Path.GetFileName(Path.GetDirectoryName(project.RootResponsePath)!);
+            File.WriteAllText(Path.Combine(project.RootPath, "Library", "Bee", "tundra.log.json"),
+                System.Text.Json.JsonSerializer.Serialize(new { msg = "init", dagFile = graph, targets = new[] { "ScriptAssemblies" } }));
+
+            AnalysisException error = await Assert.ThrowsAsync<AnalysisException>(() =>
+                new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2)));
+
+            StringAssert.Contains(error.Message, "构建图不存在");
+            StringAssert.Contains(error.Message, "tundra.log.json");
+        }
+
+        // 验证不完整或格式错误的 Unity 记录能直接定位文件，而不是继续选旧材料。
+        /// <summary>所有缺失字段及类型错误均作为输入错误停止分析。</summary>
+        [TestMethod]
+        [DataRow("")]
+        [DataRow("{")]
+        [DataRow("[]")]
+        [DataRow("{}")]
+        [DataRow("{\"msg\":0,\"dagFile\":\"x\",\"targets\":[\"ScriptAssemblies\"]}")]
+        [DataRow("{\"msg\":\"init\",\"targets\":[\"ScriptAssemblies\"]}")]
+        [DataRow("{\"msg\":\"init\",\"dagFile\":0,\"targets\":[\"ScriptAssemblies\"]}")]
+        [DataRow("{\"msg\":\"init\",\"dagFile\":\"x\",\"targets\":\"ScriptAssemblies\"}")]
+        public async Task LoadAsyncReportsInvalidBuildHeaderWithItsPath(string header)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            string log = Path.Combine(project.RootPath, "Library", "Bee", "tundra.log.json");
+            File.WriteAllText(log, header);
+
+            AnalysisException error = await Assert.ThrowsAsync<AnalysisException>(() =>
+                new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2)));
+
+            StringAssert.Contains(error.Message, log);
+        }
+
         // 检查外部文件缺失时错误直接指向原路径。
         /// <summary>
         /// 验证响应文件声明的外部编译文件缺失时停止。

@@ -1074,6 +1074,43 @@ namespace SetterChecker.Core
                 .Order(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
+            string buildLogPath = Path.Combine(projectRoot, "Library", "Bee", "tundra.log.json");
+            if (File.Exists(buildLogPath))
+            {
+                using JsonDocument buildLog = ReadBuildLogHeader(buildLogPath);
+                JsonElement initialization = buildLog.RootElement;
+                if (initialization.ValueKind != JsonValueKind.Object
+                    || !initialization.TryGetProperty("msg", out JsonElement message) || message.ValueKind != JsonValueKind.String
+                    || !initialization.TryGetProperty("dagFile", out JsonElement graph) || graph.ValueKind != JsonValueKind.String
+                    || string.IsNullOrWhiteSpace(graph.GetString())
+                    || !initialization.TryGetProperty("targets", out JsonElement targets) || targets.ValueKind != JsonValueKind.Array
+                    || targets.EnumerateArray().Any(target => target.ValueKind != JsonValueKind.String))
+                {
+                    throw new AnalysisException($"Unity 构建记录首行缺少有效的 msg、dagFile 或 targets：{buildLogPath}");
+                }
+                if (message.GetString() != "init"
+                    || !targets.EnumerateArray()
+                        .Any(target => target.GetString() == "ScriptAssemblies"))
+                {
+                    throw new AnalysisException($"Unity 当前构建记录不是脚本程序集构建：{buildLogPath}");
+                }
+
+                string graphPath = Path.GetFullPath(Path.Combine(projectRoot, graph.GetString()!));
+                if (!string.Equals(Path.GetDirectoryName(graphPath), Path.GetDirectoryName(buildLogPath),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new AnalysisException($"Unity 构建图不在当前项目的 Bee 目录：{graphPath}");
+                }
+                if (!File.Exists(graphPath))
+                {
+                    throw new AnalysisException($"Unity 当前构建图不存在：{graphPath}；构建记录：{buildLogPath}");
+                }
+
+                string recordedResponse = Path.Combine(artifactsPath, Path.GetFileName(graphPath), $"{assemblyName}.rsp");
+                return candidates.SingleOrDefault(path => string.Equals(path, recordedResponse, StringComparison.OrdinalIgnoreCase))
+                    ?? throw new AnalysisException($"Unity 当前构建缺少响应文件：{recordedResponse}；构建记录：{buildLogPath}");
+            }
+
             return candidates.Length switch
             {
                 1 => candidates[0],
@@ -1082,6 +1119,19 @@ namespace SetterChecker.Core
                 _ => throw new AnalysisException(
                     $"找到多份 {assemblyName} 编译响应文件：{string.Join("; ", candidates)}"),
             };
+        }
+
+        // 读取当前构建记录的首行，格式错误时保留确切文件位置并停止。
+        private static JsonDocument ReadBuildLogHeader(string path)
+        {
+            try
+            {
+                return JsonDocument.Parse(File.ReadLines(path).FirstOrDefault() ?? string.Empty);
+            }
+            catch (JsonException exception)
+            {
+                throw new AnalysisException($"Unity 构建记录首行不是完整 JSON：{path}；{exception.Message}");
+            }
         }
 
         // 沿 Unity 生成的参考文件读取全部源码程序集响应文件。

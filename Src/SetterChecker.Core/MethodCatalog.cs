@@ -520,13 +520,18 @@ namespace SetterChecker.Core
                 or CatalogMethodKind.EventRemover
                 or CatalogMethodKind.Operator
                 or CatalogMethodKind.Conversion;
+            string namespaceName = method.ContainingNamespace.ToDisplayString();
 
             return context.Material.IsReportAssembly
                 && sourcePath != null
                 && context.ReportablePaths.Contains(sourcePath)
                 && allowedKind
                 && !method.IsAbstract
+                && !method.IsExtern
                 && !method.IsImplicitlyDeclared
+                && namespaceName != "Tss"
+                && namespaceName != "UnityEngine"
+                && !namespaceName.StartsWith("UnityEngine.", StringComparison.Ordinal)
                 && method.ContainingType.TypeKind is TypeKind.Class or TypeKind.Struct
                 && method.MetadataName != "getInstance"
                 && !method.MetadataName.StartsWith("BaseProxy_", StringComparison.Ordinal)

@@ -8,6 +8,74 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class MethodCatalogTests
     {
+        // 验证日志排除范围按真实命名空间匹配，不误伤相似名称和普通嵌套类型。
+        /// <summary>复刻两个日志注入器共同排除的 Tss 与 UnityEngine 范围。</summary>
+        [TestMethod]
+        public async Task BuildAsyncMatchesLogNamespaceExclusionsWithoutGuessingTypeNames()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                namespace Tss { public class Item { public void Run() { } public class Nested { public void Run() { } } } }
+                namespace Tss.Child { public class Item { public void Run() { } } }
+                namespace UnityEngine { public class Item { public void Run() { } public class Nested { public void Run() { } } } }
+                namespace UnityEngine.Child { public class Item { public void Run() { } } }
+                namespace MyUnityEngine { public class Item { public void Run() { } } }
+                namespace Other.UnityEngine { public class Item { public void Run() { } } }
+                namespace OtherTypes
+                {
+                    public class UnityEngine { public void Run() { } public class Nested { public void Run() { } } }
+                    public class Tss { public void Run() { } public class Nested { public void Run() { } } }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] methods = catalog.Methods.Where(method => method.Name == "Run").ToArray();
+
+            Assert.HasCount(12, methods);
+            CollectionAssert.AreEquivalent(new[]
+            {
+                "Tss.Child.Item", "MyUnityEngine.Item", "Other.UnityEngine.Item",
+                "OtherTypes.UnityEngine", "OtherTypes.UnityEngine.Nested", "OtherTypes.Tss", "OtherTypes.Tss.Nested",
+            }, methods.Where(method => method.IsReportable).Select(method => method.TypeName).ToArray());
+        }
+
+        // 验证日志不能注入的外部声明不进入标签统计，但仍保留供调用分析。
+        /// <summary>复刻 AIService 外部声明和托管包装，二者不能一起排除。</summary>
+        [TestMethod]
+        public async Task BuildAsyncExcludesBodylessDeclarationsButKeepsTheirCallers()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                using System.Runtime.CompilerServices;
+                using System.Runtime.InteropServices;
+                public static class Service
+                {
+                    [DllImport("SampleNative", EntryPoint = "Update")]
+                    public static extern int Native(int value);
+                    [MethodImpl(MethodImplOptions.InternalCall)]
+                    public static extern int Runtime(int value);
+                    public static int Update(int value) => Native(value);
+                    public static int Read(int value) => Runtime(value);
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] methods = catalog.Methods.Where(method => method.TypeName == "Service").ToArray();
+
+            CollectionAssert.AreEquivalent(new[] { "Read", "Update" },
+                methods.Where(method => method.IsReportable).Select(method => method.Name).ToArray());
+            Assert.HasCount(4, methods);
+            BehaviorReadResult behaviors = await new BehaviorReader().ReadAsync(material, catalog, methods, 2);
+            Assert.AreEqual(MethodBodyKind.PlatformInvocation,
+                behaviors.MethodsById[methods.Single(method => method.Name == "Native").Id].BodyKind);
+            Assert.AreEqual(MethodBodyKind.RuntimeImplementation,
+                behaviors.MethodsById[methods.Single(method => method.Name == "Runtime").Id].BodyKind);
+            foreach (string caller in new[] { "Read", "Update" })
+            {
+                Assert.HasCount(1, behaviors.MethodsById[methods.Single(method => method.Name == caller).Id].Calls);
+            }
+        }
+
         // 验证真实方法实现表指定了接口成员时，公开同名方法不再占用该接口关系。
         /// <summary>
         /// 源码和 DLL 的类、结构体均按同一条显式接口优先规则建表。
