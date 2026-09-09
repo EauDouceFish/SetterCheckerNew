@@ -23,6 +23,15 @@ namespace SetterChecker.Core
             int jobs,
             CancellationToken cancellationToken = default)
         {
+            BehaviorReadResult result = await ReadAvailableAsync(material, catalog, methods, jobs, cancellationToken).ConfigureAwait(false);
+            string? failure = result.Methods.Select(method => method.Failure).FirstOrDefault(message => message != null);
+            return failure == null ? result : throw new AnalysisException(failure);
+        }
+
+        // 逐方法保存读取失败，不丢弃同批成功事实；调用方必须继续保留失败状态。
+        internal async Task<BehaviorReadResult> ReadAvailableAsync(MaterialSet material, MethodCatalogResult catalog,
+            IReadOnlyList<MethodEntry> methods, int jobs, CancellationToken cancellationToken)
+        {
             if (jobs <= 0)
             {
                 throw new AnalysisException("工作数量必须是正整数。");
@@ -102,15 +111,21 @@ namespace SetterChecker.Core
                 throw new AnalysisException($"托管函数与真实程序集不一致：{assemblyPath}");
             }
 
-            return methods.Select(method => ReadManagedBehavior(
-                    module,
-                    catalog,
-                    method))
-                .ToArray();
+            return methods.Select(method =>
+            {
+                try
+                {
+                    return ReadManagedBehavior(module, catalog, method);
+                }
+                catch (AnalysisException exception)
+                {
+                    return MethodBehavior.Empty(method.Id, MethodBodyKind.ReadFailure) with { Failure = exception.Message };
+                }
+            }).ToArray();
         }
 
         // 按一个确定的函数定义标记读取函数体或明确的无托管体边界。
-        private static MethodBehavior ReadManagedBehavior(
+        internal static MethodBehavior ReadManagedBehavior(
             Cecil.ModuleDefinition module,
             MethodCatalogResult catalog,
             MethodEntry method)
@@ -150,7 +165,7 @@ namespace SetterChecker.Core
                 throw new AnalysisException($"托管函数没有函数体也没有原生标记：{method.Id}");
             }
 
-            return new ManagedBehaviorBuilder(catalog, method).Read(definition.Body);
+            return new ManagedBehaviorBuilder(catalog, method, module.TypeSystem).Read(definition.Body);
         }
 
         /// <summary>
@@ -167,6 +182,7 @@ namespace SetterChecker.Core
         {
             private readonly MethodCatalogResult m_catalog;
             private readonly MethodEntry m_method;
+            private readonly Cecil.TypeSystem m_typeSystem;
             private readonly List<BehaviorValue> m_values = new();
             private readonly Dictionary<int, BehaviorAssignment> m_assignments = new();
             private readonly Dictionary<int, BehaviorWrite> m_writes = new();
@@ -177,6 +193,7 @@ namespace SetterChecker.Core
             private readonly Dictionary<int, int> m_instructionValueIds = new();
             private readonly Dictionary<(int Offset, int Index), int> m_mergeValueIds = new();
             private readonly Dictionary<int, int[]> m_incomingStacks = new();
+            private readonly Dictionary<Cecil.TypeReference, BehaviorTypeReference> m_typeReferences = new();
             private readonly Stack<int> m_stack = new();
             private int m_currentOffset;
             private int m_currentOrder;
@@ -184,10 +201,12 @@ namespace SetterChecker.Core
             // 保存当前托管文件和函数信息。
             public ManagedBehaviorBuilder(
                 MethodCatalogResult catalog,
-                MethodEntry method)
+                MethodEntry method,
+                Cecil.TypeSystem typeSystem)
             {
                 this.m_catalog = catalog;
                 this.m_method = method;
+                this.m_typeSystem = typeSystem;
             }
 
             // 沿所有实际控制流路径读取函数体并在路径汇合处合并值来源。
@@ -198,6 +217,19 @@ namespace SetterChecker.Core
                 IReadOnlyDictionary<int, Cil.Instruction> instructionsByOffset = instructions
                     .ToDictionary(instruction => instruction.Offset);
                 Queue<int> pending = new();
+                foreach (Cil.VariableDefinition variable in body.Variables)
+                {
+                    Cecil.TypeReference type = variable.VariableType;
+                    while (type is Cecil.PinnedType or Cecil.IModifierType)
+                    {
+                        type = ((Cecil.TypeSpecification)type).ElementType;
+                    }
+                    if (type.IsByReference)
+                    {
+                        int slot = GetLocalValueId(variable.Index);
+                        this.m_values[slot] = this.m_values[slot] with { IsManagedReferenceSlot = true };
+                    }
+                }
 
                 if (instructions.Length == 0)
                 {
@@ -211,6 +243,15 @@ namespace SetterChecker.Core
                         or Cil.ExceptionHandlerType.Filter
                         ? new[] { AddRootValue(BehaviorValueKind.Exception, "exception") }
                         : Array.Empty<int>();
+                    if (handlerStack.Length != 0)
+                    {
+                        int exceptionId = handlerStack[0];
+                        this.m_values[exceptionId] = this.m_values[exceptionId] with
+                        {
+                            Point = new BehaviorFlowPoint(handler.HandlerStart.Offset, 0),
+                            Type = handler.CatchType == null ? null : ReadTypeReference(handler.CatchType),
+                        };
+                    }
                     AddIncomingStack(handler.HandlerStart.Offset, handlerStack, pending);
                     if (handler.HandlerType == Cil.ExceptionHandlerType.Filter)
                     {
@@ -250,518 +291,130 @@ namespace SetterChecker.Core
                     this.m_writes.Values.OrderBy(item => item.Position).ToArray(),
                     this.m_calls.Values.OrderBy(item => item.Position).ToArray(),
                     this.m_returns.Values.OrderBy(item => item.Position).ToArray(),
-                    blocks: flow.Blocks,
-                    regions: flow.Regions);
+                    flow.Blocks,
+                    flow.Handlers)
+                {
+                    TypeUses = instructions.Where(instruction => this.m_incomingStacks.ContainsKey(instruction.Offset))
+                        .SelectMany(instruction => ReadObservedTypes(instruction).Select(type =>
+                            new BehaviorTypeUse(ReadTypeReference(type), instruction.Offset, instruction.OpCode.Name))).ToArray(),
+                };
             }
 
-            // 把 Cecil 函数体转换为不依赖求值栈的控制流块和区域。
+            // 读取指令直接使用或通过反射成员标记暴露的类型，普通传递不算观察类型。
+            private static IEnumerable<Cecil.TypeReference> ReadObservedTypes(Cil.Instruction instruction)
+            {
+                if (instruction.Operand is Cecil.TypeReference type)
+                {
+                    yield return type;
+                }
+                else if (instruction.OpCode == Cil.OpCodes.Ldtoken && instruction.Operand is Cecil.MemberReference member)
+                {
+                    // 字段的类型参数只能来自所属类型；这里保留所属类型的实际构造参数。
+                    yield return member.DeclaringType;
+                    if (member is Cecil.GenericInstanceMethod method)
+                    {
+                        foreach (Cecil.TypeReference argument in method.GenericArguments)
+                        {
+                            yield return argument;
+                        }
+                    }
+                }
+            }
+
+            // 按托管指令建立控制流块，并保留原始异常处理表。
             private (IReadOnlyList<BehaviorFlowBlock> Blocks,
-                IReadOnlyList<BehaviorFlowRegion> Regions) ReadManagedControlFlow(
+                IReadOnlyList<BehaviorExceptionHandler> Handlers) ReadManagedControlFlow(
                 Cil.MethodBody body,
                 IReadOnlySet<int> reachableOffsets)
             {
-                Cil.Instruction[] instructions = body.Instructions.ToArray();
-                IReadOnlyList<ManagedFlowRegionDraft> regionDrafts = ReadManagedFlowRegions(body);
-                int exitBlockId = body.CodeSize;
-                List<BehaviorFlowBlock> instructionBlocks = new(instructions.Length);
-
-                foreach (Cil.Instruction instruction in instructions)
-                {
-                    instructionBlocks.Add(new BehaviorFlowBlock(
-                        instruction.Offset,
-                        BehaviorFlowBlockKind.Block,
-                        reachableOffsets.Contains(instruction.Offset),
-                        ReadManagedRegionChain(
-                            instruction.Offset,
-                            exitBlockId,
-                            regionDrafts)[^1].Id,
-                        ReadManagedFlowEdges(
-                            instruction,
-                            body,
-                            exitBlockId,
-                            regionDrafts)));
-                }
-
-                int entryTargetId = instructions.Length == 0
-                    ? exitBlockId
-                    : instructions[0].Offset;
-                BehaviorFlowBlock entry = new(
-                    -1,
-                    BehaviorFlowBlockKind.Entry,
-                    true,
-                    regionDrafts[0].Id,
-                    new[]
-                    {
-                        CreateManagedFlowEdge(
-                            -1,
-                            entryTargetId,
-                            false,
-                            BehaviorFlowBranchSemantics.Regular,
-                            false,
-                            body,
-                            exitBlockId,
-                            regionDrafts),
-                    });
-                bool exitIsReachable = instructions.Length == 0
-                    || instructionBlocks.Any(block => block.IsReachable
-                        && block.Successors.Any(edge => edge.TargetBlockId == exitBlockId));
-                BehaviorFlowBlock exit = new(
-                    exitBlockId,
-                    BehaviorFlowBlockKind.Exit,
-                    exitIsReachable,
-                    regionDrafts[0].Id,
-                    Array.Empty<BehaviorFlowEdge>());
-                BehaviorFlowBlock[] blocks = instructionBlocks
-                    .Prepend(entry)
-                    .Append(exit)
-                    .ToArray();
-                BehaviorFlowRegion[] regions = regionDrafts.Select(region =>
-                    new BehaviorFlowRegion(
-                        region.Id,
-                        region.Kind,
-                        region.Parent?.Id,
-                        region.Kind == BehaviorFlowRegionKind.Root
-                            ? -1
-                            : instructions.First(instruction => region.Contains(instruction.Offset)).Offset,
-                        region.Kind == BehaviorFlowRegionKind.Root
-                            ? exitBlockId
-                            : instructions.Last(instruction => region.Contains(instruction.Offset)).Offset,
-                        region.ExceptionType))
-                    .ToArray();
-
-                return (blocks, regions);
-            }
-
-            // 按异常处理表的真实区间建立与 Roslyn 对应的区域树。
-            private IReadOnlyList<ManagedFlowRegionDraft> ReadManagedFlowRegions(
-                Cil.MethodBody body)
-            {
-                ManagedFlowRegionDraft root = new(
-                    0,
-                    BehaviorFlowRegionKind.Root,
-                    -1,
-                    body.CodeSize + 1,
-                    null,
-                    null);
-                List<ManagedFlowRegionDraft> regions = new() { root };
-                IEnumerable<IGrouping<(int TryStart, int TryEnd, bool IsCatch),
-                    Cil.ExceptionHandler>> groups = body.ExceptionHandlers.GroupBy(handler => (
+                BehaviorExceptionHandler[] handlers = body.ExceptionHandlers.Select(handler =>
+                    new BehaviorExceptionHandler(
+                        handler.HandlerType switch
+                        {
+                            Cil.ExceptionHandlerType.Catch => BehaviorExceptionHandlerKind.Catch,
+                            Cil.ExceptionHandlerType.Filter => BehaviorExceptionHandlerKind.Filter,
+                            Cil.ExceptionHandlerType.Finally => BehaviorExceptionHandlerKind.Finally,
+                            Cil.ExceptionHandlerType.Fault => BehaviorExceptionHandlerKind.Fault,
+                            _ => throw new AnalysisException($"不支持的 Cecil 异常处理类型：{handler.HandlerType}"),
+                        },
                         handler.TryStart.Offset,
-                        ReadManagedRegionEnd(handler.TryEnd, body.CodeSize),
-                        handler.HandlerType is Cil.ExceptionHandlerType.Catch
-                            or Cil.ExceptionHandlerType.Filter));
-
-                foreach (IGrouping<(int TryStart, int TryEnd, bool IsCatch),
-                             Cil.ExceptionHandler> group in groups
-                             .OrderBy(item => item.Key.TryStart)
-                             .ThenByDescending(item => item.Key.TryEnd)
-                             .ThenByDescending(item => item.Key.IsCatch))
-                {
-                    Cil.ExceptionHandler[] handlers = group
-                        .OrderBy(handler => handler.FilterStart?.Offset
-                            ?? handler.HandlerStart.Offset)
-                        .ThenBy(handler => handler.HandlerStart.Offset)
-                        .ToArray();
-                    ManagedFlowRegionDraft composite = new(
-                        regions.Count,
-                        group.Key.IsCatch
-                            ? BehaviorFlowRegionKind.TryAndCatch
-                            : BehaviorFlowRegionKind.TryAndFinally,
-                        group.Key.TryStart,
-                        handlers.Max(handler => ReadManagedRegionEnd(
-                            handler.HandlerEnd,
-                            body.CodeSize)),
-                        null,
-                        null);
-                    ManagedFlowRegionDraft tryRegion = new(
-                        regions.Count + 1,
-                        BehaviorFlowRegionKind.Try,
-                        group.Key.TryStart,
-                        group.Key.TryEnd,
-                        null,
-                        null)
-                    {
-                        Parent = composite,
-                    };
-                    regions.Add(composite);
-                    regions.Add(tryRegion);
-
-                    foreach (Cil.ExceptionHandler handler in handlers)
-                    {
-                        AddManagedHandlerRegions(body, handler, composite, regions);
-                    }
-                }
-
-                foreach (ManagedFlowRegionDraft composite in regions.Where(region =>
-                             region.Parent == null && region != root))
-                {
-                    ManagedFlowRegionDraft? parent = regions.Where(region =>
-                            region != composite
-                            && region.Kind is BehaviorFlowRegionKind.Try
-                                or BehaviorFlowRegionKind.Filter
-                                or BehaviorFlowRegionKind.Catch
-                                or BehaviorFlowRegionKind.Finally
-                                or BehaviorFlowRegionKind.Fault
-                            && region.Contains(composite))
-                        .OrderBy(region => region.EndOffset - region.StartOffset)
-                        .ThenBy(region => region.CreationOrder)
-                        .FirstOrDefault();
-                    composite.Parent = parent ?? root;
-                }
-
-                List<ManagedFlowRegionDraft> ordered = new(regions.Count);
-                AppendManagedFlowRegions(root, regions, ordered);
-
-                return ordered;
-            }
-
-            // 把一条 catch、filter、finally 或 fault 子句加入区域树。
-            private void AddManagedHandlerRegions(
-                Cil.MethodBody body,
-                Cil.ExceptionHandler handler,
-                ManagedFlowRegionDraft composite,
-                ICollection<ManagedFlowRegionDraft> regions)
-            {
-                int handlerEnd = ReadManagedRegionEnd(handler.HandlerEnd, body.CodeSize);
-                if (handler.HandlerType == Cil.ExceptionHandlerType.Filter)
-                {
-                    int filterStart = handler.FilterStart?.Offset
-                        ?? throw new AnalysisException(
-                            $"筛选异常处理器缺少入口：{this.m_method.Id}");
-                    ManagedFlowRegionDraft filterAndHandler = new(
-                        regions.Count,
-                        BehaviorFlowRegionKind.FilterAndHandler,
-                        filterStart,
-                        handlerEnd,
-                        null,
-                        handler)
-                    {
-                        Parent = composite,
-                    };
-                    ManagedFlowRegionDraft filter = new(
-                        regions.Count + 1,
-                        BehaviorFlowRegionKind.Filter,
-                        filterStart,
+                        handler.TryEnd?.Offset ?? body.CodeSize,
                         handler.HandlerStart.Offset,
-                        null,
-                        handler)
-                    {
-                        Parent = filterAndHandler,
-                    };
-                    ManagedFlowRegionDraft catchRegion = new(
-                        regions.Count + 2,
-                        BehaviorFlowRegionKind.Catch,
-                        handler.HandlerStart.Offset,
-                        handlerEnd,
-                        null,
-                        handler)
-                    {
-                        Parent = filterAndHandler,
-                    };
-                    regions.Add(filterAndHandler);
-                    regions.Add(filter);
-                    regions.Add(catchRegion);
+                        handler.HandlerEnd?.Offset ?? body.CodeSize,
+                        handler.FilterStart?.Offset,
+                        handler.CatchType == null ? null : ReadTypeReference(handler.CatchType))).ToArray();
+                BehaviorFlowBlock[] instructionBlocks = body.Instructions.Select(instruction =>
+                    new BehaviorFlowBlock(instruction.Offset, BehaviorFlowBlockKind.Block,
+                        reachableOffsets.Contains(instruction.Offset),
+                        ReadManagedFlowEdges(instruction, body.CodeSize, handlers),
+                        instruction.OpCode.FlowControl == Cil.FlowControl.Cond_Branch && instruction.Operand is Cil.Instruction
+                            && this.m_instructionValueIds.TryGetValue(instruction.Offset, out int condition) ? condition : null,
+                        instruction.Operand is Cil.Instruction target ? target.Offset : null)).ToArray();
+                int entryTarget = body.Instructions.Count == 0 ? body.CodeSize : body.Instructions[0].Offset;
+                BehaviorFlowBlock entry = new(-1, BehaviorFlowBlockKind.Entry, true,
+                    new[] { new BehaviorFlowEdge(entryTarget, false, BehaviorFlowBranchSemantics.Regular, Array.Empty<int>()) });
+                bool exitReachable = instructionBlocks.Length == 0 || instructionBlocks.Any(block =>
+                    block.IsReachable && block.Successors.Any(edge => edge.TargetBlockId == body.CodeSize));
+                BehaviorFlowBlock exit = new(body.CodeSize, BehaviorFlowBlockKind.Exit, exitReachable, Array.Empty<BehaviorFlowEdge>());
 
-                    return;
-                }
-
-                BehaviorFlowRegionKind kind = handler.HandlerType switch
-                {
-                    Cil.ExceptionHandlerType.Catch => BehaviorFlowRegionKind.Catch,
-                    Cil.ExceptionHandlerType.Finally => BehaviorFlowRegionKind.Finally,
-                    Cil.ExceptionHandlerType.Fault => BehaviorFlowRegionKind.Fault,
-                    _ => throw new AnalysisException(
-                        $"不支持的 Cecil 异常处理类型：{handler.HandlerType}"),
-                };
-                BehaviorTypeReference? exceptionType = handler.HandlerType
-                        == Cil.ExceptionHandlerType.Catch
-                    && handler.CatchType != null
-                        ? ReadTypeReference(handler.CatchType)
-                        : null;
-                ManagedFlowRegionDraft region = new(
-                    regions.Count,
-                    kind,
-                    handler.HandlerStart.Offset,
-                    handlerEnd,
-                    exceptionType,
-                    handler)
-                {
-                    Parent = composite,
-                };
-                regions.Add(region);
+                return (instructionBlocks.Prepend(entry).Append(exit).ToArray(), handlers);
             }
 
-            // 按父子关系稳定分配区域编号。
-            private static void AppendManagedFlowRegions(
-                ManagedFlowRegionDraft current,
-                IReadOnlyList<ManagedFlowRegionDraft> regions,
-                ICollection<ManagedFlowRegionDraft> ordered)
-            {
-                current.Id = ordered.Count;
-                ordered.Add(current);
-                foreach (ManagedFlowRegionDraft child in regions.Where(region =>
-                             region.Parent == current)
-                             .OrderBy(region => region.StartOffset)
-                             .ThenByDescending(region => region.EndOffset)
-                             .ThenBy(region => region.CreationOrder))
-                {
-                    AppendManagedFlowRegions(child, regions, ordered);
-                }
-            }
-
-            // 读取一条指令的明确跳转、顺序或结束边。
+            // 直接保存指令跳转和离开 try 时必须执行的 finally 入口，不另建区域树。
             private static IReadOnlyList<BehaviorFlowEdge> ReadManagedFlowEdges(
                 Cil.Instruction instruction,
-                Cil.MethodBody body,
                 int exitBlockId,
-                IReadOnlyList<ManagedFlowRegionDraft> regions)
+                IReadOnlyList<BehaviorExceptionHandler> handlers)
             {
-                // 使用当前指令和函数体的固定信息建立一条边。
-                BehaviorFlowEdge Edge(
-                    int? targetBlockId,
-                    BehaviorFlowBranchSemantics semantics,
-                    bool isConditional = false,
-                    bool runsFinally = false)
+                // 按真实半开区间计算离开路径，嵌套 finally 从内到外执行。
+                BehaviorFlowEdge Edge(int? target, BehaviorFlowBranchSemantics semantics,
+                    bool conditional = false, bool runsFinally = false)
                 {
-                    return CreateManagedFlowEdge(
-                        instruction.Offset,
-                        targetBlockId,
-                        isConditional,
-                        semantics,
-                        runsFinally,
-                        body,
-                        exitBlockId,
-                        regions);
+                    int[] finalizers = runsFinally && target.HasValue
+                        ? handlers.Where(handler => handler.Kind == BehaviorExceptionHandlerKind.Finally
+                            && instruction.Offset >= handler.TryStartBlockId && instruction.Offset < handler.TryEndBlockId
+                            && (target.Value < handler.TryStartBlockId || target.Value >= handler.TryEndBlockId))
+                            .OrderBy(handler => handler.TryEndBlockId - handler.TryStartBlockId)
+                            .ThenByDescending(handler => handler.TryStartBlockId)
+                            .Select(handler => handler.HandlerStartBlockId).ToArray()
+                        : Array.Empty<int>();
+                    return new BehaviorFlowEdge(target, conditional, semantics, finalizers);
                 }
 
                 if (instruction.OpCode.Code == Cil.Code.Ret)
                 {
                     return new[] { Edge(exitBlockId, BehaviorFlowBranchSemantics.Return) };
                 }
-
                 if (instruction.OpCode.Code is Cil.Code.Throw or Cil.Code.Rethrow)
                 {
-                    return new[]
-                    {
-                        Edge(
-                            null,
-                            instruction.OpCode.Code == Cil.Code.Throw
-                                ? BehaviorFlowBranchSemantics.Throw
-                                : BehaviorFlowBranchSemantics.Rethrow),
-                    };
+                    return new[] { Edge(null, instruction.OpCode.Code == Cil.Code.Throw
+                        ? BehaviorFlowBranchSemantics.Throw : BehaviorFlowBranchSemantics.Rethrow) };
                 }
-
                 if (instruction.OpCode.Code == Cil.Code.Endfinally)
                 {
-                    return new[]
-                    {
-                        Edge(
-                            null,
-                            BehaviorFlowBranchSemantics.StructuredExceptionHandling),
-                    };
+                    return new[] { Edge(null, BehaviorFlowBranchSemantics.StructuredExceptionHandling) };
                 }
-
                 if (instruction.OpCode.Code == Cil.Code.Endfilter)
                 {
-                    Cil.ExceptionHandler handler = body.ExceptionHandlers.Single(item =>
-                        item.HandlerType == Cil.ExceptionHandlerType.Filter
-                        && item.FilterStart != null
-                        && instruction.Offset >= item.FilterStart.Offset
-                        && instruction.Offset < item.HandlerStart.Offset);
-
+                    BehaviorExceptionHandler handler = handlers.Single(item => item.Kind == BehaviorExceptionHandlerKind.Filter
+                        && instruction.Offset >= item.FilterStartBlockId && instruction.Offset < item.HandlerStartBlockId);
                     return new[]
                     {
-                        Edge(
-                            handler.HandlerStart.Offset,
-                            BehaviorFlowBranchSemantics.Regular,
-                            isConditional: true),
-                        Edge(
-                            null,
-                            BehaviorFlowBranchSemantics.StructuredExceptionHandling),
+                        Edge(handler.HandlerStartBlockId, BehaviorFlowBranchSemantics.Regular, conditional: true),
+                        Edge(null, BehaviorFlowBranchSemantics.StructuredExceptionHandling),
                     };
                 }
 
-                bool isLeave = instruction.OpCode.Code == Cil.Code.Leave;
-                bool isConditional = instruction.OpCode.FlowControl == Cil.FlowControl.Cond_Branch;
-                IEnumerable<int?> targets = instruction.OpCode.FlowControl switch
+                bool conditional = instruction.OpCode.FlowControl == Cil.FlowControl.Cond_Branch;
+                IEnumerable<int> targets = instruction.OpCode.FlowControl switch
                 {
-                    Cil.FlowControl.Branch => ReadBranchTargets(instruction)
-                        .Select(target => (int?)target),
-                    Cil.FlowControl.Cond_Branch => ReadBranchTargets(instruction)
-                        .Select(target => (int?)target)
-                        .Concat(instruction.Next == null
-                            ? Array.Empty<int?>()
-                            : new int?[] { instruction.Next.Offset }),
-                    _ => instruction.Next == null
-                        ? Array.Empty<int?>()
-                        : new int?[] { instruction.Next.Offset },
+                    Cil.FlowControl.Branch => ReadBranchTargets(instruction),
+                    Cil.FlowControl.Cond_Branch => ReadBranchTargets(instruction).Concat(instruction.Next == null
+                        ? Array.Empty<int>() : new[] { instruction.Next.Offset }),
+                    _ => instruction.Next == null ? Array.Empty<int>() : new[] { instruction.Next.Offset },
                 };
-
-                return targets.Distinct()
-                    .OrderBy(target => target)
-                    .Select(target => Edge(
-                        target,
-                        BehaviorFlowBranchSemantics.Regular,
-                        isConditional,
-                        isLeave))
-                    .ToArray();
-            }
-
-            // 建立一条边并计算其离开、进入和执行的 finally 区域。
-            private static BehaviorFlowEdge CreateManagedFlowEdge(
-                int sourceBlockId,
-                int? targetBlockId,
-                bool isConditional,
-                BehaviorFlowBranchSemantics semantics,
-                bool runsFinally,
-                Cil.MethodBody body,
-                int exitBlockId,
-                IReadOnlyList<ManagedFlowRegionDraft> regions)
-            {
-                if (!targetBlockId.HasValue)
-                {
-                    return new BehaviorFlowEdge(
-                        null,
-                        isConditional,
-                        semantics,
-                        Array.Empty<int>(),
-                        Array.Empty<int>(),
-                        Array.Empty<int>());
-                }
-
-                IReadOnlyList<ManagedFlowRegionDraft> sourceRegions = ReadManagedRegionChain(
-                    sourceBlockId,
-                    exitBlockId,
-                    regions);
-                IReadOnlyList<ManagedFlowRegionDraft> targetRegions = ReadManagedRegionChain(
-                    targetBlockId.Value,
-                    exitBlockId,
-                    regions);
-                int sharedCount = 0;
-                while (sharedCount < sourceRegions.Count
-                    && sharedCount < targetRegions.Count
-                    && sourceRegions[sharedCount] == targetRegions[sharedCount])
-                {
-                    sharedCount++;
-                }
-
-                int[] leaving = sourceRegions.Skip(sharedCount)
-                    .Reverse()
-                    .Select(region => region.Id)
-                    .ToArray();
-                int[] entering = targetRegions.Skip(sharedCount)
-                    .Select(region => region.Id)
-                    .ToArray();
-                int[] finallyRegions = runsFinally
-                    ? body.ExceptionHandlers.Where(handler =>
-                            handler.HandlerType == Cil.ExceptionHandlerType.Finally
-                            && sourceBlockId >= handler.TryStart.Offset
-                            && sourceBlockId < ReadManagedRegionEnd(
-                                handler.TryEnd,
-                                body.CodeSize)
-                            && (targetBlockId.Value < handler.TryStart.Offset
-                                || targetBlockId.Value >= ReadManagedRegionEnd(
-                                    handler.TryEnd,
-                                    body.CodeSize)))
-                        .Select(handler => regions.Single(region =>
-                            region.Handler == handler
-                            && region.Kind == BehaviorFlowRegionKind.Finally))
-                        .OrderBy(region => ReadManagedRegionEnd(
-                                region.Handler!.TryEnd,
-                                body.CodeSize)
-                            - region.Handler.TryStart.Offset)
-                        .ThenByDescending(region => region.Handler!.TryStart.Offset)
-                        .Select(region => region.Id)
-                        .ToArray()
-                    : Array.Empty<int>();
-
-                return new BehaviorFlowEdge(
-                    targetBlockId,
-                    isConditional,
-                    semantics,
-                    leaving,
-                    entering,
-                    finallyRegions);
-            }
-
-            // 返回一个块从根到最内层的区域链。
-            private static IReadOnlyList<ManagedFlowRegionDraft> ReadManagedRegionChain(
-                int blockId,
-                int exitBlockId,
-                IReadOnlyList<ManagedFlowRegionDraft> regions)
-            {
-                List<ManagedFlowRegionDraft> chain = new() { regions[0] };
-                if (blockId is -1 || blockId == exitBlockId)
-                {
-                    return chain;
-                }
-
-                while (true)
-                {
-                    ManagedFlowRegionDraft? child = regions.Where(region =>
-                            region.Parent == chain[^1]
-                            && region.Contains(blockId))
-                        .OrderBy(region => region.EndOffset - region.StartOffset)
-                        .ThenBy(region => region.CreationOrder)
-                        .FirstOrDefault();
-                    if (child == null)
-                    {
-                        return chain;
-                    }
-
-                    chain.Add(child);
-                }
-            }
-
-            // 把可空的 Cecil 区间结束转换为函数体末尾。
-            private static int ReadManagedRegionEnd(Cil.Instruction? end, int codeSize)
-            {
-                return end?.Offset ?? codeSize;
-            }
-
-            /// <summary>
-            /// 保存托管异常区域在稳定编号前的树形信息。
-            /// </summary>
-            private sealed class ManagedFlowRegionDraft
-            {
-                // 保存一个 Cecil 异常区域的真实半开区间。
-                public ManagedFlowRegionDraft(
-                    int creationOrder,
-                    BehaviorFlowRegionKind kind,
-                    int startOffset,
-                    int endOffset,
-                    BehaviorTypeReference? exceptionType,
-                    Cil.ExceptionHandler? handler)
-                {
-                    this.CreationOrder = creationOrder;
-                    this.Kind = kind;
-                    this.StartOffset = startOffset;
-                    this.EndOffset = endOffset;
-                    this.ExceptionType = exceptionType;
-                    this.Handler = handler;
-                }
-
-                public int CreationOrder { get; }
-                public BehaviorFlowRegionKind Kind { get; }
-                public int StartOffset { get; }
-                public int EndOffset { get; }
-                public BehaviorTypeReference? ExceptionType { get; }
-                public Cil.ExceptionHandler? Handler { get; }
-                public int Id { get; set; }
-                public ManagedFlowRegionDraft? Parent { get; set; }
-
-                // 检查一条指令是否位于本区域的半开区间内。
-                public bool Contains(int offset)
-                {
-                    return offset >= this.StartOffset && offset < this.EndOffset;
-                }
-
-                // 检查另一个区域是否完整位于本区域内。
-                public bool Contains(ManagedFlowRegionDraft region)
-                {
-                    return region.StartOffset >= this.StartOffset
-                        && region.EndOffset <= this.EndOffset;
-                }
+                return targets.Distinct().Order().Select(target => Edge(target,
+                    BehaviorFlowBranchSemantics.Regular, conditional, instruction.OpCode.Code == Cil.Code.Leave)).ToArray();
             }
 
             // 返回当前指令完成后可能继续执行的全部下一条指令。
@@ -769,23 +422,12 @@ namespace SetterChecker.Core
                 Cil.Instruction instruction,
                 IReadOnlyDictionary<int, Cil.Instruction> instructions)
             {
-                IEnumerable<int> successors = instruction.OpCode.FlowControl switch
-                {
-                    Cil.FlowControl.Branch => ReadBranchTargets(instruction),
-                    Cil.FlowControl.Cond_Branch => ReadBranchTargets(instruction).Concat(
-                        instruction.Next == null
-                            ? Array.Empty<int>()
-                            : new[] { instruction.Next.Offset }),
-                    Cil.FlowControl.Return or Cil.FlowControl.Throw => Array.Empty<int>(),
-                    _ => instruction.Next == null
-                        ? Array.Empty<int>()
-                        : new[] { instruction.Next.Offset },
-                };
-
-                return successors.Where(instructions.ContainsKey)
-                    .Distinct()
-                    .Order()
-                    .ToArray();
+                // 异常入口由编译器给定的独立栈初始化；普通路径共用已保存的跳转事实。
+                return instruction.OpCode.FlowControl is Cil.FlowControl.Return or Cil.FlowControl.Throw
+                    ? Array.Empty<int>()
+                    : ReadManagedFlowEdges(instruction, int.MaxValue, Array.Empty<BehaviorExceptionHandler>())
+                        .Where(edge => edge.TargetBlockId.HasValue && instructions.ContainsKey(edge.TargetBlockId.Value))
+                        .Select(edge => edge.TargetBlockId!.Value).ToArray();
             }
 
             // 读取 Cecil 已经解析完成的单目标或多目标跳转位置。
@@ -845,16 +487,11 @@ namespace SetterChecker.Core
                         BehaviorValueKind.Merge,
                         null,
                         null,
-                        new[] { firstValueId, secondValueId }
-                            .Distinct()
-                            .Order()
-                            .ToArray())
+                        Array.Empty<int>())
                     {
                         Point = new BehaviorFlowPoint(offset, index),
                     });
                     this.m_mergeValueIds.Add((offset, index), mergeValueId);
-
-                    return mergeValueId;
                 }
 
                 BehaviorValue merge = this.m_values[mergeValueId];
@@ -887,23 +524,6 @@ namespace SetterChecker.Core
                 object? operand = instruction.Operand;
                 int offset = instruction.Offset;
 
-                if (code == OpCodes.Nop)
-                {
-                    return;
-                }
-
-                if (code == OpCodes.Br || code == OpCodes.Leave)
-                {
-                    return;
-                }
-
-                if (code == OpCodes.Brfalse || code == OpCodes.Brtrue)
-                {
-                    Pop(code, offset);
-
-                    return;
-                }
-
                 if (code == OpCodes.Ret)
                 {
                     this.m_returns[offset] = new BehaviorReturn(
@@ -916,129 +536,51 @@ namespace SetterChecker.Core
                     return;
                 }
 
-                if (code == OpCodes.Ldarga)
+                if (code.Code is Cil.Code.Ldarg or Cil.Code.Ldarga or Cil.Code.Starg
+                    or Cil.Code.Ldloc or Cil.Code.Ldloca or Cil.Code.Stloc)
                 {
-                    int argumentAddressIndex = ReadArgumentIndex(code, operand);
-                    this.m_stack.Push(AddValue(
-                        BehaviorValueKind.Address,
-                        $"argument:{argumentAddressIndex}",
-                        null,
-                        new[] { GetArgumentValueId(argumentAddressIndex) }));
-
-                    return;
-                }
-
-                if (code == OpCodes.Starg)
-                {
-                    this.m_assignments[offset] = new BehaviorAssignment(
-                        GetArgumentValueId(ReadArgumentIndex(code, operand)),
-                        Pop(code, offset),
-                        offset)
+                    bool argument = code.Code is Cil.Code.Ldarg or Cil.Code.Ldarga or Cil.Code.Starg;
+                    int index = argument ? ReadArgumentIndex(code, operand) : RequireOperand<Cil.VariableDefinition>(instruction).Index;
+                    int slotId = argument ? GetArgumentValueId(index) : GetLocalValueId(index);
+                    if (code.Code is Cil.Code.Starg or Cil.Code.Stloc)
                     {
-                        Point = NextPoint(),
-                    };
-
-                    return;
-                }
-
-                if (code == OpCodes.Ldarg)
-                {
-                    int slotId = GetArgumentValueId(ReadArgumentIndex(code, operand));
-                    this.m_stack.Push(this.m_values[slotId].Kind == BehaviorValueKind.CurrentInstance
-                        ? slotId
-                        : ReadSlot(slotId));
-
-                    return;
-                }
-
-                if (code == OpCodes.Ldc_I4)
-                {
-                    this.m_stack.Push(AddValue(
-                        BehaviorValueKind.Constant,
-                        RequireOperand<int>(instruction).ToString(System.Globalization.CultureInfo.InvariantCulture),
-                        null,
-                        Array.Empty<int>()));
-
-                    return;
-                }
-
-                if (code == OpCodes.Ldc_I8)
-                {
-                    this.m_stack.Push(AddValue(
-                        BehaviorValueKind.Constant,
-                        RequireOperand<long>(instruction).ToString(
-                            System.Globalization.CultureInfo.InvariantCulture),
-                        null,
-                        Array.Empty<int>()));
-
-                    return;
-                }
-
-                if (code == OpCodes.Ldc_R4 || code == OpCodes.Ldc_R8)
-                {
-                    double value = code == OpCodes.Ldc_R4
-                        ? RequireOperand<float>(instruction)
-                        : RequireOperand<double>(instruction);
-                    this.m_stack.Push(AddValue(
-                        BehaviorValueKind.Constant,
-                        value.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
-                        null,
-                        Array.Empty<int>()));
-
-                    return;
-                }
-
-                if (code == OpCodes.Ldnull)
-                {
-                    this.m_stack.Push(AddValue(
-                        BehaviorValueKind.Constant,
-                        null,
-                        null,
-                        Array.Empty<int>()));
-
-                    return;
-                }
-
-                if (code == OpCodes.Ldstr)
-                {
-                    this.m_stack.Push(AddValue(
-                        BehaviorValueKind.Constant,
-                        RequireOperand<string>(instruction),
-                        null,
-                        Array.Empty<int>()));
-
-                    return;
-                }
-
-                if (code == OpCodes.Ldloc)
-                {
-                    this.m_stack.Push(ReadSlot(GetLocalValueId(RequireOperand<Cil.VariableDefinition>(instruction).Index)));
-
-                    return;
-                }
-
-                if (code == OpCodes.Ldloca)
-                {
-                    int localIndex = RequireOperand<Cil.VariableDefinition>(instruction).Index;
-                    this.m_stack.Push(AddValue(
-                        BehaviorValueKind.Address,
-                        $"local:{localIndex}",
-                        null,
-                        new[] { GetLocalValueId(localIndex) }));
-
-                    return;
-                }
-
-                if (code == OpCodes.Stloc)
-                {
-                    this.m_assignments[offset] = new BehaviorAssignment(
-                        GetLocalValueId(RequireOperand<Cil.VariableDefinition>(instruction).Index),
-                        Pop(code, offset),
-                        offset)
+                        this.m_assignments[offset] = new BehaviorAssignment(slotId, Pop(code, offset), offset)
+                        {
+                            Point = NextPoint(),
+                        };
+                    }
+                    else if (code.Code is Cil.Code.Ldarga or Cil.Code.Ldloca)
                     {
-                        Point = NextPoint(),
-                    };
+                        if (this.m_values[slotId].IsManagedReferenceSlot)
+                        {
+                            throw new AnalysisException($"托管引用不能再次取托管地址：{this.m_method.Id} @ {offset}");
+                        }
+                        this.m_stack.Push(AddValue(BehaviorValueKind.Address,
+                            $"{(argument ? "argument" : "local")}:{index}", new[] { slotId }));
+                    }
+                    else
+                    {
+                        this.m_stack.Push(ReadSlot(slotId));
+                    }
+                    return;
+                }
 
+                System.Globalization.CultureInfo culture = System.Globalization.CultureInfo.InvariantCulture;
+                (Cecil.TypeReference? Type, string? Text)? constant = code.Code switch
+                {
+                    Cil.Code.Ldc_I4 => (this.m_typeSystem.Int32, RequireOperand<int>(instruction).ToString(culture)),
+                    Cil.Code.Ldc_I8 => (this.m_typeSystem.Int64, RequireOperand<long>(instruction).ToString(culture)),
+                    Cil.Code.Ldc_R4 => (this.m_typeSystem.Single, RequireOperand<float>(instruction).ToString("R", culture)),
+                    Cil.Code.Ldc_R8 => (this.m_typeSystem.Double, RequireOperand<double>(instruction).ToString("R", culture)),
+                    Cil.Code.Ldstr => (this.m_typeSystem.String, RequireOperand<string>(instruction)),
+                    Cil.Code.Ldnull => (null, null),
+                    _ => null,
+                };
+                if (constant.HasValue)
+                {
+                    int valueId = AddValue(BehaviorValueKind.Constant, constant.Value.Text, Array.Empty<int>(),
+                        type: constant.Value.Type == null ? null : ReadTypeReference(constant.Value.Type));
+                    this.m_stack.Push(valueId);
                     return;
                 }
 
@@ -1062,10 +604,7 @@ namespace SetterChecker.Core
                     BehaviorTypeReference type = ReadTypeReference(
                         new Cecil.ArrayType(RequireOperand<Cecil.TypeReference>(instruction)));
                     int lengthValueId = Pop(code, offset);
-                    this.m_stack.Push(AddTypeValue(
-                        BehaviorValueKind.NewArray,
-                        type,
-                        new[] { lengthValueId }));
+                    this.m_stack.Push(AddValue(BehaviorValueKind.NewArray, null, new[] { lengthValueId }, type: type));
 
                     return;
                 }
@@ -1074,30 +613,23 @@ namespace SetterChecker.Core
                 {
                     if (operand is Cecil.TypeReference type)
                     {
-                        this.m_stack.Push(AddTypeValue(
-                            BehaviorValueKind.Type,
-                            ReadTypeReference(type),
-                            Array.Empty<int>()));
+                        this.m_stack.Push(AddValue(BehaviorValueKind.Type, null, Array.Empty<int>(), type: ReadTypeReference(type)));
 
                         return;
                     }
 
                     if (operand is Cecil.MethodReference methodReference)
                     {
-                        this.m_stack.Push(AddMethodValue(
-                            BehaviorValueKind.Function,
-                            ReadMethodReference(methodReference),
-                            Array.Empty<int>()));
+                        this.m_stack.Push(AddValue(BehaviorValueKind.Function, null, Array.Empty<int>(),
+                            method: this.m_catalog.ReadManagedMethodReference(methodReference, this.m_method.AssemblyPath!)));
 
                         return;
                     }
 
                     if (operand is Cecil.FieldReference fieldReference)
                     {
-                        this.m_stack.Push(AddMemberValue(
-                            BehaviorValueKind.Computation,
-                            ReadFieldReference(fieldReference),
-                            Array.Empty<int>()));
+                        this.m_stack.Push(AddValue(BehaviorValueKind.Computation, null, Array.Empty<int>(),
+                            member: this.m_catalog.ReadManagedFieldReference(fieldReference, this.m_method.AssemblyPath!)));
 
                         return;
                     }
@@ -1110,86 +642,29 @@ namespace SetterChecker.Core
                     or Cil.Code.Box or Cil.Code.Unbox or Cil.Code.Unbox_Any
                     or Cil.Code.Ldobj)
                 {
-                    int valueId = AddTypeValue(
-                        BehaviorValueKind.Conversion,
-                        ReadTypeReference(RequireOperand<Cecil.TypeReference>(instruction)),
-                        new[] { Pop(code, offset) });
-                    this.m_values[valueId] = this.m_values[valueId] with { Reference = code.Name };
+                    int valueId = AddValue(BehaviorValueKind.Conversion, code.Name, new[] { Pop(code, offset) },
+                        type: ReadTypeReference(RequireOperand<Cecil.TypeReference>(instruction)));
                     this.m_stack.Push(valueId);
 
                     return;
                 }
 
-                if (code == OpCodes.Ldfld)
+                if (code.Code is Cil.Code.Ldfld or Cil.Code.Ldflda or Cil.Code.Ldsfld or Cil.Code.Ldsflda)
                 {
-                    this.m_stack.Push(AddMemberValue(
-                        BehaviorValueKind.FieldRead,
-                        ReadFieldReference(RequireOperand<Cecil.FieldReference>(instruction)),
-                        new[] { Pop(code, offset) }));
+                    this.m_stack.Push(AddValue(
+                        code.Code is Cil.Code.Ldflda or Cil.Code.Ldsflda ? BehaviorValueKind.Address : BehaviorValueKind.FieldRead,
+                        null, code.Code is Cil.Code.Ldsfld or Cil.Code.Ldsflda ? Array.Empty<int>() : new[] { Pop(code, offset) },
+                        member: this.m_catalog.ReadManagedFieldReference(RequireOperand<Cecil.FieldReference>(instruction), this.m_method.AssemblyPath!)));
 
                     return;
                 }
 
-                if (code == OpCodes.Ldflda)
-                {
-                    this.m_stack.Push(AddMemberValue(
-                        BehaviorValueKind.Address,
-                        ReadFieldReference(RequireOperand<Cecil.FieldReference>(instruction)),
-                        new[] { Pop(code, offset) }));
-
-                    return;
-                }
-
-                if (code == OpCodes.Ldsfld)
-                {
-                    this.m_stack.Push(AddMemberValue(
-                        BehaviorValueKind.FieldRead,
-                        ReadFieldReference(RequireOperand<Cecil.FieldReference>(instruction)),
-                        Array.Empty<int>()));
-
-                    return;
-                }
-
-                if (code == OpCodes.Ldsflda)
-                {
-                    this.m_stack.Push(AddMemberValue(
-                        BehaviorValueKind.Address,
-                        ReadFieldReference(RequireOperand<Cecil.FieldReference>(instruction)),
-                        Array.Empty<int>()));
-
-                    return;
-                }
-
-                if (code == OpCodes.Stfld)
+                if (code == OpCodes.Stfld || code == OpCodes.Stsfld)
                 {
                     int valueId = Pop(code, offset);
-                    int receiverId = Pop(code, offset);
-                    this.m_writes[offset] = new BehaviorWrite(
-                        BehaviorWriteKind.Field,
-                        receiverId,
-                        ReadFieldReference(RequireOperand<Cecil.FieldReference>(instruction)),
-                        Array.Empty<int>(),
-                        valueId,
-                        offset)
-                    {
-                        Point = NextPoint(),
-                    };
-
-                    return;
-                }
-
-                if (code == OpCodes.Stsfld)
-                {
-                    this.m_writes[offset] = new BehaviorWrite(
-                        BehaviorWriteKind.Field,
-                        null,
-                        ReadFieldReference(RequireOperand<Cecil.FieldReference>(instruction)),
-                        Array.Empty<int>(),
-                        Pop(code, offset),
-                        offset)
-                    {
-                        Point = NextPoint(),
-                    };
+                    int? receiverId = code == OpCodes.Stfld ? Pop(code, offset) : null;
+                    RecordWrite(BehaviorWriteKind.Field, receiverId,
+                        this.m_catalog.ReadManagedFieldReference(RequireOperand<Cecil.FieldReference>(instruction), this.m_method.AssemblyPath!), Array.Empty<int>(), valueId, offset);
 
                     return;
                 }
@@ -1198,11 +673,8 @@ namespace SetterChecker.Core
                 {
                     int indexValueId = Pop(code, offset);
                     int arrayValueId = Pop(code, offset);
-                    this.m_stack.Push(AddValue(
-                        BehaviorValueKind.Address,
-                        RequireOperand<Cecil.TypeReference>(instruction).FullName,
-                        null,
-                        new[] { arrayValueId, indexValueId }));
+                    this.m_stack.Push(AddValue(BehaviorValueKind.Address, null, new[] { arrayValueId, indexValueId },
+                        type: ReadTypeReference(RequireOperand<Cecil.TypeReference>(instruction))));
 
                     return;
                 }
@@ -1214,7 +686,6 @@ namespace SetterChecker.Core
                     this.m_stack.Push(AddValue(
                         BehaviorValueKind.ArrayElementRead,
                         code.Name,
-                        null,
                         new[] { arrayValueId, indexValueId }));
 
                     return;
@@ -1226,35 +697,19 @@ namespace SetterChecker.Core
                     int indexValueId = Pop(code, offset);
                     int arrayValueId = Pop(code, offset);
 
-                    this.m_writes[offset] = new BehaviorWrite(
-                        BehaviorWriteKind.ArrayElement,
-                        arrayValueId,
-                        null,
-                        new[] { indexValueId },
-                        valueId,
-                        offset)
-                    {
-                        Point = NextPoint(),
-                    };
+                    RecordWrite(BehaviorWriteKind.ArrayElement, arrayValueId, null,
+                        new[] { indexValueId }, valueId, offset);
 
                     return;
                 }
 
-                if (IsStoreIndirect(code))
+                if (IsStoreIndirect(code) || code == OpCodes.Cpobj)
                 {
                     int valueId = Pop(code, offset);
                     int addressValueId = Pop(code, offset);
 
-                    this.m_writes[offset] = new BehaviorWrite(
-                        BehaviorWriteKind.Indirect,
-                        addressValueId,
-                        null,
-                        Array.Empty<int>(),
-                        valueId,
-                        offset)
-                    {
-                        Point = NextPoint(),
-                    };
+                    RecordWrite(BehaviorWriteKind.Indirect, addressValueId, null,
+                        Array.Empty<int>(), valueId, offset);
 
                     return;
                 }
@@ -1265,36 +720,9 @@ namespace SetterChecker.Core
                     int defaultValueId = AddValue(
                         BehaviorValueKind.Constant,
                         $"default:{RequireOperand<Cecil.TypeReference>(instruction).FullName}",
-                        null,
                         Array.Empty<int>());
-                    this.m_writes[offset] = new BehaviorWrite(
-                        BehaviorWriteKind.Indirect,
-                        addressValueId,
-                        null,
-                        Array.Empty<int>(),
-                        defaultValueId,
-                        offset)
-                    {
-                        Point = NextPoint(),
-                    };
-
-                    return;
-                }
-
-                if (code == OpCodes.Cpobj)
-                {
-                    int sourceAddressId = Pop(code, offset);
-                    int targetAddressId = Pop(code, offset);
-                    this.m_writes[offset] = new BehaviorWrite(
-                        BehaviorWriteKind.Indirect,
-                        targetAddressId,
-                        null,
-                        Array.Empty<int>(),
-                        sourceAddressId,
-                        offset)
-                    {
-                        Point = NextPoint(),
-                    };
+                    RecordWrite(BehaviorWriteKind.Indirect, addressValueId, null,
+                        Array.Empty<int>(), defaultValueId, offset);
 
                     return;
                 }
@@ -1304,16 +732,8 @@ namespace SetterChecker.Core
                     int lengthValueId = Pop(code, offset);
                     int valueId = Pop(code, offset);
                     int targetAddressId = Pop(code, offset);
-                    this.m_writes[offset] = new BehaviorWrite(
-                        BehaviorWriteKind.Indirect,
-                        targetAddressId,
-                        null,
-                        new[] { lengthValueId },
-                        valueId,
-                        offset)
-                    {
-                        Point = NextPoint(),
-                    };
+                    RecordWrite(BehaviorWriteKind.Indirect, targetAddressId, null,
+                        new[] { lengthValueId }, valueId, offset);
 
                     return;
                 }
@@ -1329,10 +749,7 @@ namespace SetterChecker.Core
                     IReadOnlyList<int> inputs = code == OpCodes.Ldvirtftn
                         ? new[] { Pop(code, offset) }
                         : Array.Empty<int>();
-                    this.m_stack.Push(AddMethodValue(
-                        BehaviorValueKind.Function,
-                        reference,
-                        inputs));
+                    this.m_stack.Push(AddValue(BehaviorValueKind.Function, null, inputs, method: reference));
 
                     return;
                 }
@@ -1346,13 +763,6 @@ namespace SetterChecker.Core
                     return;
                 }
 
-                if (code == OpCodes.Pop)
-                {
-                    Pop(code, offset);
-
-                    return;
-                }
-
                 if (TryReadStackOperation(code, offset))
                 {
                     return;
@@ -1360,6 +770,16 @@ namespace SetterChecker.Core
 
                 throw new AnalysisException(
                     $"托管函数包含尚未读取的操作码：{this.m_method.Id} @ {offset} {code.Name}");
+            }
+
+            // 用统一的执行位置登记字段、数组和地址写入。
+            private void RecordWrite(BehaviorWriteKind kind, int? receiver, BehaviorMemberReference? member,
+                IReadOnlyList<int> indices, int value, int offset)
+            {
+                this.m_writes[offset] = new BehaviorWrite(kind, receiver, member, indices, value, offset)
+                {
+                    Point = NextPoint(),
+                };
             }
 
             // 从 Cecil 指令取得一个类型完全确定的操作数。
@@ -1415,10 +835,11 @@ namespace SetterChecker.Core
                     Cil.Code.Beq or Cil.Code.Bne_Un or Cil.Code.Bge or Cil.Code.Bge_Un
                         or Cil.Code.Bgt or Cil.Code.Bgt_Un or Cil.Code.Ble or Cil.Code.Ble_Un
                         or Cil.Code.Blt or Cil.Code.Blt_Un => (2, 0),
-                    Cil.Code.Switch or Cil.Code.Throw or Cil.Code.Endfilter => (1, 0),
+                    Cil.Code.Brtrue or Cil.Code.Brfalse or Cil.Code.Pop
+                        or Cil.Code.Switch or Cil.Code.Throw or Cil.Code.Endfilter => (1, 0),
                     Cil.Code.Rethrow or Cil.Code.Endfinally or Cil.Code.Volatile
                         or Cil.Code.Readonly or Cil.Code.Constrained or Cil.Code.Unaligned
-                        or Cil.Code.Tail => (0, 0),
+                        or Cil.Code.Tail or Cil.Code.Nop or Cil.Code.Br or Cil.Code.Leave => (0, 0),
                     Cil.Code.Sizeof => (0, 1),
                     _ => null,
                 };
@@ -1433,13 +854,17 @@ namespace SetterChecker.Core
                     inputs[index] = Pop(code, offset);
                 }
 
-                if (shape.Value.Push == 1)
+                if (shape.Value.Push == 1 || code.FlowControl == Cil.FlowControl.Cond_Branch
+                    || code.Code is Cil.Code.Throw or Cil.Code.Rethrow or Cil.Code.Endfilter)
                 {
-                    this.m_stack.Push(AddValue(
+                    int valueId = AddValue(
                         BehaviorValueKind.Computation,
                         code.Name,
-                        null,
-                        inputs));
+                        inputs);
+                    if (shape.Value.Push == 1)
+                    {
+                        this.m_stack.Push(valueId);
+                    }
                 }
 
                 return true;
@@ -1474,24 +899,17 @@ namespace SetterChecker.Core
                 BehaviorCallKind kind = ReadCallKind(code, definition);
                 int? resultValueId = null;
 
-                if (code == OpCodes.Newobj || reference.ReturnTypeId != "System.Void")
+                if (code == OpCodes.Newobj || reference.Identity.ReturnType.Text != "System.Void")
                 {
                     resultValueId = AddValue(
                         code == OpCodes.Newobj
                             ? BehaviorValueKind.NewObject
                             : BehaviorValueKind.CallResult,
                         code == OpCodes.Newobj
-                            ? reference.Identity.DeclaringType.StableText
+                            ? reference.Identity.DeclaringType.Text
                             : reference.Identity.Text,
-                        null,
-                        arguments.Select(argument => argument.ValueId).ToArray());
-                    if (code == OpCodes.Newobj)
-                    {
-                        this.m_values[resultValueId.Value] = this.m_values[resultValueId.Value] with
-                        {
-                            Type = ReadTypeReference(method.DeclaringType),
-                        };
-                    }
+                        arguments.Select(argument => argument.ValueId).ToArray(),
+                        type: code == OpCodes.Newobj ? ReadTypeReference(method.DeclaringType) : null);
 
                     this.m_stack.Push(resultValueId.Value);
                 }
@@ -1536,10 +954,7 @@ namespace SetterChecker.Core
 
                 if (code == OpCodes.Newobj && method.Name == ".ctor")
                 {
-                    this.m_stack.Push(AddTypeValue(
-                        BehaviorValueKind.NewArray,
-                        ReadTypeReference(array),
-                        arguments));
+                    this.m_stack.Push(AddValue(BehaviorValueKind.NewArray, null, arguments, type: ReadTypeReference(array)));
 
                     return;
                 }
@@ -1547,25 +962,16 @@ namespace SetterChecker.Core
                 int receiverId = Pop(code, offset);
                 if (method.Name == "Set")
                 {
-                    this.m_writes[offset] = new BehaviorWrite(
-                        BehaviorWriteKind.ArrayElement,
-                        receiverId,
-                        null,
-                        arguments[..^1],
-                        arguments[^1],
-                        offset)
-                    {
-                        Point = NextPoint(),
-                    };
+                    RecordWrite(BehaviorWriteKind.ArrayElement, receiverId, null,
+                        arguments[..^1], arguments[^1], offset);
                 }
                 else if (method.Name is "Get" or "Address")
                 {
-                    this.m_stack.Push(AddTypeValue(
+                    this.m_stack.Push(AddValue(
                         method.Name == "Get"
                             ? BehaviorValueKind.ArrayElementRead
                             : BehaviorValueKind.Address,
-                        ReadTypeReference(array.ElementType),
-                        new[] { receiverId }.Concat(arguments).ToArray()));
+                        null, new[] { receiverId }.Concat(arguments).ToArray(), type: ReadTypeReference(array.ElementType)));
                 }
                 else
                 {
@@ -1645,6 +1051,10 @@ namespace SetterChecker.Core
                 if (!this.m_method.IsStatic && argumentIndex == 0)
                 {
                     valueId = AddRootValue(BehaviorValueKind.CurrentInstance, "this");
+                    this.m_values[valueId] = this.m_values[valueId] with
+                    {
+                        IsManagedReferenceSlot = this.m_catalog.TypesById[this.m_method.TypeId].IsValueType,
+                    };
                 }
                 else
                 {
@@ -1659,6 +1069,7 @@ namespace SetterChecker.Core
                     this.m_values[valueId] = this.m_values[valueId] with
                     {
                         ParameterIndex = parameterIndex,
+                        IsManagedReferenceSlot = parameter.RefKind != CatalogRefKind.None,
                     };
                 }
 
@@ -1685,43 +1096,30 @@ namespace SetterChecker.Core
                         $"托管函数指令栈不足：{this.m_method.Id} @ {offset} {code.Name}");
             }
 
-            // 追加一个值来源并返回其函数内编号。
+            // 一次保存值和类型、函数或字段事实，同一指令重算时保留编号。
             private int AddValue(
                 BehaviorValueKind kind,
                 string? reference,
-                int? parameterIndex,
-                IReadOnlyList<int> inputValueIds)
+                IReadOnlyList<int> inputValueIds,
+                BehaviorTypeReference? type = null, BehaviorMethodReference? method = null, BehaviorMemberReference? member = null)
             {
-                if (this.m_instructionValueIds.TryGetValue(
-                        this.m_currentOffset,
-                        out int existingId))
+                int id = this.m_instructionValueIds.GetValueOrDefault(this.m_currentOffset, this.m_values.Count);
+                BehaviorValue value = new(id, kind, reference ?? type?.Id ?? method?.Name ?? member?.Name, null, inputValueIds)
                 {
-                    BehaviorValue existing = this.m_values[existingId];
-                    this.m_values[existingId] = existing with
-                    {
-                        Kind = kind,
-                        Reference = reference,
-                        ParameterIndex = parameterIndex,
-                        InputValueIds = inputValueIds,
-                        Point = NextPoint(),
-                    };
-
-                    return existingId;
-                }
-
-                int id = this.m_values.Count;
-
-                this.m_values.Add(new BehaviorValue(
-                    id,
-                    kind,
-                    reference,
-                    parameterIndex,
-                    inputValueIds)
-                {
+                    Type = type,
+                    Method = method,
+                    Member = member,
                     Point = NextPoint(),
-                });
-                this.m_instructionValueIds.Add(this.m_currentOffset, id);
-
+                };
+                if (id == this.m_values.Count)
+                {
+                    this.m_values.Add(value);
+                    this.m_instructionValueIds.Add(this.m_currentOffset, id);
+                }
+                else
+                {
+                    this.m_values[id] = value;
+                }
                 return id;
             }
 
@@ -1737,7 +1135,6 @@ namespace SetterChecker.Core
                 return AddValue(
                     BehaviorValueKind.SlotRead,
                     this.m_values[slotId].Reference,
-                    null,
                     new[] { slotId });
             }
 
@@ -1755,62 +1152,18 @@ namespace SetterChecker.Core
                 return id;
             }
 
-            // 追加一个带结构化字段身份的字段读取或字段地址值。
-            private int AddMemberValue(
-                BehaviorValueKind kind,
-                BehaviorMemberReference member,
-                IReadOnlyList<int> inputValueIds)
-            {
-                int id = AddValue(kind, member.Name, null, inputValueIds);
-
-                this.m_values[id] = this.m_values[id] with { Member = member };
-
-                return id;
-            }
-
-            // 追加一个带结构化函数身份的函数指针或委托绑定值。
-            private int AddMethodValue(
-                BehaviorValueKind kind,
-                BehaviorMethodReference method,
-                IReadOnlyList<int> inputValueIds)
-            {
-                int id = AddValue(kind, method.Name, null, inputValueIds);
-
-                this.m_values[id] = this.m_values[id] with { Method = method };
-
-                return id;
-            }
-
-            // 追加一个带结构化类型身份的类型或数组创建值。
-            private int AddTypeValue(
-                BehaviorValueKind kind,
-                BehaviorTypeReference type,
-                IReadOnlyList<int> inputValueIds)
-            {
-                int id = AddValue(kind, type.Id, null, inputValueIds);
-
-                this.m_values[id] = this.m_values[id] with { Type = type };
-
-                return id;
-            }
-
-            // 从字段定义或成员引用标记读取结构化字段身份。
-            private BehaviorMemberReference ReadFieldReference(Cecil.FieldReference field)
-            {
-                return this.m_catalog.ReadManagedFieldReference(field, this.m_method.AssemblyPath!);
-            }
-
             // 从类型定义、引用或规格标记读取结构化类型身份。
             private BehaviorTypeReference ReadTypeReference(Cecil.TypeReference type)
             {
-                return this.m_catalog.ReadManagedTypeReference(type, this.m_method.AssemblyPath!);
+                if (!this.m_typeReferences.TryGetValue(type, out BehaviorTypeReference? reference))
+                {
+                    reference = this.m_catalog.ReadManagedTypeReference(type, this.m_method.AssemblyPath!);
+                    this.m_typeReferences.Add(type, reference);
+                }
+
+                return reference;
             }
 
-            // 从 Cecil 函数引用读取结构化调用身份。
-            private BehaviorMethodReference ReadMethodReference(Cecil.MethodReference method)
-            {
-                return this.m_catalog.ReadManagedMethodReference(method, this.m_method.AssemblyPath!);
-            }
         }
     }
 
@@ -1819,6 +1172,8 @@ namespace SetterChecker.Core
     /// </summary>
     public enum MethodBodyKind
     {
+        /// <summary>函数体读取失败，不能把空事实当作没有修改。</summary>
+        ReadFailure,
         /// <summary>函数具有可读取的托管行为。</summary>
         Executable,
         /// <summary>接口或抽象函数只声明契约。</summary>
@@ -1867,40 +1222,28 @@ namespace SetterChecker.Core
     }
 
     /// <summary>
-    /// 区分局部生命周期与异常处理区域。
+    /// 区分编译文件中的异常处理子句。
     /// </summary>
-    public enum BehaviorFlowRegionKind
+    public enum BehaviorExceptionHandlerKind
     {
-        /// <summary>完整函数区域。</summary>
-        Root,
-        /// <summary>try 区域。</summary>
-        Try,
         /// <summary>异常筛选区域。</summary>
         Filter,
         /// <summary>catch 区域。</summary>
         Catch,
-        /// <summary>异常筛选及其处理区域。</summary>
-        FilterAndHandler,
-        /// <summary>try 和全部 catch 的组合区域。</summary>
-        TryAndCatch,
         /// <summary>finally 区域。</summary>
         Finally,
-        /// <summary>try 和 finally 的组合区域。</summary>
-        TryAndFinally,
         /// <summary>IL fault 区域。</summary>
         Fault,
     }
 
     /// <summary>
-    /// 保存一条控制流转移及其经过的异常处理区域。
+    /// 保存控制流转移及必须执行的 finally 入口。
     /// </summary>
     public sealed record BehaviorFlowEdge(
         int? TargetBlockId,
         bool IsConditional,
         BehaviorFlowBranchSemantics Semantics,
-        IReadOnlyList<int> LeavingRegionIds,
-        IReadOnlyList<int> EnteringRegionIds,
-        IReadOnlyList<int> FinallyRegionIds);
+        IReadOnlyList<int> FinallyBlockIds);
 
     /// <summary>
     /// 保存一个控制流块和它的全部后继。
@@ -1909,18 +1252,19 @@ namespace SetterChecker.Core
         int Id,
         BehaviorFlowBlockKind Kind,
         bool IsReachable,
-        int? EnclosingRegionId,
-        IReadOnlyList<BehaviorFlowEdge> Successors);
+        IReadOnlyList<BehaviorFlowEdge> Successors,
+        int? ConditionValueId = null, int? JumpTargetBlockId = null);
 
     /// <summary>
-    /// 保存编译器已经建立的控制流区域范围。
+    /// 按元数据顺序保存异常处理子句；所有范围均为包含起点、不含终点的指令区间。
     /// </summary>
-    public sealed record BehaviorFlowRegion(
-        int Id,
-        BehaviorFlowRegionKind Kind,
-        int? ParentRegionId,
-        int FirstBlockId,
-        int LastBlockId,
+    public sealed record BehaviorExceptionHandler(
+        BehaviorExceptionHandlerKind Kind,
+        int TryStartBlockId,
+        int TryEndBlockId,
+        int HandlerStartBlockId,
+        int HandlerEndBlockId,
+        int? FilterStartBlockId,
         BehaviorTypeReference? ExceptionType);
 
     /// <summary>
@@ -2010,13 +1354,22 @@ namespace SetterChecker.Core
         /// <summary>函数或委托值所引用的结构化函数。</summary>
         public BehaviorMethodReference? Method { get; init; }
 
-        /// <summary>类型或数组创建值所引用的结构化类型。</summary>
+        /// <summary>反射属性保存真实读写函数，不把属性名称当作行为结论。</summary>
+        public BehaviorPropertyReference? Property { get; init; }
+
+        /// <summary>该值已知的结构化类型。</summary>
         public BehaviorTypeReference? Type { get; init; }
+
+        /// <summary>该槽保存托管引用本身；间接写入修改其所指数据，不改变引用槽。</summary>
+        public bool IsManagedReferenceSlot { get; init; }
 
         /// <summary>派生值被读取或产生的执行位置；根槽可以为空。</summary>
         public BehaviorFlowPoint? Point { get; init; }
 
     }
+
+    /// <summary>保存一个反射属性的真实访问函数。</summary>
+    public sealed record BehaviorPropertyReference(BehaviorMethodReference? Getter, BehaviorMethodReference? Setter);
 
     /// <summary>
     /// 保存局部槽或参数槽之间的一次赋值关系。
@@ -2034,53 +1387,26 @@ namespace SetterChecker.Core
     /// 保存类型的实际身份、定义身份和构造类型实参。
     /// </summary>
     public sealed record BehaviorTypeReference(
-        string Id,
-        string DefinitionId,
-        IReadOnlyList<string> ArgumentIds,
+        TypeIdentityTemplate Identity,
+        TypeIdentityTemplate DefinitionIdentity,
+        IReadOnlyList<TypeIdentityTemplate> ArgumentIdentities,
         string? TargetAssemblyIdentity,
-        string? ReferringAssemblyPath)
+        string? ReferringAssemblyPath,
+        string? KnownTypeId)
     {
-        /// <summary>当前模块中的类型定义物理身份。</summary>
-        public string? KnownTypeId { get; init; }
+        /// <summary>直接展示同一类型身份，不另存字符串副本。</summary>
+        public string Id => this.Identity.Text;
 
-        internal TypeIdentityTemplate Identity { get; init; } = null!;
-
-        internal TypeIdentityTemplate DefinitionIdentity { get; init; } = null!;
-
-        internal IReadOnlyList<TypeIdentityTemplate> ArgumentIdentities { get; init; } =
-            Array.Empty<TypeIdentityTemplate>();
-
-        // 同时保存结构化类型身份和公开展示，不再经另一套引用对象中转。
-        internal static BehaviorTypeReference Create(
-            TypeIdentityTemplate identity,
-            TypeIdentityTemplate definition,
-            IReadOnlyList<TypeIdentityTemplate> arguments,
-            string? targetAssemblyIdentity,
-            string? referringAssemblyPath,
-            string? knownTypeId)
-        {
-            return new BehaviorTypeReference(
-                identity.StableText,
-                definition.StableText,
-                arguments.Select(type => type.StableText).ToArray(),
-                targetAssemblyIdentity,
-                referringAssemblyPath)
-            {
-                KnownTypeId = knownTypeId,
-                Identity = identity,
-                DefinitionIdentity = definition,
-                ArgumentIdentities = arguments,
-            };
-        }
+        /// <summary>直接展示类型开放定义身份。</summary>
+        public string DefinitionId => this.DefinitionIdentity.Text;
     }
 
     /// <summary>
     /// 保存字段的声明类型、名称和字段类型，不依赖显示字符串解析。
     /// </summary>
     public sealed record BehaviorMemberReference(
-        string DeclaringTypeId,
+        TypeIdentityTemplate DeclaringTypeIdentity,
         string DeclaringTypeDefinitionId,
-        IReadOnlyList<string> DeclaringTypeArgumentIds,
         string Name,
         string FieldTypeId)
     {
@@ -2096,9 +1422,6 @@ namespace SetterChecker.Core
         /// <summary>读取字段引用的真实程序集路径。</summary>
         public string? ReferringAssemblyPath { get; init; }
 
-        internal TypeIdentityTemplate DeclaringTypeIdentity { get; init; } = null!;
-
-        internal TypeIdentityTemplate FieldTypeIdentity { get; init; } = null!;
     }
 
     /// <summary>
@@ -2127,13 +1450,8 @@ namespace SetterChecker.Core
     /// 保存调用目标的完整签名、泛型实参和实例调用形态。
     /// </summary>
     public sealed record BehaviorMethodReference(
-        string DeclaringTypeId,
+        MethodIdentityTemplate Identity,
         string DeclaringTypeDefinitionId,
-        IReadOnlyList<string> DeclaringTypeArgumentIds,
-        string Name,
-        int GenericArity,
-        IReadOnlyList<string> ParameterTypeIds,
-        string ReturnTypeId,
         IReadOnlyList<string> GenericArgumentTypeIds,
         bool HasInstance,
         string TargetAssemblyIdentity,
@@ -2148,10 +1466,8 @@ namespace SetterChecker.Core
         /// <summary>当前模块中的函数定义标记。</summary>
         public int? KnownMetadataToken { get; init; }
 
-        internal MethodIdentityTemplate Identity { get; init; } = null!;
-
-        internal IReadOnlyList<TypeIdentityTemplate> GenericArgumentIdentities { get; init; } =
-            Array.Empty<TypeIdentityTemplate>();
+        /// <summary>直接展示函数身份中的名称。</summary>
+        public string Name => this.Identity.Name;
     }
 
     /// <summary>
@@ -2190,68 +1506,39 @@ namespace SetterChecker.Core
         string LibraryName,
         string EntryPoint);
 
+    /// <summary>保存非调用指令直接使用的类型及其原始位置。</summary>
+    public sealed record BehaviorTypeUse(BehaviorTypeReference Type, int Position, string Operation);
+
     /// <summary>
     /// 保存一个函数的值来源、写入、调用与返回事实。
     /// </summary>
-    public sealed class MethodBehavior
+    /// <param name="MethodId">函数的唯一身份。</param>
+    /// <param name="BodyKind">函数体来源。</param>
+    /// <param name="Values">按连续值编号排列的来源。</param>
+    /// <param name="Assignments">局部槽和参数槽赋值。</param>
+    /// <param name="Writes">直接存储写入。</param>
+    /// <param name="Calls">函数调用。</param>
+    /// <param name="Returns">函数返回。</param>
+    /// <param name="Blocks">控制流块。</param>
+    /// <param name="ExceptionHandlers">完整异常处理表。</param>
+    /// <param name="NativeBoundary">原生库和入口。</param>
+    public sealed record MethodBehavior(
+        string MethodId,
+        MethodBodyKind BodyKind,
+        IReadOnlyList<BehaviorValue> Values,
+        IReadOnlyList<BehaviorAssignment> Assignments,
+        IReadOnlyList<BehaviorWrite> Writes,
+        IReadOnlyList<BehaviorCall> Calls,
+        IReadOnlyList<BehaviorReturn> Returns,
+        IReadOnlyList<BehaviorFlowBlock> Blocks,
+        IReadOnlyList<BehaviorExceptionHandler> ExceptionHandlers,
+        NativeBoundary? NativeBoundary = null)
     {
-        // 保存一组已经读取并保持顺序的函数行为事实。
-        /// <summary>
-        /// 建立一个函数的行为结果。
-        /// </summary>
-        public MethodBehavior(
-            string methodId,
-            MethodBodyKind bodyKind,
-            IReadOnlyList<BehaviorValue> values,
-            IReadOnlyList<BehaviorAssignment> assignments,
-            IReadOnlyList<BehaviorWrite> writes,
-            IReadOnlyList<BehaviorCall> calls,
-            IReadOnlyList<BehaviorReturn> returns,
-            NativeBoundary? nativeBoundary = null,
-            IReadOnlyList<BehaviorFlowBlock>? blocks = null,
-            IReadOnlyList<BehaviorFlowRegion>? regions = null)
-        {
-            this.MethodId = methodId;
-            this.BodyKind = bodyKind;
-            this.Values = values;
-            this.Assignments = assignments;
-            this.Writes = writes;
-            this.Calls = calls;
-            this.Returns = returns;
-            this.NativeBoundary = nativeBoundary;
-            this.Blocks = blocks ?? Array.Empty<BehaviorFlowBlock>();
-            this.Regions = regions ?? Array.Empty<BehaviorFlowRegion>();
-        }
+        /// <summary>当前函数体尚未读出的原始分析失败。</summary>
+        public string? Failure { get; init; }
 
-        /// <summary>函数的唯一身份。</summary>
-        public string MethodId { get; }
-
-        /// <summary>函数体来源种类。</summary>
-        public MethodBodyKind BodyKind { get; }
-
-        /// <summary>函数体的控制流块。</summary>
-        public IReadOnlyList<BehaviorFlowBlock> Blocks { get; }
-
-        /// <summary>函数体的局部生命周期和异常处理区域。</summary>
-        public IReadOnlyList<BehaviorFlowRegion> Regions { get; }
-
-        /// <summary>按连续值编号排列的来源，可直接用值编号作为下标。</summary>
-        public IReadOnlyList<BehaviorValue> Values { get; }
-
-        /// <summary>局部槽和参数槽之间的赋值事实。</summary>
-        public IReadOnlyList<BehaviorAssignment> Assignments { get; }
-
-        /// <summary>直接存储写入事实。</summary>
-        public IReadOnlyList<BehaviorWrite> Writes { get; }
-
-        /// <summary>调用事实。</summary>
-        public IReadOnlyList<BehaviorCall> Calls { get; }
-
-        /// <summary>返回事实。</summary>
-        public IReadOnlyList<BehaviorReturn> Returns { get; }
-
-        /// <summary>平台调用函数声明的原生库和入口。</summary>
-        public NativeBoundary? NativeBoundary { get; }
+        /// <summary>数组、转换、复制、初始化等指令直接使用的类型。</summary>
+        public IReadOnlyList<BehaviorTypeUse> TypeUses { get; init; } = Array.Empty<BehaviorTypeUse>();
 
         // 建立没有可执行行为的声明或原生函数结果。
         internal static MethodBehavior Empty(
@@ -2267,6 +1554,8 @@ namespace SetterChecker.Core
                 Array.Empty<BehaviorWrite>(),
                 Array.Empty<BehaviorCall>(),
                 Array.Empty<BehaviorReturn>(),
+                Array.Empty<BehaviorFlowBlock>(),
+                Array.Empty<BehaviorExceptionHandler>(),
                 nativeBoundary);
         }
     }
@@ -2274,26 +1563,12 @@ namespace SetterChecker.Core
     /// <summary>
     /// 保存一批函数行为和固定顺序的查找表。
     /// </summary>
-    public sealed class BehaviorReadResult
+    /// <param name="Methods">按函数身份排列的全部行为。</param>
+    /// <param name="Elapsed">读取本批行为的耗时。</param>
+    public sealed record BehaviorReadResult(IReadOnlyList<MethodBehavior> Methods, TimeSpan Elapsed)
     {
-        // 保存按函数身份排好顺序的行为结果。
-        /// <summary>
-        /// 建立一批函数的行为读取结果。
-        /// </summary>
-        public BehaviorReadResult(IReadOnlyList<MethodBehavior> methods, TimeSpan elapsed)
-        {
-            this.Methods = methods;
-            this.MethodsById = methods.ToDictionary(method => method.MethodId, StringComparer.Ordinal);
-            this.Elapsed = elapsed;
-        }
-
-        /// <summary>按函数身份排序的全部行为。</summary>
-        public IReadOnlyList<MethodBehavior> Methods { get; }
-
         /// <summary>按函数身份查找行为。</summary>
-        public IReadOnlyDictionary<string, MethodBehavior> MethodsById { get; }
-
-        /// <summary>读取这一批函数行为所用的时间。</summary>
-        public TimeSpan Elapsed { get; }
+        public IReadOnlyDictionary<string, MethodBehavior> MethodsById { get; } =
+            Methods.ToDictionary(method => method.MethodId, StringComparer.Ordinal);
     }
 }

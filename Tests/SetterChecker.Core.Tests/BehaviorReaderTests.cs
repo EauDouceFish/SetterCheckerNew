@@ -6,6 +6,208 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class BehaviorReaderTests
     {
+        // 保留异常对象和筛选值，后续才能按真实抛出位置接回异常处理。
+        /// <summary>源码和 DLL 的 throw、rethrow、endfilter 均保存原始操作数和位置。</summary>
+        [TestMethod]
+        public async Task ReadAsyncPreservesExceptionTransferValues()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Calls
+                {
+                    public static void Run(System.Exception error, bool accept)
+                    {
+                        try { throw error; }
+                        catch (System.Exception caught) when (accept) { throw; }
+                    }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name == "Run").ToArray();
+            BehaviorReadResult result = await new BehaviorReader().ReadAsync(material, catalog, roots, 2);
+            foreach (MethodBehavior body in result.Methods)
+            {
+                foreach (string instruction in new[] { "throw", "rethrow", "endfilter" })
+                {
+                    BehaviorValue transfer = body.Values.Single(value => value.Kind == BehaviorValueKind.Computation && value.Reference == instruction);
+                    Assert.IsNotNull(transfer.Point);
+                    Assert.HasCount(instruction == "rethrow" ? 0 : 1, transfer.InputValueIds);
+                }
+                BehaviorValue exception = body.Values.Single(value => value.Kind == BehaviorValueKind.Exception);
+                Assert.AreEqual(body.ExceptionHandlers.Single().HandlerStartBlockId, exception.Point!.Value.BlockId);
+            }
+        }
+
+        // 逐项对照真实异常表，保证移除合成区域树后没有丢失原始事实。
+        /// <summary>源码内存产物和 DLL 均完整保留筛选、处理范围、类型及表内顺序。</summary>
+        [TestMethod]
+        public async Task ReadAsyncPreservesRawExceptionTable()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Calls
+                {
+                    private static int value;
+                    public static void Run(bool accept)
+                    {
+                        try
+                        {
+                            try { throw new System.InvalidOperationException(); }
+                            catch (System.InvalidOperationException) when (accept) { value = 1; }
+                            catch (System.Exception) { value = 2; }
+                        }
+                        finally { value = 3; }
+                    }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name == "Run").ToArray();
+            BehaviorReadResult result = await new BehaviorReader().ReadAsync(material, catalog, roots, 2);
+
+            foreach (MethodEntry root in roots)
+            {
+                byte[] bytes = material.SourceAssemblies.SingleOrDefault(source => source.AssemblyPath == root.AssemblyPath)?.AssemblyImage
+                    ?? File.ReadAllBytes(root.AssemblyPath!);
+                using MemoryStream stream = new(bytes);
+                using Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(stream);
+                Mono.Cecil.Cil.MethodBody original = ((Mono.Cecil.MethodDefinition)module.LookupToken(root.MetadataToken)).Body;
+                IReadOnlyList<BehaviorExceptionHandler> actual = result.MethodsById[root.Id].ExceptionHandlers;
+                Assert.HasCount(original.ExceptionHandlers.Count, actual);
+                for (int index = 0; index < actual.Count; index++)
+                {
+                    Mono.Cecil.Cil.ExceptionHandler expected = original.ExceptionHandlers[index];
+                    Assert.AreEqual(expected.HandlerType.ToString(), actual[index].Kind.ToString());
+                    Assert.AreEqual(expected.TryStart.Offset, actual[index].TryStartBlockId);
+                    Assert.AreEqual(expected.TryEnd?.Offset ?? original.CodeSize, actual[index].TryEndBlockId);
+                    Assert.AreEqual(expected.HandlerStart.Offset, actual[index].HandlerStartBlockId);
+                    Assert.AreEqual(expected.HandlerEnd?.Offset ?? original.CodeSize, actual[index].HandlerEndBlockId);
+                    Assert.AreEqual(expected.FilterStart?.Offset, actual[index].FilterStartBlockId);
+                    Assert.AreEqual(expected.CatchType == null, actual[index].ExceptionType == null);
+                    if (expected.CatchType != null)
+                    {
+                        StringAssert.EndsWith(actual[index].ExceptionType!.DefinitionId, expected.CatchType.FullName);
+                    }
+                }
+            }
+        }
+
+        // 验证反射取得函数和字段标记时也保留其携带的类型参数。
+        /// <summary>
+        /// 表达式树中的成员标记不能漏掉函数实参或字段所属类型。
+        /// </summary>
+        [TestMethod]
+        [DataRow("Method")]
+        [DataRow("Field")]
+        public async Task ReadAsyncPreservesTypesExposedByMemberTokens(string methodName)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                using System;
+                using System.Linq.Expressions;
+                namespace Samples;
+                public static class Helper { public static void Run<T>() { } }
+                public static class Holder<T> { public static T Value; }
+                public static class Calls
+                {
+                    public static Expression<Action> Method<T>() => () => Helper.Run<T>();
+                    public static Expression<Func<T>> Field<T>() => () => Holder<T>.Value;
+                }
+                """);
+            File.WriteAllLines(project.RootResponsePath, File.ReadAllLines(project.RootResponsePath)
+                .Where(line => !line.StartsWith("-analyzer:", StringComparison.Ordinal)), encoding: new System.Text.UTF8Encoding(false));
+            File.Delete(project.AnalyzerPath);
+            File.AppendAllLines(project.RootResponsePath,
+                typeof(System.Linq.Expressions.Expression).Assembly.GetReferencedAssemblies()
+                    .Select(System.Reflection.Assembly.Load).Append(typeof(System.Linq.Expressions.Expression).Assembly)
+                    .Select(assembly => $"-r:\"{assembly.Location}\""), encoding: new System.Text.UTF8Encoding(false));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name == methodName).ToArray();
+            Assert.HasCount(2, roots);
+
+            BehaviorReadResult result = await new BehaviorReader().ReadAsync(material, catalog, roots, 2);
+
+            foreach (MethodBehavior body in result.Methods)
+            {
+                BehaviorValue token = body.Values.Single(value => methodName == "Method"
+                    ? value.Method?.Name == "Run" : value.Member?.Name == "Value");
+                Assert.IsNotNull(token.Point);
+                BehaviorTypeUse[] uses = body.TypeUses.Where(use => use.Position == token.Point.Value.BlockId).ToArray();
+                Assert.IsNotEmpty(uses);
+                if (methodName == "Method")
+                {
+                    BehaviorTypeReference argument = uses.Single(use => use.Type.Id == "!!0").Type;
+                    Assert.AreEqual("!!0", argument.DefinitionId);
+                    Assert.IsNull(argument.TargetAssemblyIdentity);
+                }
+                else
+                {
+                    BehaviorTypeReference declaringType = uses.Single().Type;
+                    CollectionAssert.AreEqual(new[] { "!!0" }, declaringType.ArgumentIdentities.Select(type => type.Text).ToArray());
+                    StringAssert.Contains(declaringType.DefinitionId, "Holder");
+                }
+            }
+        }
+
+        // 验证数组、默认值和引用复制指令保留直接使用的泛型类型。
+        /// <summary>
+        /// 没有普通函数调用的指令也可能观察类型，后续不能把这部分信息丢掉。
+        /// </summary>
+        [TestMethod]
+        [DataRow("Read", 1, false)]
+        [DataRow("Write", 1, false)]
+        [DataRow("Default", 1, false)]
+        [DataRow("Copy", 2, false)]
+        [DataRow("Read", 1, true)]
+        [DataRow("Write", 1, true)]
+        [DataRow("Default", 1, true)]
+        [DataRow("Copy", 2, true)]
+        public async Task ReadAsyncPreservesTypesUsedByNonCallInstructions(string methodName, int expectedCount, bool classParameter)
+        {
+            string source = """
+                namespace Samples;
+                public static class Calls
+                {
+                    public static T Read<T>(T[] values, int index) => values[index];
+                    public static void Write<T>(T[] values, int index, T value) { values[index] = value; }
+                    public static T Default<T>() => default;
+                    public static void Copy<T>(ref T target, in T source) { target = source; }
+                }
+                """;
+            if (classParameter)
+            {
+                source = source.Replace("class Calls", "class Calls<T>", StringComparison.Ordinal)
+                    .Replace("Read<T>", "Read", StringComparison.Ordinal).Replace("Write<T>", "Write", StringComparison.Ordinal)
+                    .Replace("Default<T>", "Default", StringComparison.Ordinal).Replace("Copy<T>", "Copy", StringComparison.Ordinal);
+            }
+            using TestProject project = TestProject.CreateWithCallTargets(source);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name is "Calls" or "Calls`1").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name == methodName).ToArray();
+            Assert.HasCount(2, roots);
+
+            BehaviorReadResult result = await new BehaviorReader().ReadAsync(material, catalog, roots, 2);
+
+            foreach (MethodBehavior body in result.Methods)
+            {
+                Assert.HasCount(expectedCount, body.TypeUses);
+                foreach (BehaviorTypeUse use in body.TypeUses)
+                {
+                    Assert.AreEqual(classParameter ? "!0" : "!!0", use.Type.Id);
+                    Assert.AreEqual(use.Type.Id, use.Type.DefinitionId);
+                    Assert.IsNull(use.Type.TargetAssemblyIdentity);
+                    Assert.IsNull(use.Type.KnownTypeId);
+                    Assert.IsNotNull(use.Type.ReferringAssemblyPath);
+                }
+                Assert.HasCount(expectedCount, body.TypeUses.Select(use => use.Position).Distinct().ToArray());
+            }
+        }
+
         // 验证泛型调用保留原始方法规格标记，同时另存实际本地定义标记。
         /// <summary>
         /// 源码内存产物和 DLL 的泛型调用都使用原始 MethodSpec，而不是解包后的 MethodDef。
@@ -149,7 +351,7 @@ namespace SetterChecker.Core.Tests
                 BehaviorCall creation = behavior.Calls.Single();
                 BehaviorValue value = behavior.Values[creation.ResultValueId!.Value];
                 Assert.IsNotNull(value.Type);
-                Assert.AreEqual(creation.Target.DeclaringTypeId, value.Type.Id);
+                Assert.AreEqual(creation.Target.Identity.DeclaringType.Text, value.Type.Id);
             }
 
             BehaviorValue[] arrays = pairs["CreateArray"].Select(behavior =>
@@ -231,19 +433,19 @@ namespace SetterChecker.Core.Tests
             StringAssert.Contains(exception.Message, "jmp");
         }
 
-        // 验证工具总入口只读取当前可报告根函数行为。
+        // 验证行为模块按调用方明确给出的统计根读取行为。
         /// <summary>
-        /// 验证模块三已经接入固定分析顺序，而不是只供测试单独调用。
+        /// 完整入口由报告测试覆盖，本项验证模块三公开读取范围。
         /// </summary>
         [TestMethod]
         public async Task AnalyzeAsyncReadsReportableSourceMethodBehaviors()
         {
             using TestProject project = TestProject.CreateWithBehaviorMethods();
 
-            (MaterialSet _, MethodCatalogResult catalog, BehaviorReadResult behaviors) =
-                await new SetterChecker().AnalyzeAsync(new MaterialRequest(
-                    project.AssemblyDefinitionPath,
-                    4));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            BehaviorReadResult behaviors = await new BehaviorReader().ReadAsync(material, catalog,
+                catalog.Methods.Where(method => method.IsReportable).ToArray(), 4);
 
             MethodEntry[] roots = catalog.Methods.Where(method => method.IsReportable).ToArray();
 
@@ -514,9 +716,7 @@ namespace SetterChecker.Core.Tests
                 BehaviorValue writtenValue = behavior.Values[write.ValueId];
                 Assert.AreEqual(BehaviorValueKind.FieldRead, writtenValue.Kind);
                 Assert.AreEqual("m_value", writtenValue.Member!.Name);
-                Assert.AreEqual(
-                    BehaviorValueKind.CurrentInstance,
-                    behavior.Values[writtenValue.InputValueIds.Single()].Kind);
+                AssertCurrentInstanceRead(behavior, writtenValue.InputValueIds.Single());
                 int returnedId = behavior.Returns.Single().ValueId!.Value;
                 foreach (BehaviorValue source in behavior.Values.Where(value =>
                              value.Kind == BehaviorValueKind.Parameter
@@ -653,17 +853,13 @@ namespace SetterChecker.Core.Tests
                 {
                     BehaviorWrite write = behavior.Writes.Single();
                     Assert.AreEqual("System.Int32", write.Member!.FieldTypeId);
-                    CollectionAssert.AreEqual(
-                        new[] { "System.Int32" },
-                        write.Member.DeclaringTypeArgumentIds.ToArray());
+                    Assert.AreEqual(write.Member.DeclaringTypeDefinitionId + "<System.Int32>", write.Member.DeclaringTypeIdentity.Text);
                     BehaviorMethodReference target = behavior.Calls.Single().Target;
                     CollectionAssert.AreEqual(
                         new[] { "System.Int32" },
-                        target.ParameterTypeIds.ToArray());
-                    Assert.AreEqual("System.Int32", target.ReturnTypeId);
-                    CollectionAssert.AreEqual(
-                        new[] { "System.Int32" },
-                        target.DeclaringTypeArgumentIds.ToArray());
+                        target.Identity.Parameters.Select(type => type.Text).ToArray());
+                    Assert.AreEqual("System.Int32", target.Identity.ReturnType.Text);
+                    Assert.AreEqual(target.DeclaringTypeDefinitionId + "<System.Int32>", target.Identity.DeclaringType.Text);
                 }
                 else
                 {
@@ -671,8 +867,8 @@ namespace SetterChecker.Core.Tests
                     Assert.AreEqual(BehaviorCallKind.Direct, behavior.Calls.Single().Kind);
                     CollectionAssert.AreEqual(
                         new[] { "!!0" },
-                        target.ParameterTypeIds.ToArray());
-                    Assert.AreEqual("!!0", target.ReturnTypeId);
+                        target.Identity.Parameters.Select(type => type.Text).ToArray());
+                    Assert.AreEqual("!!0", target.Identity.ReturnType.Text);
                     CollectionAssert.AreEqual(
                         new[] { "System.Int32" },
                         target.GenericArgumentTypeIds.ToArray());
@@ -786,9 +982,7 @@ namespace SetterChecker.Core.Tests
                 if (method.Name == "PassFieldByReference")
                 {
                     Assert.AreEqual("m_value", address.Member!.Name);
-                    Assert.AreEqual(
-                        BehaviorValueKind.CurrentInstance,
-                        behavior.Values[address.InputValueIds.Single()].Kind);
+                    AssertCurrentInstanceRead(behavior, address.InputValueIds.Single());
                 }
                 else
                 {
@@ -880,7 +1074,7 @@ namespace SetterChecker.Core.Tests
                 2,
                 functions.Select(value =>
                         $"{value.Method!.DeclaringTypeDefinitionId}|{value.Method.Name}|"
-                            + string.Join('|', value.Method.ParameterTypeIds))
+                            + string.Join('|', value.Method.Identity.Parameters.Select(type => type.Text)))
                     .Distinct(StringComparer.Ordinal)
                     .Count());
             Assert.IsTrue(functions.All(value =>
@@ -1765,7 +1959,7 @@ namespace SetterChecker.Core.Tests
                     .Select(call => behavior.Values[call.Arguments.Single().ValueId].Reference)
                     .ToArray();
                 CollectionAssert.AreEqual(new[] { "1", "2", "3" }, arguments);
-                Assert.IsTrue(behavior.Blocks.All(block => block.EnclosingRegionId == 0));
+                Assert.IsEmpty(behavior.ExceptionHandlers);
             }
         }
 
@@ -1805,9 +1999,7 @@ namespace SetterChecker.Core.Tests
                 Assert.AreEqual(BehaviorCallKind.Direct, call.Kind);
                 Assert.AreEqual(".ctor", call.Target.Name);
                 StringAssert.Contains(call.Target.DeclaringTypeDefinitionId, "BaseInitialized");
-                Assert.AreEqual(
-                    BehaviorValueKind.CurrentInstance,
-                    behavior.Values[call.ReceiverValueId!.Value].Kind);
+                AssertCurrentInstanceRead(behavior, call.ReceiverValueId!.Value);
             }
         }
 
@@ -2268,26 +2460,27 @@ namespace SetterChecker.Core.Tests
             {
                 BehaviorFlowEdge thrown = behavior.Blocks.SelectMany(block => block.Successors)
                     .Single(edge => edge.Semantics == BehaviorFlowBranchSemantics.Throw);
-                Assert.IsEmpty(thrown.FinallyRegionIds, behavior.MethodId);
+                Assert.IsEmpty(thrown.FinallyBlockIds, behavior.MethodId);
                 BehaviorCall caught = behavior.Calls.Single(call => call.Target.Name == "Apply");
                 BehaviorCall final = behavior.Calls.Single(call => call.Target.Name == "WriteStatic");
-                BehaviorFlowRegion catchRegion = behavior.Regions.Single(region =>
-                    region.Kind == BehaviorFlowRegionKind.Catch
+                BehaviorExceptionHandler catchRegion = behavior.ExceptionHandlers.Single(region =>
+                    region.Kind == BehaviorExceptionHandlerKind.Catch
                     && ContainsBlock(region, caught.Point.BlockId));
-                BehaviorFlowRegion finallyRegion = behavior.Regions.Single(region =>
-                    region.Kind == BehaviorFlowRegionKind.Finally
+                BehaviorExceptionHandler finallyRegion = behavior.ExceptionHandlers.Single(region =>
+                    region.Kind == BehaviorExceptionHandlerKind.Finally
                     && ContainsBlock(region, final.Point.BlockId));
-                Assert.AreEqual(catchRegion.Id, behavior.Blocks.Single(block =>
-                    block.Id == caught.Point.BlockId).EnclosingRegionId);
+                Assert.IsTrue(catchRegion.TryStartBlockId < catchRegion.TryEndBlockId);
+                Assert.IsTrue(finallyRegion.TryStartBlockId <= catchRegion.HandlerStartBlockId
+                    && finallyRegion.TryEndBlockId >= catchRegion.HandlerEndBlockId);
                 Assert.IsTrue(behavior.Blocks.Where(block =>
                         ContainsBlock(catchRegion, block.Id))
                     .SelectMany(block => block.Successors)
-                    .Any(edge => edge.FinallyRegionIds.Contains(finallyRegion.Id)
+                    .Any(edge => edge.FinallyBlockIds.Contains(finallyRegion.HandlerStartBlockId)
                         || edge.TargetBlockId is int continuation
                         && behavior.Blocks.Where(block =>
                                 CanReachBlock(behavior, continuation, block.Id))
                             .SelectMany(block => block.Successors)
-                            .Any(next => next.FinallyRegionIds.Contains(finallyRegion.Id))),
+                            .Any(next => next.FinallyBlockIds.Contains(finallyRegion.HandlerStartBlockId))),
                     System.Text.Json.JsonSerializer.Serialize(behavior));
             }
         }
@@ -2308,24 +2501,24 @@ namespace SetterChecker.Core.Tests
                         call.Target.Name == "WriteStatic")
                     .OrderBy(call => behavior.Values[call.Arguments.Single().ValueId].Reference)
                     .ToArray();
-                BehaviorFlowRegion inner = behavior.Regions.Single(region =>
-                    region.Kind == BehaviorFlowRegionKind.Finally
+                BehaviorExceptionHandler inner = behavior.ExceptionHandlers.Single(region =>
+                    region.Kind == BehaviorExceptionHandlerKind.Finally
                     && ContainsBlock(region, writes[0].Point.BlockId));
-                BehaviorFlowRegion outer = behavior.Regions.Single(region =>
-                    region.Kind == BehaviorFlowRegionKind.Finally
+                BehaviorExceptionHandler outer = behavior.ExceptionHandlers.Single(region =>
+                    region.Kind == BehaviorExceptionHandlerKind.Finally
                     && ContainsBlock(region, writes[1].Point.BlockId));
                 (BehaviorFlowBlock Block, BehaviorFlowEdge Edge) innerExit = behavior.Blocks
                     .SelectMany(block => block.Successors.Select(edge => (block, edge)))
-                    .Single(item => item.edge.FinallyRegionIds.Contains(inner.Id));
+                    .Single(item => item.edge.FinallyBlockIds.Contains(inner.HandlerStartBlockId));
                 int outerIndex = Array.IndexOf(
-                    innerExit.Edge.FinallyRegionIds.ToArray(),
-                    outer.Id);
+                    innerExit.Edge.FinallyBlockIds.ToArray(),
+                    outer.HandlerStartBlockId);
                 if (outerIndex >= 0)
                 {
                     Assert.IsTrue(
                         Array.IndexOf(
-                            innerExit.Edge.FinallyRegionIds.ToArray(),
-                            inner.Id) < outerIndex);
+                            innerExit.Edge.FinallyBlockIds.ToArray(),
+                            inner.HandlerStartBlockId) < outerIndex);
                 }
                 else
                 {
@@ -2334,7 +2527,7 @@ namespace SetterChecker.Core.Tests
                     Assert.IsTrue(behavior.Blocks.Where(block =>
                             CanReachBlock(behavior, continuation, block.Id))
                         .SelectMany(block => block.Successors)
-                        .Any(edge => edge.FinallyRegionIds.Contains(outer.Id)));
+                        .Any(edge => edge.FinallyBlockIds.Contains(outer.HandlerStartBlockId)));
                 }
             }
         }
@@ -2431,18 +2624,24 @@ namespace SetterChecker.Core.Tests
         {
             using TestProject project = TestProject.CreateWithBehaviorMethods();
 
-            BehaviorReadResult single = (await new SetterChecker().AnalyzeAsync(
-                new MaterialRequest(project.AssemblyDefinitionPath, 1))).Behaviors;
+            BehaviorReadResult single = await ReadReportableBehaviorsAsync(project, 1);
             string[] expected = ProjectBehaviors(single).ToArray();
             foreach (int jobs in new[] { 2, 4, 8 })
             {
-                BehaviorReadResult parallel = (await new SetterChecker().AnalyzeAsync(
-                    new MaterialRequest(project.AssemblyDefinitionPath, jobs))).Behaviors;
+                BehaviorReadResult parallel = await ReadReportableBehaviorsAsync(project, jobs);
                 CollectionAssert.AreEqual(
                     expected,
                     ProjectBehaviors(parallel).ToArray(),
                     $"-j{jobs.ToString()} 输出与 -j1 不同。");
             }
+        }
+
+        // 通过模块公开入口读取指定并行数量下的同一批根函数。
+        private static async Task<BehaviorReadResult> ReadReportableBehaviorsAsync(TestProject project, int jobs)
+        {
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, jobs));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, jobs);
+            return await new BehaviorReader().ReadAsync(material, catalog, catalog.Methods.Where(method => method.IsReportable).ToArray(), jobs);
         }
 
         // 一次建立测试项目并读取所需函数的源码与真实托管版本。
@@ -2484,30 +2683,24 @@ namespace SetterChecker.Core.Tests
             MethodCatalogResult catalog,
             BehaviorMethodReference reference)
         {
-            TypeEntry? type = catalog.Types.SingleOrDefault(candidate =>
-                candidate.Id == reference.DeclaringTypeDefinitionId
-                || candidate.Id == reference.DeclaringTypeId
-                || candidate.LogicalId == reference.DeclaringTypeDefinitionId
-                || candidate.LogicalId == reference.DeclaringTypeId
-                || candidate.AliasIds.Contains(
-                    reference.DeclaringTypeDefinitionId,
-                    StringComparer.Ordinal)
-                || candidate.AliasIds.Contains(
-                    reference.DeclaringTypeId,
-                    StringComparer.Ordinal));
+            TypeEntry? type = new[] { reference.DeclaringTypeDefinitionId, reference.Identity.DeclaringType.Text }
+                .SelectMany(id => catalog.TypesById.TryGetValue(id, out TypeEntry? definition)
+                    ? new[] { definition }
+                    : catalog.TypesByLogicalId.GetValueOrDefault(id) ?? Array.Empty<TypeEntry>())
+                .DistinctBy(candidate => candidate.Id).SingleOrDefault();
             if (type == null)
             {
                 throw new InvalidOperationException(
-                    $"找不到结构化声明类型：{reference.DeclaringTypeId} / "
+                    $"找不到结构化声明类型：{reference.Identity.DeclaringType.Text} / "
                         + reference.DeclaringTypeDefinitionId);
             }
 
             return catalog.GetMethods(type).Single(candidate =>
                 candidate.Name == reference.Name
-                && candidate.GenericArity == reference.GenericArity
-                && candidate.ReturnTypeId == reference.ReturnTypeId
+                && candidate.GenericArity == reference.Identity.GenericArity
+                && candidate.ReturnTypeId == reference.Identity.ReturnType.Text
                 && candidate.Parameters.Select(parameter => parameter.TypeId)
-                    .SequenceEqual(reference.ParameterTypeIds, StringComparer.Ordinal));
+                    .SequenceEqual(reference.Identity.Parameters.Select(parameter => parameter.Text), StringComparer.Ordinal));
         }
 
         // 从迭代器工厂实际创建的类型定位生成的遍历函数。
@@ -2546,10 +2739,17 @@ namespace SetterChecker.Core.Tests
             BehaviorWrite write = behavior.Writes.Single();
             Assert.AreEqual(BehaviorWriteKind.Field, write.Kind);
             Assert.IsNotNull(write.ReceiverValueId);
-            Assert.AreEqual(
-                BehaviorValueKind.CurrentInstance,
-                behavior.Values[write.ReceiverValueId.Value].Kind);
+            AssertCurrentInstanceRead(behavior, write.ReceiverValueId.Value);
             AssertParameter(behavior, write.ValueId, 0);
+        }
+
+        // 核对当前对象读取保留独立位置，且仍连接同一个当前对象。
+        private static void AssertCurrentInstanceRead(MethodBehavior behavior, int valueId)
+        {
+            BehaviorValue read = behavior.Values[valueId];
+            Assert.AreEqual(BehaviorValueKind.SlotRead, read.Kind);
+            Assert.IsNotNull(read.Point);
+            AssertValueFlowsFrom(behavior, valueId, behavior.Values.Single(value => value.Kind == BehaviorValueKind.CurrentInstance).Id);
         }
 
         // 核对一个值来源是指定位置的函数参数。
@@ -2729,9 +2929,9 @@ namespace SetterChecker.Core.Tests
         }
 
         // 判断一个基本块是否位于指定的连续控制流区域内。
-        private static bool ContainsBlock(BehaviorFlowRegion region, int blockId)
+        private static bool ContainsBlock(BehaviorExceptionHandler region, int blockId)
         {
-            return blockId >= region.FirstBlockId && blockId <= region.LastBlockId;
+            return blockId >= region.HandlerStartBlockId && blockId < region.HandlerEndBlockId;
         }
 
         // 沿局部赋值继续查找测试需要的值来源。

@@ -15,34 +15,25 @@ namespace SetterChecker.Cli
         /// </summary>
         public static async Task<int> Main(string[] arguments)
         {
-            Console.OutputEncoding = Encoding.UTF8;
+            Console.OutputEncoding = new UTF8Encoding(false);
 
             try
             {
-                (string projectPath, int jobs) = ParseArguments(arguments);
+                (string projectPath, int jobs, string output) = ParseArguments(arguments);
                 Stopwatch stopwatch = Stopwatch.StartNew();
-                (
-                    MaterialSet material,
-                    MethodCatalogResult catalog,
-                    BehaviorReadResult behaviors) = await new SetterChecker.Core.SetterChecker()
-                        .AnalyzeAsync(new MaterialRequest(projectPath, jobs));
+                AnalysisRun run = await new SetterChecker.Core.SetterChecker()
+                        .AnalyzeAsync(new MaterialRequest(projectPath, jobs), progress: Console.Error.WriteLine,
+                            reportProgress: current => new ReportWriter().Write(current, output));
+                new ReportWriter().Write(run, output);
                 stopwatch.Stop();
 
-                Console.WriteLine($"源码程序集：{material.SourceAssemblies.Count}");
-                Console.WriteLine($"源码文件：{material.SourceAssemblies.Sum(item => item.SourcePaths.Count)}");
-                Console.WriteLine($"外部编译文件：{material.ExternalAssemblies.Count}");
-                Console.WriteLine($"分析器文件：{material.AnalyzerPaths.Count}");
-                Console.WriteLine($"材料读取耗时（含编译）：{material.Elapsed.TotalMilliseconds:F0} 毫秒");
-                Console.WriteLine($"其中当前源码编译：{material.CompilationElapsed.TotalMilliseconds:F0} 毫秒");
-                Console.WriteLine($"已建立源码函数：{catalog.Methods.Count}");
-                Console.WriteLine($"已建立全部类型：{catalog.Types.Count}");
-                Console.WriteLine($"khengine 可报告函数：{catalog.Methods.Count(method => method.IsReportable)}");
-                Console.WriteLine($"函数总表耗时：{catalog.Elapsed.TotalMilliseconds:F0} 毫秒");
-                Console.WriteLine($"已读取函数行为：{behaviors.Methods.Count}");
-                Console.WriteLine($"函数行为读取耗时：{behaviors.Elapsed.TotalMilliseconds:F0} 毫秒");
-                Console.WriteLine($"当前完整流程耗时：{stopwatch.Elapsed.TotalMilliseconds:F0} 毫秒");
+                Console.WriteLine(run.Complete ? "分析完成" : "验收未通过；已输出确定结论与待解决问题");
+                Console.WriteLine($"khengine 总函数：{run.Annotations.Methods.Count(method => method.IsReportable)}");
+                Console.WriteLine($"已证明真实行为：{run.Annotations.Methods.Count(method => method.IsReportable && method.Actual != null)}");
+                Console.WriteLine($"报告目录：{Path.GetFullPath(output)}");
+                Console.WriteLine($"完整耗时（包含源码编译和报告写出）：{stopwatch.Elapsed.TotalSeconds:F3} 秒");
 
-                return 0;
+                return run.Complete ? 0 : 1;
             }
             catch (AnalysisException exception)
             {
@@ -53,10 +44,11 @@ namespace SetterChecker.Cli
         }
 
         // 解析项目路径和全程序共用的最大并行数。
-        private static (string ProjectPath, int Jobs) ParseArguments(string[] arguments)
+        private static (string ProjectPath, int Jobs, string Output) ParseArguments(string[] arguments)
         {
             string? projectPath = null;
             int jobs = 4;
+            string output = Path.Combine(Environment.CurrentDirectory, "reports");
 
             for (int index = 0; index < arguments.Length; index++)
             {
@@ -71,6 +63,11 @@ namespace SetterChecker.Cli
                 {
                     projectPath = ReadValue(arguments, ref index, "--project");
 
+                    continue;
+                }
+                if (argument == "--output")
+                {
+                    output = ReadValue(arguments, ref index, "--output");
                     continue;
                 }
 
@@ -91,7 +88,7 @@ namespace SetterChecker.Cli
                 throw new AnalysisException($"不支持的参数：{argument}");
             }
 
-            return (projectPath ?? throw new AnalysisException("缺少 --project 项目路径。"), jobs);
+            return (projectPath ?? throw new AnalysisException("缺少 --project 项目路径。"), jobs, output);
         }
 
         // 读取必须紧跟在参数名后的值。

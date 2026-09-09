@@ -36,11 +36,10 @@ namespace SetterChecker.Core
             string assemblyDefinitionPath = Path.GetFullPath(request.AssemblyDefinitionPath);
             string projectRoot = FindProjectRoot(assemblyDefinitionPath);
             string reportRoot = FindReportRoot(assemblyDefinitionPath, projectRoot);
-            string assemblyName = ReadAssemblyName(assemblyDefinitionPath);
+            string assemblyName = ReadAssemblyDefinition(assemblyDefinitionPath).Name;
             string responsePath = FindRootResponse(projectRoot, assemblyName);
             IReadOnlyList<CompilerResponse> responses = ReadResponseClosure(
                 projectRoot,
-                assemblyName,
                 responsePath);
             IReadOnlyDictionary<string, SyntaxTree> trees = await ParseSourcesAsync(
                 responses,
@@ -52,57 +51,75 @@ namespace SetterChecker.Core
                 .Select(reference => reference.ReferencePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
             Dictionary<CompilerReference, PortableExecutableReference> metadataReferences =
                 CreateMetadataReferences(responses, sourceReferencePaths, request.Jobs, cancellationToken);
-            bool enableCompilerParallel = responses.Count == 1 && request.Jobs > 1;
+            ILookup<string, CompilerReference> sourceConsumers = responses.SelectMany(response => response.SourceReferences).Distinct()
+                .Join(responses.SelectMany(response => response.References).Distinct(), source => source.ReferencePath, reference => reference.Path,
+                    (source, reference) => (source.AssemblyName, Reference: reference), StringComparer.OrdinalIgnoreCase)
+                .ToLookup(item => item.AssemblyName, item => item.Reference, StringComparer.Ordinal);
             Dictionary<string, SourceAssemblyMaterial> builtAssemblies = new(StringComparer.Ordinal);
             List<CompilerResponse> remaining = responses.ToList();
+            List<Task<SourceAssemblyMaterial>> running = new();
             Stopwatch compilationWatch = Stopwatch.StartNew();
-            while (remaining.Count != 0)
+            try
             {
-                CompilerResponse[] ready = remaining.Where(response => response.SourceReferences
-                    .All(reference => builtAssemblies.ContainsKey(reference.AssemblyName))).ToArray();
-                if (ready.Length == 0)
+                while (remaining.Count != 0 || running.Count != 0)
                 {
-                    throw new AnalysisException("源码程序集存在循环依赖，不能使用旧参考拆开编译："
-                        + string.Join("; ", remaining.Select(response => response.AssemblyName)));
-                }
-
-                SourceAssemblyMaterial[] layer = new SourceAssemblyMaterial[ready.Length];
-                await Parallel.ForEachAsync(Enumerable.Range(0, ready.Length),
-                    new ParallelOptions { MaxDegreeOfParallelism = request.Jobs, CancellationToken = cancellationToken },
-                    (index, token) =>
+                    if (running.Any(task => task.IsFaulted || task.IsCanceled))
                     {
-                        CompilerResponse response = ready[index];
-                        SourceAssemblyMaterial source = BuildSourceAssembly(response, reportRoot, enableCompilerParallel,
-                            trees, metadataReferences, generatorsByAnalyzerSet[AnalyzerSetKey(response.AnalyzerPaths)], token);
-                        using MemoryStream image = new();
-                        EmitResult result = source.Compilation.Emit(image, options: response.EmitOptions, cancellationToken: token);
-                        if (!result.Success)
+                        await Task.WhenAll(running).ConfigureAwait(false);
+                    }
+                    CompilerResponse[] ready = remaining.Where(response => response.SourceReferences
+                        .All(reference => builtAssemblies.ContainsKey(reference.AssemblyName)))
+                        .Take(request.Jobs - running.Count).ToArray();
+                    if (ready.Length == 0 && running.Count == 0)
+                    {
+                        throw new AnalysisException("源码程序集存在循环依赖，不能使用旧参考拆开编译："
+                            + string.Join("; ", remaining.Select(response => response.AssemblyName)));
+                    }
+
+                    foreach (CompilerResponse response in ready)
+                    {
+                        PortableExecutableReference[] references = response.References.Select(reference => metadataReferences[reference]).ToArray();
+                        remaining.Remove(response);
+                        running.Add(Task.Run(() =>
                         {
-                            throw new AnalysisException($"当前源码编译失败：{source.Name} => "
-                                + string.Join("; ", result.Diagnostics.Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error)));
-                        }
+                            SourceAssemblyMaterial source = BuildSourceAssembly(response, reportRoot,
+                                trees, references, generatorsByAnalyzerSet[AnalyzerSetKey(response.AnalyzerPaths)], cancellationToken);
+                            using MemoryStream image = new();
+                            EmitResult result = source.Compilation.Emit(image, options: response.EmitOptions, cancellationToken: cancellationToken);
+                            if (!result.Success)
+                            {
+                                throw new AnalysisException($"当前源码编译失败：{source.Name} => "
+                                    + string.Join("; ", result.Diagnostics.Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error)));
+                            }
 
-                        layer[index] = source with { AssemblyImage = image.ToArray() };
-                        return ValueTask.CompletedTask;
-                    }).ConfigureAwait(false);
-                foreach (SourceAssemblyMaterial source in layer)
-                {
-                    builtAssemblies.Add(source.Name, source);
-                    HashSet<string> referencePaths = responses.SelectMany(response => response.SourceReferences)
-                        .Where(reference => reference.AssemblyName == source.Name).Select(reference => reference.ReferencePath)
-                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                    foreach (CompilerReference reference in responses.SelectMany(response => response.References)
-                                 .Where(reference => referencePaths.Contains(reference.Path)).Distinct())
+                            return source with { AssemblyImage = image.ToArray() };
+                        }, cancellationToken));
+                    }
+                    Task<SourceAssemblyMaterial> completed = await Task.WhenAny(running).ConfigureAwait(false);
+                    if (!completed.IsCompletedSuccessfully)
                     {
-                        metadataReferences.Add(reference, MetadataReference.CreateFromImage(source.AssemblyImage,
-                            reference.Properties, filePath: source.AssemblyPath));
+                        await Task.WhenAll(running).ConfigureAwait(false);
+                    }
+                    SourceAssemblyMaterial finished = await completed.ConfigureAwait(false);
+                    running.Remove(completed);
+                    builtAssemblies.Add(finished.Name, finished);
+                    foreach (CompilerReference reference in sourceConsumers[finished.Name].Distinct())
+                    {
+                        metadataReferences.Add(reference, MetadataReference.CreateFromImage(finished.AssemblyImage,
+                            reference.Properties, filePath: finished.AssemblyPath));
                     }
                 }
-
-                remaining.RemoveAll(response => builtAssemblies.ContainsKey(response.AssemblyName));
+            }
+            finally
+            {
+                // 正常结束时队列为空；失败时只收拢其他任务，原始异常仍由主流程抛出。
+                await ((Task)Task.WhenAll(running)).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
             }
             compilationWatch.Stop();
+            IReadOnlySet<string> editorOnlyAssemblies = ReadEditorOnlyReportAssemblies(reportRoot);
             SourceAssemblyMaterial[] sourceAssemblies = builtAssemblies.Values
+                .Select(source => editorOnlyAssemblies.Contains(source.Name)
+                    ? source with { IsReportAssembly = false, ReportSourcePaths = Array.Empty<string>() } : source)
                 .OrderBy(assembly => assembly.Name, StringComparer.Ordinal).ToArray();
             string[] externalAssemblyPaths = responses
                 .SelectMany(response => response.References)
@@ -114,6 +131,7 @@ namespace SetterChecker.Core
             ExternalMaterialResolution external = await ResolveExternalAssembliesAsync(
                 projectRoot,
                 externalAssemblyPaths,
+                sourceAssemblies.Select(source => source.Name).ToHashSet(StringComparer.OrdinalIgnoreCase),
                 responses.Single(response => string.Equals(
                     response.AssemblyName,
                     assemblyName,
@@ -138,33 +156,40 @@ namespace SetterChecker.Core
                 stopwatch.Elapsed)
             {
                 CompilationElapsed = compilationWatch.Elapsed,
-                UnityRuntimeFacadePaths = external.UnityRuntimeFacadePaths,
                 AssemblyRedirects = external.AssemblyRedirects,
+                UsesUnityLegacyBinding = external.UsesUnityLegacyBinding,
+                ExplicitRuntimeAssemblyPaths = external.ExplicitRuntimeAssemblyPaths,
             };
+        }
+
+        // 只排除 asmdef 明确声明仅用于编辑器的报告程序集，不删除分析材料。
+        private static IReadOnlySet<string> ReadEditorOnlyReportAssemblies(string reportRoot)
+        {
+            Dictionary<string, (bool EditorOnly, string Path)> definitions = new(StringComparer.Ordinal);
+            foreach (string path in Directory.EnumerateFiles(reportRoot, "*.asmdef", SearchOption.AllDirectories))
+            {
+                var definition = ReadAssemblyDefinition(path);
+                if (!definitions.TryAdd(definition.Name, (definition.EditorOnly, path)))
+                {
+                    throw new AnalysisException($"报告包内程序集定义名称重复：{definition.Name}；{definitions[definition.Name].Path}；{path}");
+                }
+            }
+            return definitions.Where(pair => pair.Value.EditorOnly).Select(pair => pair.Key).ToHashSet(StringComparer.Ordinal);
         }
 
         // 从输入程序集定义向上找到包含 package.json 的目标包目录。
         private static string FindReportRoot(string assemblyDefinitionPath, string projectRoot)
         {
-            DirectoryInfo? directory = new FileInfo(assemblyDefinitionPath).Directory;
-
-            while (directory != null && IsUnderDirectory(directory.FullName, projectRoot))
-            {
-                if (File.Exists(Path.Combine(directory.FullName, "package.json")))
-                {
-                    return directory.FullName;
-                }
-
-                directory = directory.Parent;
-            }
-
-            throw new AnalysisException($"程序集定义不属于一个有 package.json 的 Unity 包：{assemblyDefinitionPath}");
+            return ReadParentDirectories(assemblyDefinitionPath).TakeWhile(directory => IsUnderDirectory(directory.FullName, projectRoot))
+                .FirstOrDefault(directory => File.Exists(Path.Combine(directory.FullName, "package.json")))?.FullName
+                ?? throw new AnalysisException($"程序集定义不属于一个有 package.json 的 Unity 包：{assemblyDefinitionPath}");
         }
 
         // 把只有声明的外部参考文件连接到 Unity 当前真实输出文件。
         private static async Task<ExternalMaterialResolution> ResolveExternalAssembliesAsync(
             string projectRoot,
             IReadOnlyList<string> referencePaths,
+            IReadOnlySet<string> sourceAssemblyNames,
             CompilerResponse rootResponse,
             int jobs,
             CancellationToken cancellationToken)
@@ -197,14 +222,20 @@ namespace SetterChecker.Core
                 .Concat(FindSiblingAssemblyPaths(assemblies, unityRuntime))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
+            HashSet<string>? explicitPaths = unityRuntime == null ? null : assemblies
+                .Where(assembly => CanBeAssemblyLookupPath(assembly.ReferencePath, unityRuntime)
+                    && !assembly.ReferencePath.EndsWith(".ref.dll", StringComparison.OrdinalIgnoreCase))
+                .Select(assembly => assembly.ReferencePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            IReadOnlyDictionary<string, IReadOnlyList<string>> pathsByAssemblyName = IndexAssemblyPaths(
+                knownPaths.Where(path => CanBeAssemblyLookupPath(path, unityRuntime)), explicitPaths);
             IReadOnlyDictionary<string, string> assemblyRedirects = ReadAssemblyRedirects(
                 assemblies,
                 knownPaths,
+                pathsByAssemblyName,
+                sourceAssemblyNames,
                 unityRuntime);
-            IReadOnlyDictionary<string, IReadOnlyList<string>> pathsByAssemblyName =
-                IndexAssemblyPaths(knownPaths);
             ExternalAssemblyMaterial[] resolved = new ExternalAssemblyMaterial[assemblies.Length];
-            ConcurrentDictionary<string, Lazy<IReadOnlyList<AssemblyReferenceIdentity>>> forwardedAssembliesByPath =
+            ConcurrentDictionary<string, Lazy<IReadOnlyList<AssemblyName>>> forwardedAssembliesByPath =
                 new(StringComparer.OrdinalIgnoreCase);
 
             await Parallel.ForEachAsync(
@@ -232,8 +263,9 @@ namespace SetterChecker.Core
                     .ToArray(),
                 knownPaths.Where(path => CanBeAssemblyLookupPath(path, unityRuntime))
                     .Order(StringComparer.OrdinalIgnoreCase).ToArray(),
-                unityRuntime?.FacadePaths ?? Array.Empty<string>(),
-                assemblyRedirects);
+                assemblyRedirects,
+                unityRuntime != null,
+                explicitPaths ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase));
         }
 
         // 将编译引用所在目录的托管文件加入按需查找候选而不提前分析。
@@ -267,24 +299,6 @@ namespace SetterChecker.Core
 
             return portableExecutable.HasMetadata;
         }
-
-        // 把一条程序集引用转换为可核对的完整身份。
-        private static AssemblyReferenceIdentity ReadAssemblyReference(
-            MetadataReader metadata,
-            AssemblyReferenceHandle handle)
-        {
-            AssemblyReference reference = metadata.GetAssemblyReference(handle);
-
-            return new AssemblyReferenceIdentity(
-                metadata.GetString(reference.Name),
-                reference.Version,
-                reference.Culture.IsNil ? string.Empty : metadata.GetString(reference.Culture),
-                reference.PublicKeyOrToken.IsNil
-                    ? ImmutableArray<byte>.Empty
-                    : metadata.GetBlobBytes(reference.PublicKeyOrToken).ToImmutableArray(),
-                (reference.Flags & AssemblyFlags.PublicKey) != 0);
-        }
-
 
         // 按 Unity 明确的输出位置寻找一份参考文件的真实实现。
         private static IReadOnlyList<string> FindImplementationPaths(
@@ -373,16 +387,10 @@ namespace SetterChecker.Core
         private static bool MatchesReferenceCandidate(
             string referencePath,
             string implementationPath,
-            UnityRuntimeSelection unityRuntime)
+            UnityRuntimeSelection? unityRuntime)
         {
-            AssemblyName reference = AssemblyName.GetAssemblyName(referencePath);
-            AssemblyName implementation = AssemblyName.GetAssemblyName(implementationPath);
-
-            return SameAssemblyNameCultureAndToken(reference, implementation)
-                && (Equals(reference.Version, implementation.Version)
-                    || IsCompatibleUnityFacade(reference, implementationPath, unityRuntime)
-                    || IsCompatibleUnityFramework(
-                        reference.Name!, reference.Version!, implementation.Version!, unityRuntime));
+            return MatchesIdentity(implementationPath, AssemblyName.GetAssemblyName(referencePath),
+                unityRuntime, allowUnspecifiedVersion: false, useFullPublicKey: false);
         }
 
         // 核对参考文件与真实实现声明的是同一个程序集。
@@ -391,15 +399,7 @@ namespace SetterChecker.Core
             string implementationPath,
             UnityRuntimeSelection? unityRuntime)
         {
-            AssemblyName reference = AssemblyName.GetAssemblyName(referencePath);
-            AssemblyName implementation = AssemblyName.GetAssemblyName(implementationPath);
-            bool sameIdentity = SameAssemblyNameCultureAndToken(reference, implementation)
-                && (Equals(reference.Version, implementation.Version)
-                    || IsCompatibleUnityFacade(reference, implementationPath, unityRuntime)
-                    || IsCompatibleUnityFramework(
-                        reference.Name!, reference.Version!, implementation.Version!, unityRuntime));
-
-            if (!sameIdentity)
+            if (!MatchesReferenceCandidate(referencePath, implementationPath, unityRuntime))
             {
                 throw new AnalysisException(
                     $"参考文件与真实文件的程序集身份不同：{referencePath} => {implementationPath}");
@@ -407,23 +407,28 @@ namespace SetterChecker.Core
         }
 
         // 比较程序集的名称、区域和公钥标记。
-        private static bool SameAssemblyNameCultureAndToken(
+        internal static bool SameAssemblyNameCultureAndToken(
             AssemblyName expected,
-            AssemblyName candidate)
+            AssemblyName candidate,
+            bool useFullPublicKey = false)
         {
+            byte[] expectedKey = (useFullPublicKey ? expected.GetPublicKey() : expected.GetPublicKeyToken()) ?? Array.Empty<byte>();
+            byte[] candidateKey = (useFullPublicKey ? candidate.GetPublicKey() : candidate.GetPublicKeyToken()) ?? Array.Empty<byte>();
+
             return string.Equals(expected.Name, candidate.Name, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(
                     expected.CultureName ?? string.Empty,
                     candidate.CultureName ?? string.Empty,
                     StringComparison.OrdinalIgnoreCase)
-                && (expected.GetPublicKeyToken() ?? Array.Empty<byte>())
-                    .SequenceEqual(candidate.GetPublicKeyToken() ?? Array.Empty<byte>());
+                && expectedKey.SequenceEqual(candidateKey);
         }
 
-        // 保留材料模块已唯一证明的普通框架身份重定向。
+        // 只有全部实际候选唯一时，保存不依赖引用方位置的运行身份对应。
         private static IReadOnlyDictionary<string, string> ReadAssemblyRedirects(
             IEnumerable<ExternalAssemblyMaterial> assemblies,
             IReadOnlyList<string> lookupPaths,
+            IReadOnlyDictionary<string, IReadOnlyList<string>> runtimePaths,
+            IReadOnlySet<string> sourceAssemblyNames,
             UnityRuntimeSelection? unityRuntime)
         {
             Dictionary<string, string> redirects = new(StringComparer.OrdinalIgnoreCase);
@@ -432,35 +437,22 @@ namespace SetterChecker.Core
                 return redirects;
             }
 
-            IReadOnlyDictionary<string, IReadOnlyList<string>> runtimePaths = IndexAssemblyPaths(unityRuntime.AssemblyPaths);
             IEnumerable<AssemblyName> references = assemblies.Select(assembly =>
                     AssemblyName.GetAssemblyName(assembly.ReferencePath))
                 .Concat(lookupPaths.SelectMany(ReadReferencedAssemblyNames))
                 .DistinctBy(reference => reference.FullName, StringComparer.OrdinalIgnoreCase);
             foreach (AssemblyName reference in references)
             {
-                if (!runtimePaths.TryGetValue(reference.Name!, out IReadOnlyList<string>? candidates)
-                    || !unityRuntime.FrameworkRemappings.ContainsKey(reference.Name!))
+                if (sourceAssemblyNames.Contains(reference.Name!)
+                    || !runtimePaths.TryGetValue(reference.Name!, out IReadOnlyList<string>? candidates)
+                    || candidates.Count != 1 || !unityRuntime.AssemblyPaths.Contains(candidates[0], StringComparer.OrdinalIgnoreCase))
                 {
                     continue;
                 }
 
-                string[] matching = candidates.Where(path =>
+                if (!string.Equals(reference.FullName, AssemblyName.GetAssemblyName(candidates[0]).FullName, StringComparison.OrdinalIgnoreCase))
                 {
-                    AssemblyName actual = AssemblyName.GetAssemblyName(path);
-
-                    return !Equals(reference.Version, actual.Version)
-                        && SameAssemblyNameCultureAndToken(reference, actual)
-                        && IsCompatibleUnityFramework(reference.Name!, reference.Version!, actual.Version!, unityRuntime);
-                }).ToArray();
-                if (matching.Length > 1)
-                {
-                    throw new AnalysisException($"参考程序集身份重定向不唯一：{reference.FullName} => {string.Join("; ", matching)}");
-                }
-
-                if (matching.Length == 1)
-                {
-                    redirects.Add(reference.FullName!, matching[0]);
+                    redirects.Add(reference.FullName!, candidates[0]);
                 }
             }
 
@@ -483,7 +475,7 @@ namespace SetterChecker.Core
             IReadOnlyList<string> rootPaths,
             IReadOnlyDictionary<string, IReadOnlyList<string>> pathsByAssemblyName,
             UnityRuntimeSelection? unityRuntime,
-            ConcurrentDictionary<string, Lazy<IReadOnlyList<AssemblyReferenceIdentity>>> forwardedAssembliesByPath)
+            ConcurrentDictionary<string, Lazy<IReadOnlyList<AssemblyName>>> forwardedAssembliesByPath)
         {
             Queue<string> pending = new(rootPaths);
             List<string> paths = new();
@@ -498,12 +490,12 @@ namespace SetterChecker.Core
 
                 paths.Add(path);
                 string normalizedPath = Path.GetFullPath(path);
-                IReadOnlyList<AssemblyReferenceIdentity> forwardedAssemblies = forwardedAssembliesByPath.GetOrAdd(
+                IReadOnlyList<AssemblyName> forwardedAssemblies = forwardedAssembliesByPath.GetOrAdd(
                     normalizedPath,
-                    static currentPath => new Lazy<IReadOnlyList<AssemblyReferenceIdentity>>(
+                    static currentPath => new Lazy<IReadOnlyList<AssemblyName>>(
                         () => ReadForwardedAssemblies(currentPath),
                         LazyThreadSafetyMode.ExecutionAndPublication)).Value;
-                foreach (AssemblyReferenceIdentity identity in forwardedAssemblies)
+                foreach (AssemblyName identity in forwardedAssemblies)
                 {
                     string? forwardedPath = FindForwardedAssembly(
                         path,
@@ -521,12 +513,12 @@ namespace SetterChecker.Core
         }
 
         // 读取一份托管文件中的全部类型转交目标程序集名称。
-        private static IReadOnlyList<AssemblyReferenceIdentity> ReadForwardedAssemblies(string path)
+        private static IReadOnlyList<AssemblyName> ReadForwardedAssemblies(string path)
         {
             using FileStream stream = File.OpenRead(path);
             using PEReader portableExecutable = new(stream);
             MetadataReader metadata = portableExecutable.GetMetadataReader();
-            Dictionary<string, AssemblyReferenceIdentity> identities = new(
+            Dictionary<string, AssemblyName> identities = new(
                 StringComparer.OrdinalIgnoreCase);
 
             foreach (ExportedTypeHandle handle in metadata.ExportedTypes)
@@ -544,32 +536,38 @@ namespace SetterChecker.Core
 
                 if (implementation.Kind == HandleKind.AssemblyReference)
                 {
-                    AssemblyReferenceIdentity identity = ReadAssemblyReference(
-                        metadata,
-                        (AssemblyReferenceHandle)implementation);
+                    AssemblyName identity = metadata.GetAssemblyReference((AssemblyReferenceHandle)implementation).GetAssemblyName();
 
-                    identities[identity.Key] = identity;
+                    identities[ReadAssemblyReferenceKey(identity)] = identity;
                 }
             }
 
             return identities.Values
-                .OrderBy(identity => identity.Key, StringComparer.OrdinalIgnoreCase)
+                .OrderBy(ReadAssemblyReferenceKey, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
+        }
+
+        // 保留转交引用的原始公钥表示，完整公钥与 token 不能在索引时相互覆盖。
+        private static string ReadAssemblyReferenceKey(AssemblyName identity)
+        {
+            bool fullKey = (identity.Flags & AssemblyNameFlags.PublicKey) != 0;
+            byte[] key = (fullKey ? identity.GetPublicKey() : identity.GetPublicKeyToken()) ?? Array.Empty<byte>();
+            return $"{identity.Name}|{identity.Version}|{identity.CultureName}|{fullKey}|{Convert.ToHexString(key)}";
         }
 
         // 在转交文件明确可达的位置寻找唯一已有目标程序集。
         private static string? FindForwardedAssembly(
             string forwardingPath,
-            AssemblyReferenceIdentity identity,
+            AssemblyName identity,
             IReadOnlyDictionary<string, IReadOnlyList<string>> pathsByAssemblyName,
             UnityRuntimeSelection? unityRuntime)
         {
             DirectoryInfo directory = new(Path.GetDirectoryName(forwardingPath)!);
             HashSet<string> candidates = pathsByAssemblyName.TryGetValue(
-                identity.Name,
+                identity.Name!,
                 out IReadOnlyList<string>? knownPaths)
                     ? knownPaths
-                        .Where(path => MatchesIdentity(path, identity, unityRuntime))
+                        .Where(path => unityRuntime != null || MatchesIdentity(path, identity, unityRuntime))
                         .ToHashSet(StringComparer.OrdinalIgnoreCase)
                     : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -597,21 +595,26 @@ namespace SetterChecker.Core
             {
                 1 => candidates.Single(),
                 0 => null,
+                _ when unityRuntime != null => null,
                 _ => throw new AnalysisException(
                     $"类型转交目标不唯一：{forwardingPath} => {identity.Name}：{string.Join("; ", candidates)}"),
             };
         }
 
-        // 按程序集自身名称建立一次运行内的快速文件索引。
-        private static IReadOnlyDictionary<string, IReadOnlyList<string>> IndexAssemblyPaths(
-            IEnumerable<string> paths)
+        // 严格宿主使用元数据名；当前 Unity 允许文件名探测及显式运行引用的预载名称。
+        internal static IReadOnlyDictionary<string, IReadOnlyList<string>> IndexAssemblyPaths(
+            IEnumerable<string> paths, IReadOnlySet<string>? explicitRuntimePaths)
         {
             return paths
-                .GroupBy(ReadAssemblyIdentityName, StringComparer.OrdinalIgnoreCase)
+                .Where(path => explicitRuntimePaths == null || !path.EndsWith(".ref.dll", StringComparison.OrdinalIgnoreCase))
+                .SelectMany(path => (explicitRuntimePaths == null ? new[] { AssemblyName.GetAssemblyName(path).Name }
+                    : explicitRuntimePaths.Contains(path) ? new[] { Path.GetFileNameWithoutExtension(path), AssemblyName.GetAssemblyName(path).Name }
+                    : new[] { Path.GetFileNameWithoutExtension(path) }).Select(name => (Name: name, Path: path)))
+                .GroupBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
                 .Where(group => group.Key != null)
                 .ToDictionary(
                     group => group.Key!,
-                    group => (IReadOnlyList<string>)group
+                    group => (IReadOnlyList<string>)group.Select(item => item.Path)
                         .Distinct(StringComparer.OrdinalIgnoreCase)
                         .Order(StringComparer.OrdinalIgnoreCase)
                         .ToArray(),
@@ -622,7 +625,7 @@ namespace SetterChecker.Core
         private static void AddCandidate(
             ISet<string> candidates,
             string path,
-            AssemblyReferenceIdentity identity,
+            AssemblyName identity,
             UnityRuntimeSelection? unityRuntime)
         {
             if (File.Exists(path) && MatchesIdentity(path, identity, unityRuntime))
@@ -634,96 +637,25 @@ namespace SetterChecker.Core
         // 检查候选文件是否符合类型转交记录中的完整程序集身份。
         private static bool MatchesIdentity(
             string path,
-            AssemblyReferenceIdentity identity,
-            UnityRuntimeSelection? unityRuntime)
+            AssemblyName identity,
+            UnityRuntimeSelection? unityRuntime,
+            bool allowUnspecifiedVersion = true,
+            bool? useFullPublicKey = null)
         {
+            if (unityRuntime != null)
+            {
+                return string.Equals(Path.GetFileNameWithoutExtension(path), identity.Name, StringComparison.OrdinalIgnoreCase);
+            }
             AssemblyName candidate = AssemblyName.GetAssemblyName(path);
-            byte[] candidateKey = identity.UsesFullPublicKey
-                ? candidate.GetPublicKey() ?? Array.Empty<byte>()
-                : candidate.GetPublicKeyToken() ?? Array.Empty<byte>();
-            bool versionMatches = identity.Version == new Version(0, 0, 0, 0)
-                || Equals(identity.Version, candidate.Version)
-                || IsCompatibleUnityFacade(identity, path, unityRuntime)
-                || (candidate.Version != null && IsCompatibleUnityFramework(
-                    identity.Name,
-                    identity.Version,
-                    candidate.Version,
-                    unityRuntime));
+            bool versionMatches = allowUnspecifiedVersion && identity.Version == new Version(0, 0, 0, 0)
+                || Equals(identity.Version, candidate.Version);
 
-            return string.Equals(
-                    identity.Name,
-                    candidate.Name,
-                    StringComparison.OrdinalIgnoreCase)
-                && string.Equals(
-                    identity.Culture,
-                    candidate.CultureName ?? string.Empty,
-                    StringComparison.OrdinalIgnoreCase)
-                && identity.PublicKeyOrToken.SequenceEqual(candidateKey)
+            return SameAssemblyNameCultureAndToken(identity, candidate,
+                    useFullPublicKey ?? (identity.Flags & AssemblyNameFlags.PublicKey) != 0)
                 && versionMatches;
         }
 
-        // 只允许 Unity 当前运行配置的纯转交门面使用门面版本规则。
-        private static bool IsCompatibleUnityFacade(
-            AssemblyName expected,
-            string candidatePath,
-            UnityRuntimeSelection? unityRuntime)
-        {
-            if (unityRuntime == null
-                || !unityRuntime.FacadePaths.Contains(candidatePath, StringComparer.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-
-            AssemblyName candidate = AssemblyName.GetAssemblyName(candidatePath);
-
-            return SameAssemblyNameCultureAndToken(expected, candidate)
-                && candidate.Version?.Major >= expected.Version?.Major;
-        }
-
-        // 只对已验证的 Unity 纯转交门面放宽转交目标的主版本。
-        private static bool IsCompatibleUnityFacade(
-            AssemblyReferenceIdentity expected,
-            string candidatePath,
-            UnityRuntimeSelection? unityRuntime)
-        {
-            if (unityRuntime == null
-                || !unityRuntime.FacadePaths.Contains(candidatePath, StringComparer.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-
-            AssemblyName candidate = AssemblyName.GetAssemblyName(candidatePath);
-            byte[] candidateKey = expected.UsesFullPublicKey
-                ? candidate.GetPublicKey() ?? Array.Empty<byte>()
-                : candidate.GetPublicKeyToken() ?? Array.Empty<byte>();
-
-            return string.Equals(expected.Name, candidate.Name, StringComparison.OrdinalIgnoreCase)
-                && string.Equals(
-                    expected.Culture,
-                    candidate.CultureName ?? string.Empty,
-                    StringComparison.OrdinalIgnoreCase)
-                && expected.PublicKeyOrToken.SequenceEqual(candidateKey)
-                && candidate.Version?.Major >= expected.Version.Major;
-        }
-
-        // 核对一条已证明的Mono框架版本重映射。
-        private static bool IsCompatibleUnityFramework(
-            string expectedName,
-            Version expectedVersion,
-            Version candidateVersion,
-            UnityRuntimeSelection? unityRuntime)
-        {
-            if (unityRuntime == null
-                || !unityRuntime.FrameworkRemappings.TryGetValue(expectedName, out UnityFrameworkRemapping? mapping)
-                || mapping.RuntimeVersion != candidateVersion)
-            {
-                return false;
-            }
-
-            return !mapping.OnlyLowerVersions || expectedVersion < mapping.RuntimeVersion;
-        }
-
-        // 核对运行配置 Facades 目录中的文件只含类型转交表。
+        // 核对门面只含类型转交，不用参考桩补出实际运行库没有的行为。
         private static bool IsPureForwardingFacade(string path)
         {
             using FileStream stream = File.OpenRead(path);
@@ -744,12 +676,6 @@ namespace SetterChecker.Core
 
                     return implementation.Kind == HandleKind.AssemblyReference;
                 });
-        }
-
-        // 读取托管文件自身声明的程序集名称。
-        private static string? ReadAssemblyIdentityName(string path)
-        {
-            return AssemblyName.GetAssemblyName(path).Name;
         }
 
         // 从当前编译标记和 Unity 安装路径选择唯一运行目录。
@@ -776,6 +702,13 @@ namespace SetterChecker.Core
             }
 
             string dataDirectory = dataDirectories[0];
+            string hostPath = Path.Combine(Path.GetDirectoryName(dataDirectory)!, "Unity.exe");
+            if (!File.Exists(hostPath) || FileVersionInfo.GetVersionInfo(hostPath) is not
+                { FileVersion: "2021.3.16.0", ProductVersion: "2021.3.16f1_0" }
+                || !File.Exists(Path.Combine(dataDirectory, "MonoBleedingEdge", "EmbedRuntime", "mono-2.0-bdwgc.dll")))
+            {
+                throw new AnalysisException($"Unity 宿主装载规则尚未审计：{hostPath}");
+            }
             string runtimeName = SelectUnityRuntimeName(parseOptions.PreprocessorSymbolNames);
             string runtimeDirectory = Path.Combine(
                 dataDirectory,
@@ -790,7 +723,6 @@ namespace SetterChecker.Core
             }
 
             string managedDirectory = Path.Combine(dataDirectory, "Managed");
-            string facadeDirectory = Path.Combine(runtimeDirectory, "Facades");
             string[] assemblyPaths = Directory.EnumerateFiles(
                     runtimeDirectory,
                     "*.dll",
@@ -803,129 +735,13 @@ namespace SetterChecker.Core
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Order(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
-            string[] facadePaths = Directory.Exists(facadeDirectory)
-                ? Directory.EnumerateFiles(facadeDirectory, "*.dll", SearchOption.TopDirectoryOnly)
-                    .Where(IsManagedAssembly)
-                    .Where(IsPureForwardingFacade)
-                    .Select(Path.GetFullPath)
-                    .Order(StringComparer.OrdinalIgnoreCase)
-                    .ToArray()
-                : Array.Empty<string>();
-            IReadOnlyDictionary<string, UnityFrameworkRemapping> frameworkRemappings =
-                ReadUnityFrameworkRemappings(dataDirectory, runtimeDirectory);
-
             return new UnityRuntimeSelection(
                 new[]
                 {
                     Path.Combine(dataDirectory, "NetStandard"),
                     Path.Combine(dataDirectory, "UnityReferenceAssemblies"),
                 },
-                assemblyPaths,
-                facadePaths,
-                frameworkRemappings);
-        }
-
-        // 从当前Unity携带的Mono源码读取普通框架版本重映射。
-        private static IReadOnlyDictionary<string, UnityFrameworkRemapping> ReadUnityFrameworkRemappings(
-            string dataDirectory,
-            string runtimeDirectory)
-        {
-            string metadataDirectory = Path.Combine(dataDirectory, "il2cpp", "external", "mono", "mono", "metadata");
-            string assemblySourcePath = Path.Combine(metadataDirectory, "assembly.c");
-            string domainSourcePath = Path.Combine(metadataDirectory, "domain.c");
-            string coreLibraryPath = Path.Combine(runtimeDirectory, "mscorlib.dll");
-            if (!File.Exists(assemblySourcePath) || !File.Exists(domainSourcePath) || !File.Exists(coreLibraryPath))
-            {
-                throw new AnalysisException($"Unity当前安装缺少Mono框架版本表证据：{metadataDirectory}");
-            }
-
-            Version runtimeVersion = AssemblyName.GetAssemblyName(coreLibraryPath).Version
-                ?? throw new AnalysisException($"Unity运行时核心库没有版本：{coreLibraryPath}");
-            Version[] versionSets = ReadRuntimeVersionSets(domainSourcePath, runtimeVersion);
-            string table = ReadSourceArray(assemblySourcePath, "framework_assemblies []");
-            Dictionary<string, UnityFrameworkRemapping> result = new(StringComparer.OrdinalIgnoreCase);
-            const string entryPattern = "^\\s*\\{\\s*\"(?<name>[^\"]+)\"\\s*,\\s*(?<index>\\d+)"
-                + "(?:\\s*,\\s*(?<newName>NULL|\"[^\"]+\"))?(?:\\s*,\\s*(?<lower>TRUE|FALSE))?\\s*\\}\\s*,?\\s*$";
-
-            foreach (string line in table.Split(
-                         '\n',
-                         StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                if (Regex.IsMatch(line, "^\\s*FACADE_ASSEMBLY\\s*\\(\\s*\"[^\"]+\"\\s*\\)\\s*,?\\s*$"))
-                {
-                    continue;
-                }
-
-                Match entry = Regex.Match(line, entryPattern);
-                if (!entry.Success || !int.TryParse(entry.Groups["index"].Value, out int versionIndex)
-                    || versionIndex >= versionSets.Length)
-                {
-                    throw new AnalysisException($"Unity Mono框架版本表格式无法证明：{assemblySourcePath} => {line.Trim()}");
-                }
-
-                if (!entry.Groups["newName"].Success || entry.Groups["newName"].Value == "NULL")
-                {
-                    result.Add(entry.Groups["name"].Value, new UnityFrameworkRemapping(
-                        versionSets[versionIndex],
-                        entry.Groups["lower"].Value == "TRUE"));
-                }
-            }
-
-            return result;
-        }
-
-        // 从Mono当前运行时行读取各框架表项的目标版本。
-        private static Version[] ReadRuntimeVersionSets(string path, Version runtimeVersion)
-        {
-            string table = ReadSourceArray(path, "supported_runtimes[]");
-            const string rowPattern = "^\\s*\\{\\s*\"[^\"]+\"\\s*,\\s*\"[^\"]+\"\\s*,\\s*\\{(?<sets>.*)\\}\\s*\\}\\s*,?\\s*$";
-            const string versionPattern = "\\{\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\}";
-            List<Version[]> matchingRows = new();
-
-            foreach (string line in table.Split(
-                         '\n',
-                         StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                Match row = Regex.Match(line, rowPattern);
-                if (!row.Success)
-                {
-                    continue;
-                }
-
-                MatchCollection matches = Regex.Matches(row.Groups["sets"].Value, versionPattern);
-                Version[] versions = matches.Select(match => new Version(
-                    int.Parse(match.Groups[1].Value), int.Parse(match.Groups[2].Value),
-                    int.Parse(match.Groups[3].Value), int.Parse(match.Groups[4].Value))).ToArray();
-                if (versions.Length > 0 && versions[0] == runtimeVersion)
-                {
-                    string unparsed = Regex.Replace(row.Groups["sets"].Value, versionPattern, string.Empty);
-                    if (Regex.IsMatch(unparsed, "[^\\s,]"))
-                    {
-                        throw new AnalysisException($"Unity Mono框架版本表含未解析版本槽：{path} => {line}");
-                    }
-
-                    matchingRows.Add(versions);
-                }
-            }
-
-            return matchingRows.Count == 1
-                ? matchingRows[0]
-                : throw new AnalysisException($"Unity Mono框架版本表无法匹配当前运行时：{path} => {runtimeVersion}");
-        }
-
-        // 精确截取Mono源码中指定的静态数组内容。
-        private static string ReadSourceArray(string path, string name)
-        {
-            string source = File.ReadAllText(path);
-            int nameStart = source.IndexOf(name, StringComparison.Ordinal);
-            int bodyStart = nameStart < 0 ? -1 : source.IndexOf('{', nameStart);
-            Match bodyEnd = bodyStart < 0 ? Match.Empty : Regex.Match(source[bodyStart..], "(?m)^\\s*};\\s*$");
-            if (bodyStart < 0 || !bodyEnd.Success)
-            {
-                throw new AnalysisException($"Unity Mono框架版本表格式无法证明：{path} => {name}");
-            }
-
-            return source.Substring(bodyStart + 1, bodyEnd.Index - 1);
+                assemblyPaths);
         }
 
         // 读取 Unity 平台标记对应的即时或预编译运行目录名称。
@@ -979,20 +795,9 @@ namespace SetterChecker.Core
         // 找到引用路径所属的 Unity Data 目录。
         private static string? FindUnityDataDirectory(string referencePath)
         {
-            DirectoryInfo? directory = new FileInfo(referencePath).Directory;
-
-            while (directory != null)
-            {
-                if (string.Equals(directory.Name, "Data", StringComparison.OrdinalIgnoreCase)
-                    && Directory.Exists(Path.Combine(directory.FullName, "MonoBleedingEdge")))
-                {
-                    return directory.FullName;
-                }
-
-                directory = directory.Parent;
-            }
-
-            return null;
+            return ReadParentDirectories(referencePath).FirstOrDefault(directory =>
+                string.Equals(directory.Name, "Data", StringComparison.OrdinalIgnoreCase)
+                && Directory.Exists(Path.Combine(directory.FullName, "MonoBleedingEdge")))?.FullName;
         }
 
         // 判断文件是否位于一个已确认的目录内部。
@@ -1032,35 +837,45 @@ namespace SetterChecker.Core
         // 从程序集定义向上找到当前 Unity 工程根目录。
         private static string FindProjectRoot(string assemblyDefinitionPath)
         {
-            DirectoryInfo? directory = new FileInfo(assemblyDefinitionPath).Directory;
-
-            while (directory != null)
-            {
-                if (Directory.Exists(Path.Combine(directory.FullName, "Library", "Bee", "artifacts")))
-                {
-                    return directory.FullName;
-                }
-
-                directory = directory.Parent;
-            }
-
-            throw new AnalysisException(
-                $"没有找到 Unity 当前生成的 Library/Bee/artifacts：{assemblyDefinitionPath}");
+            return ReadParentDirectories(assemblyDefinitionPath).FirstOrDefault(directory =>
+                Directory.Exists(Path.Combine(directory.FullName, "Library", "Bee", "artifacts")))?.FullName
+                ?? throw new AnalysisException($"没有找到 Unity 当前生成的 Library/Bee/artifacts：{assemblyDefinitionPath}");
         }
 
-        // 从程序集定义读取 Unity 使用的程序集名称。
-        private static string ReadAssemblyName(string assemblyDefinitionPath)
+        // 从文件所在目录开始逐级向上，共用工程、目标包与运行时目录的查找顺序。
+        private static IEnumerable<DirectoryInfo> ReadParentDirectories(string filePath)
         {
-            using FileStream stream = File.OpenRead(assemblyDefinitionPath);
-            using JsonDocument document = JsonDocument.Parse(stream);
-
-            if (!document.RootElement.TryGetProperty("name", out JsonElement nameElement)
-                || string.IsNullOrWhiteSpace(nameElement.GetString()))
+            for (DirectoryInfo? directory = new FileInfo(filePath).Directory; directory != null; directory = directory.Parent)
             {
-                throw new AnalysisException($"程序集定义没有有效名称：{assemblyDefinitionPath}");
+                yield return directory;
             }
+        }
 
-            return nameElement.GetString()!;
+        // 读取真实程序集名称及明确的编辑器专用平台声明。
+        private static (string Name, bool EditorOnly) ReadAssemblyDefinition(string assemblyDefinitionPath)
+        {
+            try
+            {
+                using FileStream stream = File.OpenRead(assemblyDefinitionPath);
+                using JsonDocument document = JsonDocument.Parse(stream);
+                if (document.RootElement.ValueKind != JsonValueKind.Object
+                    || !document.RootElement.TryGetProperty("name", out JsonElement nameElement)
+                    || nameElement.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(nameElement.GetString()))
+                {
+                    throw new AnalysisException($"程序集定义没有有效名称：{assemblyDefinitionPath}");
+                }
+                bool hasPlatforms = document.RootElement.TryGetProperty("includePlatforms", out JsonElement platforms);
+                if (hasPlatforms && (platforms.ValueKind != JsonValueKind.Array || platforms.EnumerateArray().Any(
+                    platform => platform.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(platform.GetString()))))
+                {
+                    throw new AnalysisException($"程序集平台声明不是有效字符串列表：{assemblyDefinitionPath}");
+                }
+                return (nameElement.GetString()!, hasPlatforms && platforms.GetArrayLength() == 1 && platforms[0].GetString() == "Editor");
+            }
+            catch (JsonException exception)
+            {
+                throw new AnalysisException($"程序集定义不是有效 JSON：{assemblyDefinitionPath}；{exception.Message}");
+            }
         }
 
         // 找到当前编译唯一使用的根程序集响应文件。
@@ -1134,56 +949,62 @@ namespace SetterChecker.Core
             }
         }
 
-        // 沿 Unity 生成的参考文件读取全部源码程序集响应文件。
+        // 当前构建的全部源码都可能提供接口实现或回调；引用关系只认本次构建声明的产物。
         private static IReadOnlyList<CompilerResponse> ReadResponseClosure(
             string projectRoot,
-            string rootAssemblyName,
             string rootResponsePath)
         {
-            Queue<(string Name, string Path)> pending = new();
-            Dictionary<string, CompilerResponse> responses = new(StringComparer.Ordinal);
-
-            pending.Enqueue((rootAssemblyName, rootResponsePath));
-            while (pending.TryDequeue(out (string Name, string Path) current))
+            IReadOnlyDictionary<string, string> outputs = ReadBuildOutputs(projectRoot, rootResponsePath);
+            return outputs.Values.Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).Select(path =>
             {
-                if (responses.ContainsKey(current.Name))
+                CompilerResponse response = ReadResponse(projectRoot, Path.GetFileNameWithoutExtension(path), path, outputs);
+                if (!outputs.TryGetValue(response.OutputPath, out string? owner)
+                    || !string.Equals(owner, path, StringComparison.OrdinalIgnoreCase))
                 {
-                    continue;
+                    throw new AnalysisException($"编译输出不属于当前构建节点：{path} => {response.OutputPath}");
                 }
+                return response;
+            }).ToArray();
+        }
 
-                CompilerResponse response = ReadResponse(projectRoot, current.Name, current.Path);
-
-                responses.Add(current.Name, response);
-                foreach (SourceReference sourceReference in response.SourceReferences)
+        // 使用 Unity 本次 Csc 节点的产物定位源码，不按相邻文件或库名推测构建关系。
+        private static IReadOnlyDictionary<string, string> ReadBuildOutputs(string projectRoot, string rootResponsePath)
+        {
+            string graphPath = Path.Combine(projectRoot, "Library", "Bee",
+                Path.GetFileName(Path.GetDirectoryName(rootResponsePath)!) + ".json");
+            RequireFiles(new[] { graphPath }, "当前构建图的 JSON", rootResponsePath);
+            using JsonDocument graph = JsonDocument.Parse(File.ReadAllText(graphPath));
+            var nodes = graph.RootElement.GetProperty("Nodes").EnumerateArray()
+                .Where(node => node.GetProperty("Annotation").GetString()!.StartsWith("Csc ", StringComparison.Ordinal))
+                .Select(node => new
                 {
-                    pending.Enqueue((sourceReference.AssemblyName, sourceReference.ResponsePath));
-                }
+                    Inputs = node.GetProperty("Inputs").EnumerateArray().Select(value => ResolvePath(projectRoot, value.GetString()!)).ToArray(),
+                    Outputs = node.GetProperty("Outputs").EnumerateArray().Select(value => ResolvePath(projectRoot, value.GetString()!)).ToArray(),
+                }).Select(node => new
+                {
+                    node.Outputs,
+                    Response = node.Inputs.Single(path => path.EndsWith(".rsp", StringComparison.OrdinalIgnoreCase)),
+                }).ToArray();
+            if (!nodes.Any(node => string.Equals(node.Response, rootResponsePath, StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new AnalysisException($"当前构建图未声明根编译：{graphPath} => {rootResponsePath}");
             }
-
-            return responses.Values
-                .OrderBy(response => response.AssemblyName, StringComparer.Ordinal)
-                .ToArray();
+            return nodes.SelectMany(node => node.Outputs.Select(path => (Path: path, node.Response)))
+                .ToDictionary(item => item.Path, item => item.Response, StringComparer.OrdinalIgnoreCase);
         }
 
         // 解析一份 Unity 编译响应文件并核对其中的真实路径。
         private static CompilerResponse ReadResponse(
             string projectRoot,
             string assemblyName,
-            string responsePath)
+            string responsePath,
+            IReadOnlyDictionary<string, string> buildOutputs)
         {
             CSharpCommandLineArguments arguments = CSharpCommandLineParser.Default.Parse(
                 new[] { $"@{responsePath}" },
                 projectRoot,
                 sdkDirectory: null);
-            Diagnostic[] errors = arguments.Errors
-                .Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error)
-                .ToArray();
-
-            if (errors.Length > 0)
-            {
-                throw new AnalysisException(
-                    $"无法读取 Unity 编译响应文件 {responsePath}：{string.Join("; ", errors.AsEnumerable())}");
-            }
+            RequireNoErrors(arguments.Errors, $"无法读取 Unity 编译响应文件 {responsePath}");
 
             string[] sourcePaths = arguments.SourceFiles
                 .Select(source => ResolvePath(projectRoot, source.Path))
@@ -1211,9 +1032,9 @@ namespace SetterChecker.Core
             RequireFiles(additionalFilePaths, "附加文件", responsePath);
 
             SourceReference[] sourceReferences = references
-                .Select(reference => FindSourceResponse(reference.Path))
-                .Where(reference => reference != null)
-                .Cast<SourceReference>()
+                .Where(reference => buildOutputs.ContainsKey(reference.Path))
+                .Select(reference => new SourceReference(Path.GetFileNameWithoutExtension(buildOutputs[reference.Path]),
+                    reference.Path))
                 .ToArray();
 
             return new CompilerResponse(
@@ -1243,26 +1064,6 @@ namespace SetterChecker.Core
                 throw new AnalysisException(
                     $"Unity 编译响应文件 {responsePath} 中的{kind}不存在：{missingPath}");
             }
-        }
-
-        // 判断参考文件是否对应另一个有源码响应文件的 Unity 程序集。
-        private static SourceReference? FindSourceResponse(string referencePath)
-        {
-            const string suffix = ".ref.dll";
-
-            if (!referencePath.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
-            {
-                return null;
-            }
-
-            string assemblyName = Path.GetFileName(referencePath)[..^suffix.Length];
-            string responsePath = Path.Combine(
-                Path.GetDirectoryName(referencePath)!,
-                $"{assemblyName}.rsp");
-
-            return File.Exists(responsePath)
-                ? new SourceReference(assemblyName, referencePath, responsePath)
-                : null;
         }
 
         // 并行读取并解析全部源码文件。
@@ -1334,23 +1135,19 @@ namespace SetterChecker.Core
         private static SourceAssemblyMaterial BuildSourceAssembly(
             CompilerResponse response,
             string reportRoot,
-            bool enableCompilerParallel,
             IReadOnlyDictionary<string, SyntaxTree> trees,
-            IReadOnlyDictionary<CompilerReference, PortableExecutableReference> metadataReferences,
+            IReadOnlyList<PortableExecutableReference> references,
             IReadOnlyList<ISourceGenerator> generators,
             CancellationToken cancellationToken)
         {
             SyntaxTree[] assemblyTrees = response.SourcePaths
                 .Select(path => trees[SourceKey(response.AssemblyName, path)])
                 .ToArray();
-            PortableExecutableReference[] references = response.References
-                .Select(reference => metadataReferences[reference])
-                .ToArray();
             CSharpCompilation compilation = CSharpCompilation.Create(
                 response.AssemblyName,
                 assemblyTrees,
                 references,
-                response.CompilationOptions.WithConcurrentBuild(enableCompilerParallel));
+                response.CompilationOptions.WithConcurrentBuild(false));
             if (generators.Count > 0)
             {
                 AdditionalText[] additionalTexts = response.AdditionalFilePaths
@@ -1366,15 +1163,7 @@ namespace SetterChecker.Core
                     out Compilation generatedCompilation,
                     out ImmutableArray<Diagnostic> diagnostics,
                     cancellationToken);
-                Diagnostic[] errors = diagnostics
-                    .Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error)
-                    .ToArray();
-
-                if (errors.Length > 0)
-                {
-                    throw new AnalysisException(
-                        $"源码生成器执行失败：{string.Join("; ", errors.AsEnumerable())}");
-                }
+                RequireNoErrors(diagnostics, "源码生成器执行失败");
 
                 compilation = (CSharpCompilation)generatedCompilation;
             }
@@ -1391,6 +1180,16 @@ namespace SetterChecker.Core
                 reportSourcePaths,
                 response.OutputPath,
                 Array.Empty<byte>());
+        }
+
+        // 编译响应和源码生成共用错误诊断检查，保留原错误内容。
+        private static void RequireNoErrors(IEnumerable<Diagnostic> diagnostics, string context)
+        {
+            Diagnostic[] errors = diagnostics.Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error).ToArray();
+            if (errors.Length != 0)
+            {
+                throw new AnalysisException($"{context}：{string.Join("; ", errors.AsEnumerable())}");
+            }
         }
 
         // 让编译参数相同的源码程序集共用一次分析器加载结果。
@@ -1463,8 +1262,7 @@ namespace SetterChecker.Core
 
         private sealed record SourceReference(
             string AssemblyName,
-            string ReferencePath,
-            string ResponsePath);
+            string ReferencePath);
 
         private sealed record SourceInput(
             string AssemblyName,
@@ -1502,29 +1300,14 @@ namespace SetterChecker.Core
 
         private sealed record UnityRuntimeSelection(
             IReadOnlyList<string> ReferenceRoots,
-            IReadOnlyList<string> AssemblyPaths,
-            IReadOnlyList<string> FacadePaths,
-            IReadOnlyDictionary<string, UnityFrameworkRemapping> FrameworkRemappings);
-
-        private sealed record UnityFrameworkRemapping(
-            Version RuntimeVersion,
-            bool OnlyLowerVersions);
+            IReadOnlyList<string> AssemblyPaths);
 
         private sealed record ExternalMaterialResolution(
             IReadOnlyList<ExternalAssemblyMaterial> Assemblies,
             IReadOnlyList<string> LookupPaths,
-            IReadOnlyList<string> UnityRuntimeFacadePaths,
-            IReadOnlyDictionary<string, string> AssemblyRedirects);
-
-        private sealed record AssemblyReferenceIdentity(
-            string Name,
-            Version Version,
-            string Culture,
-            ImmutableArray<byte> PublicKeyOrToken,
-            bool UsesFullPublicKey)
-        {
-            public string Key { get; } = $"{Name}|{Version}|{Culture}|{Convert.ToHexString(PublicKeyOrToken.AsSpan())}";
-        }
+            IReadOnlyDictionary<string, string> AssemblyRedirects,
+            bool UsesUnityLegacyBinding,
+            IReadOnlySet<string> ExplicitRuntimeAssemblyPaths);
 
         private sealed class AnalyzerAssemblyLoader : IAnalyzerAssemblyLoader
         {
@@ -1570,9 +1353,7 @@ namespace SetterChecker.Core
                     return null;
                 }
 
-                using FileStream stream = File.OpenRead(path);
-
-                return context.LoadFromStream(stream);
+                return LoadFromPath(path);
             }
         }
     }

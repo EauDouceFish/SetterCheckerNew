@@ -8,6 +8,91 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class MethodCatalogTests
     {
+        // 复刻当前构建中用泛型容器的非泛型嵌套类型作参数的声明。
+        /// <summary>外层构造实参和内层类型名称共同参加源码与编译函数匹配。</summary>
+        [TestMethod]
+        [DataRow("ExternalSamples.Configuration.ReadOnly")]
+        [DataRow("ExternalSamples.Container<Sample, int>.Inner<string>.Leaf<bool>")]
+        public async Task BuildAsyncMatchesNestedTypeInGenericContainer(string parameterType)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public class Container<T, U> { public struct ReadOnly { } public class Inner<V> { public class Leaf<W> { } } }
+                public class Configuration : Container<Configuration, int> { }
+                """);
+            project.WriteRootSource("""
+                public class Sample { public void Initialize(PARAMETER value) { } }
+                """.Replace("PARAMETER", parameterType));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry method = catalog.Methods.Single(method => method.Name == "Initialize");
+            Assert.IsTrue(method.IsReportable);
+            Assert.HasCount(1, method.Parameters);
+        }
+
+        // 复刻 FluxyContainer 虚函数接收只读引用参数的声明。
+        /// <summary>编译器加上的只读参数修饰不应破坏源码与真实函数的唯一配对。</summary>
+        [TestMethod]
+        public async Task BuildAsyncMatchesVirtualReadonlyReferenceParameter()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                public struct Position { public int X; }
+                public class Sample { public virtual int Read(in Position position, int index = 0) => position.X + index; }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry method = catalog.Methods.Single(method => method.Name == "Read");
+            Assert.AreEqual(CatalogRefKind.In, method.Parameters[0].RefKind);
+            Assert.IsTrue(method.IsReportable);
+            Assert.AreEqual(2, method.Parameters.Count);
+        }
+
+        // 完整构建中的普通特性可能接收数组，不能将数组当作标量读取。
+        /// <summary>类与方法特性的数组、空数组和 null 参数均保留真实内容。</summary>
+        [TestMethod]
+        public async Task BuildAsyncReadsArrayAttributeArguments()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                using System;
+                public sealed class PayloadAttribute : Attribute { public PayloadAttribute(int[] values) { } }
+                [Payload(new[] { 1, 2 })]
+                public sealed class Sample
+                {
+                    [Payload(new int[0])] public void Empty() { }
+                    [Payload(null)] public void Missing() { }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            CollectionAssert.AreEqual(new object[] { 1, 2 }, catalog.Types.Single(type => type.Name == "Sample")
+                .SourceSymbol!.GetAttributes().Single().ConstructorArguments.Single().Values.Select(value => value.Value).ToArray());
+            Assert.IsTrue(catalog.Methods.Single(method => method.Name == "Empty").SourceSymbol!
+                .GetAttributes().Single().ConstructorArguments.Single().Values.IsEmpty);
+            Assert.IsTrue(catalog.Methods.Single(method => method.Name == "Missing").SourceSymbol!
+                .GetAttributes().Single().ConstructorArguments.Single().IsNull);
+        }
+
+        // 复刻同名压缩库不同版本把派生类误挂到错误基类的问题。
+        /// <summary>未证明的关系不按名称连接，真实基类按需载入后才建立其精确索引。</summary>
+        [TestMethod]
+        public async Task BuildAsyncIndexesOnlyProvenPhysicalBaseTypes()
+        {
+            using TestProject project = TestProject.CreateWithVersionedInheritanceCollision();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            TypeEntry derived = catalog.Types.Single(type => type.FullName == "TransitiveSamples.DerivedType");
+            TypeEntry wrong = catalog.Types.Single(type => type.AssemblyPath == Path.Combine(project.RootPath, "WrongForwardTarget.dll")
+                && type.FullName == "TransitiveSamples.BaseType");
+            Assert.IsFalse(catalog.Types.Any(type => type.AssemblyPath == project.ForwardTargetPath));
+            IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> index = catalog.DerivedTypesByBaseId;
+            TypeEntry actual = catalog.Types.Single(type => type.AssemblyPath == project.ForwardTargetPath
+                && type.FullName == "TransitiveSamples.BaseType");
+            Assert.IsTrue(index[actual.Id].Any(type => type.Id == derived.Id));
+            Assert.IsFalse(index.GetValueOrDefault(wrong.Id)?.Any(type => type.Id == derived.Id) == true);
+        }
+
         // 验证日志排除范围按真实命名空间匹配，不误伤相似名称和普通嵌套类型。
         /// <summary>复刻两个日志注入器共同排除的 Tss 与 UnityEngine 范围。</summary>
         [TestMethod]
@@ -103,11 +188,11 @@ namespace SetterChecker.Core.Tests
             {
                 MethodEntry[] getters = result.GetMethods(type).Where(method => method.Kind == CatalogMethodKind.PropertyGetter).ToArray();
                 Assert.HasCount(2, getters);
-                Assert.IsEmpty(getters.Single(method => method.IsPublic).RelatedMethodIds);
+                Assert.IsFalse(getters.Single(method => method.IsPublic).IsVirtual);
                 TypeEntry contract = result.Types.Single(item => item.FullName is "SourceSamples.IView<T>" or "ExternalSamples.IView<T>"
                     && item.AssemblyPath == type.AssemblyPath);
-                CollectionAssert.AreEqual(new[] { result.GetMethods(contract).Single().LogicalId },
-                    getters.Single(method => !method.IsPublic).RelatedMethodIds.ToArray());
+                Assert.IsTrue(getters.Single(method => !method.IsPublic).IsVirtual);
+                CollectionAssert.Contains(result.ImplementingTypesByInterfaceId[contract.Id].Select(item => item.Id).ToArray(), type.Id);
             }
         }
 
@@ -191,11 +276,11 @@ namespace SetterChecker.Core.Tests
                     "set_Value",
                 }.Where(name => name != "Native").ToArray(),
                 reportableNames);
-            Assert.AreEqual("System.Int32", plain.Parameters.Single().TypeName);
-            Assert.IsTrue(plain.MethodAttributes.Any(attribute =>
-                attribute.TypeName == "NoLogTrackAttribute" && attribute.HasArguments));
-            Assert.IsTrue(plain.TypeAttributes.Any(attribute =>
-                attribute.TypeName == "NoLogTrackAttribute"));
+            Assert.AreEqual(Microsoft.CodeAnalysis.SpecialType.System_Int32, plain.SourceSymbol!.Parameters.Single().Type.SpecialType);
+            Assert.IsTrue(plain.SourceSymbol.GetAttributes().Any(attribute =>
+                attribute.AttributeClass!.ToDisplayString() == "NoLogTrackAttribute" && attribute.ConstructorArguments.Length > 0));
+            Assert.IsTrue(plain.SourceSymbol.ContainingType.GetAttributes().Any(attribute =>
+                attribute.AttributeClass!.ToDisplayString() == "NoLogTrackAttribute"));
             Assert.IsTrue(result.Methods.Any(method => method.TypeName == "Sample"
                 && method.SourceSymbol == null
                 && !method.IsReportable));
@@ -231,7 +316,7 @@ namespace SetterChecker.Core.Tests
                 && item.Name == "global::Contracts.IExtension.GetExtension");
             Assert.IsNotNull(method.SourceSymbol);
             Assert.IsTrue(method.IsReportable);
-            Assert.AreEqual("System.Boolean", method.Parameters.Single().TypeName);
+            Assert.AreEqual(Microsoft.CodeAnalysis.SpecialType.System_Boolean, method.SourceSymbol!.Parameters.Single().Type.SpecialType);
             Assert.IsTrue(method.MetadataToken > 0);
         }
 
@@ -262,7 +347,12 @@ namespace SetterChecker.Core.Tests
                 method.Name.EndsWith("Convert", StringComparison.Ordinal));
             MethodEntry declaration = result.GetMethods(contract).Single(method => method.Name == "Convert");
 
-            CollectionAssert.AreEquivalent(new[] { declaration.LogicalId }, implementation.RelatedMethodIds.ToArray());
+            MethodEntry caller = result.GetMethods(result.Types.Single(type => type.Name == "SignatureConsumer"))
+                .Single(method => method.Name == "Dispatch" + workerName.Replace("<T>", string.Empty));
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, result, new[] { caller }, 2);
+            ResolvedCall dispatch = calls.Calls.Single(call => call.CallerMethodId == caller.Id && call.Call.Kind == BehaviorCallKind.Virtual);
+            Assert.AreEqual(implementation.Id, dispatch.Targets.Single().MethodId);
+            Assert.AreEqual(project.ForwardTargetPath, declaration.AssemblyPath);
         }
 
         // 检查源码类型关系和函数重写索引。
@@ -294,15 +384,15 @@ namespace SetterChecker.Core.Tests
             MethodEntry derivedMethod = result.GetMethods(derived).Single(method => method.Name == "Work");
 
             CollectionAssert.Contains(
-                result.ImplementingTypesByInterfaceId[contract.LogicalId]
+                result.ImplementingTypesByInterfaceId[contract.Id]
                     .Select(type => type.Id).ToArray(),
                 derived.Id);
             CollectionAssert.Contains(
-                result.DerivedTypesByBaseId[baseType.LogicalId].Select(type => type.Id).ToArray(),
+                result.DerivedTypesByBaseId[baseType.Id].Select(type => type.Id).ToArray(),
                 derived.Id);
-            CollectionAssert.Contains(
-                derivedMethod.RelatedMethodIds.ToArray(),
-                baseMethod.LogicalId);
+            Assert.IsTrue(derivedMethod.IsVirtual);
+            Assert.IsFalse(derivedMethod.IsNewSlot);
+            Assert.IsTrue(baseMethod.IsNewSlot);
         }
 
         // 检查 Cecil 对普通、泛型、接口、重写和访问器函数的读取。
@@ -363,11 +453,9 @@ namespace SetterChecker.Core.Tests
 
             Assert.IsTrue(derivedChange.MetadataToken > 0);
             Assert.AreEqual("System.Int32", derivedChange.Parameters.Single().TypeId);
-            CollectionAssert.Contains(derivedChange.RelatedMethodIds.ToArray(), baseChange.LogicalId);
-            CollectionAssert.Contains(
-                result.GetMethods(baseType).Single(method => method.Name == "Apply")
-                    .RelatedMethodIds.ToArray(),
-                contractApply.LogicalId);
+            Assert.IsFalse(derivedChange.IsNewSlot);
+            Assert.IsTrue(baseChange.IsVirtual);
+            Assert.IsTrue(contractApply.IsAbstract);
             StringAssert.EndsWith(genericEcho.Parameters.Single().TypeId, "<!0>");
             CollectionAssert.AreEquivalent(
                 new[]
@@ -378,12 +466,27 @@ namespace SetterChecker.Core.Tests
                     CatalogMethodKind.EventRemover,
                 },
                 accessors);
-            CollectionAssert.Contains(firstDerived.RelatedMethodIds.ToArray(), firstBase.LogicalId);
-            CollectionAssert.DoesNotContain(firstDerived.RelatedMethodIds.ToArray(), secondBase.LogicalId);
-            CollectionAssert.Contains(publicRead.RelatedMethodIds.ToArray(), intContract.LogicalId);
-            CollectionAssert.DoesNotContain(publicRead.RelatedMethodIds.ToArray(), stringContract.LogicalId);
-            CollectionAssert.DoesNotContain(newSlotApply.RelatedMethodIds.ToArray(), contractApply.LogicalId);
-            CollectionAssert.Contains(reimplementedApply.RelatedMethodIds.ToArray(), contractApply.LogicalId);
+            Assert.AreEqual(intContract.ReturnTypeId, publicRead.ReturnTypeId);
+            Assert.AreNotEqual(stringContract.ReturnTypeId, publicRead.ReturnTypeId);
+            Assert.IsTrue(newSlotApply.IsNewSlot);
+            MethodEntry[] probes = result.GetMethods(result.Types.Single(type => type.Name == "DispatchSamples")).ToArray();
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, result, probes, 2);
+            Dictionary<string, string> expected = new()
+            {
+                ["First"] = firstDerived.Id,
+                ["Second"] = secondBase.Id,
+                ["Integer"] = publicRead.Id,
+                ["Text"] = result.GetMethods(returnImplementationType).Single(method => !method.IsPublic && method.Name.EndsWith("Read")).Id,
+                ["NewSlot"] = result.GetMethods(baseType).Single(method => method.Name == "Apply").Id,
+                ["BaseSlot"] = result.GetMethods(baseType).Single(method => method.Name == "Apply").Id,
+                ["DeclaredSlot"] = newSlotApply.Id,
+                ["Reimplemented"] = reimplementedApply.Id,
+            };
+            foreach (MethodEntry probe in probes)
+            {
+                ResolvedCall dispatch = calls.Calls.Single(call => call.CallerMethodId == probe.Id && call.Call.Kind == BehaviorCallKind.Virtual);
+                Assert.AreEqual(expected[probe.Name], dispatch.Targets.Single().MethodId);
+            }
         }
 
         // 检查参考程序集中的转交类型连接到实际运行文件。
@@ -401,7 +504,9 @@ namespace SetterChecker.Core.Tests
             MethodCatalogResult result = await new MethodCatalog().BuildAsync(material, 2);
             TypeEntry implementation = result.Types.Single(type =>
                 type.AssemblyPath == project.ForwardTargetPath && type.Name == "ForwardedType");
-            string alias = implementation.AliasIds.Single();
+            string alias = result.TypesByLogicalId.Single(item =>
+                item.Key.Contains("Forwarder", StringComparison.OrdinalIgnoreCase)
+                && item.Value.Any(type => type.Id == implementation.Id)).Key;
 
             CollectionAssert.Contains(
                 result.TypesByLogicalId[alias].Select(type => type.Id).ToArray(),
@@ -429,12 +534,15 @@ namespace SetterChecker.Core.Tests
             TypeEntry implementation = result.Types.Single(type =>
                 type.AssemblyPath == project.ForwardTargetPath
                 && type.FullName == "ForwardedNamespace.ForwardedType");
-            string outerAlias = implementation.AliasIds.Single(alias =>
-                alias.Contains("OuterFacade", StringComparison.Ordinal));
-            string middleAlias = implementation.AliasIds.Single(alias =>
-                alias.Contains("MiddleFacade", StringComparison.Ordinal));
+            string[] aliases = result.TypesByLogicalId.Where(item =>
+                item.Key != implementation.LogicalId
+                && item.Value.Any(type => type.Id == implementation.Id)).Select(item => item.Key).ToArray();
+            string outerAlias = aliases.Single(alias =>
+                alias.Contains("OuterFacade", StringComparison.OrdinalIgnoreCase));
+            string middleAlias = aliases.Single(alias =>
+                alias.Contains("MiddleFacade", StringComparison.OrdinalIgnoreCase));
 
-            Assert.HasCount(2, implementation.AliasIds);
+            Assert.HasCount(2, aliases);
             Assert.AreEqual(
                 implementation.Id,
                 result.TypesByLogicalId[implementation.LogicalId].Single().Id);
@@ -449,9 +557,6 @@ namespace SetterChecker.Core.Tests
             MethodEntry derivedTouch = result.GetMethods(derived).Single(method =>
                 method.Name == "Touch");
 
-            CollectionAssert.Contains(
-                derivedTouch.RelatedMethodIds.ToArray(),
-                target.LogicalId);
         }
 
         // 检查同一门面的未使用缺失分支不阻断已承载类型。
@@ -479,7 +584,6 @@ namespace SetterChecker.Core.Tests
             MethodEntry rootRead = catalog.GetMethods(root).Single(method =>
                 method.Name == "Read");
 
-            CollectionAssert.Contains(rootRead.RelatedMethodIds.ToArray(), targetRead.LogicalId);
             Assert.IsFalse(catalog.Types.Any(type =>
                 type.FullName == "PartialForwarding.MissingType"));
         }
@@ -509,7 +613,6 @@ namespace SetterChecker.Core.Tests
             MethodEntry derivedTouch = catalog.GetMethods(derived).Single(method =>
                 method.Name == "Touch");
 
-            CollectionAssert.Contains(derivedTouch.RelatedMethodIds.ToArray(), finalTouch.LogicalId);
         }
 
         // 检查参考门面的终点不会覆盖运行门面的不同终点。
@@ -538,7 +641,6 @@ namespace SetterChecker.Core.Tests
             MethodEntry derivedTouch = catalog.GetMethods(derived).Single(method =>
                 method.Name == "Touch");
 
-            CollectionAssert.Contains(derivedTouch.RelatedMethodIds.ToArray(), targetTouch.LogicalId);
         }
 
         // 检查同一别名的任一缺失分支都不会被另一条完整分支掩盖。
@@ -585,14 +687,12 @@ namespace SetterChecker.Core.Tests
                 .Single(type => type.FullName == "LookupContract.IRun");
 
             catalog.RequireClosedHierarchy(derived);
-            TypeEntry implementation = catalog.ImplementingTypesByInterfaceId[contract.LogicalId]
-                .Single(type => type.Id == derived.Id);
             TypeEntry baseType = catalog.Types.Single(type =>
                 type.FullName == "LookupBase.Base");
-
-            Assert.AreEqual(derived.Id, implementation.Id);
+            CollectionAssert.Contains(catalog.ImplementingTypesByInterfaceId[contract.Id]
+                .Select(type => type.Id).ToArray(), baseType.Id);
             CollectionAssert.Contains(
-                catalog.DerivedTypesByBaseId[baseType.LogicalId]
+                catalog.DerivedTypesByBaseId[baseType.Id]
                     .Select(type => type.Id).ToArray(),
                 derived.Id);
             MethodEntry contractMethod = catalog.GetMethods(contract).Single(method =>
@@ -601,12 +701,6 @@ namespace SetterChecker.Core.Tests
                 method.Name == "Run");
             MethodEntry derivedMethod = catalog.GetMethods(derived).Single(method =>
                 method.Name == "Run");
-            CollectionAssert.Contains(
-                baseMethod.RelatedMethodIds.ToArray(),
-                contractMethod.LogicalId);
-            CollectionAssert.Contains(
-                derivedMethod.RelatedMethodIds.ToArray(),
-                baseMethod.LogicalId);
         }
 
         // 检查参考目录的同目录桩不能被目录额外注入为运行载体。
@@ -713,6 +807,25 @@ namespace SetterChecker.Core.Tests
             StringAssert.Contains(exception.Message, "对应多个真实类型");
         }
 
+        // 同一错误不能随两个门面在输入中的次序改变。
+        /// <summary>反序放置同身份门面的分支，完整错误文本保持一致。</summary>
+        [TestMethod]
+        public async Task BuildAsyncOrdersForwardingFailuresByTargetIdentity()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteAmbiguousForwardedAssemblies();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            AnalysisException first = await Assert.ThrowsAsync<AnalysisException>(() => new MethodCatalog().BuildAsync(material, 1));
+            string secondPath = Path.Combine(project.RootPath, "FacadeCopy.dll");
+            byte[] firstFacade = File.ReadAllBytes(project.ExternalAssemblyPath);
+            File.WriteAllBytes(project.ExternalAssemblyPath, File.ReadAllBytes(secondPath));
+            File.WriteAllBytes(secondPath, firstFacade);
+
+            AnalysisException reversed = await Assert.ThrowsAsync<AnalysisException>(() => new MethodCatalog().BuildAsync(material, 4));
+
+            Assert.AreEqual(first.Message, reversed.Message);
+        }
+
         // 检查外层门面与最终实现同名时仍按版本分辨转交节点。
         /// <summary>
         /// 验证同一逻辑类型名的高版本门面可准确落到低版本真实类型。
@@ -738,13 +851,9 @@ namespace SetterChecker.Core.Tests
             MethodEntry derivedTouch = result.GetMethods(derived).Single(method =>
                 method.Name == "Touch");
 
-            CollectionAssert.Contains(implementation.AliasIds.ToArray(), implementation.LogicalId);
             Assert.AreEqual(
                 implementation.Id,
                 result.TypesByLogicalId[implementation.LogicalId].Single().Id);
-            CollectionAssert.Contains(
-                derivedTouch.RelatedMethodIds.ToArray(),
-                target.LogicalId);
         }
 
         // 检查材料已证明的程序集重映射贯穿类型与函数目录。
@@ -786,7 +895,6 @@ namespace SetterChecker.Core.Tests
 
             Assert.IsTrue(loaded.Any(type => type.Id == baseType.Id));
             Assert.AreEqual(project.UnityRuntimeFrameworkPath, baseType.AssemblyPath);
-            CollectionAssert.Contains(derivedMethod.RelatedMethodIds.ToArray(), baseMethod.LogicalId);
             Assert.AreEqual(project.UnityRuntimeFrameworkPath, baseMethod.AssemblyPath);
             Assert.IsGreaterThan(0, baseMethod.MetadataToken);
             CollectionAssert.AreEquivalent(
@@ -809,11 +917,9 @@ namespace SetterChecker.Core.Tests
 
             MethodCatalogResult result = await new MethodCatalog().BuildAsync(material, 2);
 
-            Assert.IsTrue(result.MissingTypeRelations.Any(relation =>
-                relation.OwnerTypeName == "TransitiveSamples.DerivedType"
-                && relation.TargetTypeId.Contains("TransitiveSamples.BaseType", StringComparison.Ordinal)));
             TypeEntry derived = result.Types.Single(type =>
                 type.FullName == "TransitiveSamples.DerivedType");
+            StringAssert.Contains(derived.BaseType!.DefinitionId, "TransitiveSamples.BaseType");
             AnalysisException exception = Assert.Throws<AnalysisException>(() =>
                 result.RequireClosedHierarchy(derived));
 
@@ -841,8 +947,6 @@ namespace SetterChecker.Core.Tests
             Assert.IsTrue(result.Types.Any(type =>
                 type.AssemblyPath == project.ForwardTargetPath
                 && type.FullName == "TransitiveSamples.BaseType"));
-            Assert.IsFalse(result.MissingTypeRelations.Any(relation =>
-                relation.OwnerTypeId == derived.Id));
         }
 
         // 检查闭合层级后会重新计算子类的重写关系。
@@ -867,7 +971,7 @@ namespace SetterChecker.Core.Tests
                 method.Name == "Touch");
             Assert.IsFalse(result.Types.Any(type =>
                 type.FullName == "TransitiveSamples.BaseType"));
-            Assert.AreEqual(0, firstRead.RelatedMethodIds.Count);
+            Assert.IsTrue(firstRead.IsVirtual);
 
             result.RequireClosedHierarchy(derivedType);
             TypeEntry baseType = result.Types.Single(type =>
@@ -876,8 +980,8 @@ namespace SetterChecker.Core.Tests
                 method.Name == "Touch");
             MethodEntry secondRead = result.GetMethods(derivedType).Single(method =>
                 method.Name == "Touch");
+            Assert.AreEqual(firstRead.Id, secondRead.Id);
 
-            CollectionAssert.Contains(secondRead.RelatedMethodIds.ToArray(), baseMethod.LogicalId);
         }
 
         // 检查四路并发读取不会在闭合后写回过期的重写关系。
@@ -903,7 +1007,7 @@ namespace SetterChecker.Core.Tests
                 index => firstReads[index] = result.GetMethods(derivedType).Single(method =>
                     method.Name == "Touch"));
 
-            Assert.IsTrue(firstReads.All(method => method.RelatedMethodIds.Count == 0));
+            Assert.HasCount(1, firstReads.Select(method => method.Id).Distinct().ToArray());
             result.RequireClosedHierarchy(derivedType);
             TypeEntry baseType = result.Types.Single(type =>
                 type.FullName == "TransitiveSamples.BaseType");
@@ -918,9 +1022,8 @@ namespace SetterChecker.Core.Tests
                 index => secondReads[index] = result.GetMethods(derivedType).Single(method =>
                     method.Name == "Touch"));
 
-            Assert.IsTrue(secondReads.All(method => method.RelatedMethodIds.Contains(
-                baseMethodId,
-                StringComparer.Ordinal)));
+            Assert.IsTrue(secondReads.All(method => method.Id == firstReads[0].Id));
+            Assert.IsFalse(result.TypesById[result.GetMethods(baseType).Single(method => method.LogicalId == baseMethodId).TypeId].IsInterface);
         }
 
         // 检查构造类型实参不会替换函数自己的泛型参数。
@@ -950,9 +1053,6 @@ namespace SetterChecker.Core.Tests
             Assert.AreEqual("!!0", baseMethod.ReturnTypeId);
             Assert.AreEqual("!!0", derivedMethod.Parameters.Single().TypeId);
             Assert.AreEqual("!!0", derivedMethod.ReturnTypeId);
-            CollectionAssert.Contains(
-                derivedMethod.RelatedMethodIds.ToArray(),
-                baseMethod.LogicalId);
         }
 
         // 检查延迟载入类型时可以同时读取现有函数和类型索引。
@@ -985,7 +1085,6 @@ namespace SetterChecker.Core.Tests
                     _ = result.Types.Count;
                     _ = result.TypesById.Count;
                     _ = result.TypesByLogicalId.Count;
-                    _ = result.MissingTypeRelations.Count;
                     _ = result.GetMethods(derived).Count;
                 });
 
@@ -1141,13 +1240,12 @@ namespace SetterChecker.Core.Tests
             Assert.IsGreaterThan(0, echo.Line);
             Assert.AreEqual(echo.LogicalId, echo.Id);
             Assert.IsGreaterThan(0, echo.MetadataToken);
-            Assert.IsTrue(echo.MethodAttributes.Any(attribute =>
-                attribute.TypeName == "SourceSamples.NoLogTrackAttribute"
-                && attribute.HasArguments));
+            Assert.IsTrue(echo.SourceSymbol.GetAttributes().Any(attribute =>
+                attribute.AttributeClass!.ToDisplayString() == "SourceSamples.NoLogTrackAttribute"
+                && attribute.ConstructorArguments.Length > 0));
             Assert.AreEqual("!1&", echo.Parameters[0].TypeId);
             Assert.AreEqual("!!0", echo.Parameters[1].TypeId);
             Assert.AreEqual("!1", echo.ReturnTypeId);
-            CollectionAssert.Contains(echo.RelatedMethodIds.ToArray(), contract.LogicalId);
             Assert.IsNull(generated.SourceSymbol);
             Assert.AreNotEqual(generated.LogicalId, generated.Id);
             Assert.IsGreaterThan(0, generated.MetadataToken);
@@ -1234,10 +1332,10 @@ namespace SetterChecker.Core.Tests
 
             Assert.AreEqual(expected.Id, loaded.Id);
             Assert.AreSame(expected.SourceSymbol, loaded.SourceSymbol);
-            CollectionAssert.AreEqual(expected.Attributes.ToArray(), loaded.Attributes.ToArray());
+            Assert.AreEqual(expected.SourceSymbol, loaded.SourceSymbol);
             Assert.AreEqual(expectedMethod.Id, method.Id);
             Assert.AreEqual(expectedMethod.SourcePath, method.SourcePath);
-            CollectionAssert.AreEqual(expectedMethod.MethodAttributes.ToArray(), method.MethodAttributes.ToArray());
+            Assert.AreEqual(expectedMethod.SourceSymbol, method.SourceSymbol);
         }
 
         // 检查没有专用元数据元素类型的基础值类型也能绑定内存函数。
@@ -1317,9 +1415,8 @@ namespace SetterChecker.Core.Tests
 
             catalog.RequireClosedHierarchy(derived);
             Assert.AreEqual(project.UnityRuntimeTargetPath, baseType.AssemblyPath);
-            Assert.IsTrue(baseType.AliasIds.Contains(
-                derived.BaseType!.DefinitionId,
-                StringComparer.Ordinal));
+            Assert.AreEqual(baseType.Id,
+                catalog.TypesByLogicalId[derived.BaseType!.DefinitionId].Single().Id);
             Assert.IsFalse(catalog.Types.Any(type => string.Equals(
                 type.AssemblyPath,
                 project.UnityReferencePath,
@@ -1339,7 +1436,7 @@ namespace SetterChecker.Core.Tests
                 2));
             SourceAssemblyMaterial sourceAssembly = material.SourceAssemblies.Single(assembly =>
                 assembly.IsReportAssembly);
-            File.WriteAllText(sourceAssembly.AssemblyPath, "stale output");
+            File.WriteAllText(sourceAssembly.AssemblyPath, "stale output", encoding: new System.Text.UTF8Encoding(false));
 
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
             MethodEntry method = catalog.Methods.Single(item =>
@@ -1410,10 +1507,6 @@ namespace SetterChecker.Core.Tests
             MethodEntry externalOverride = catalog.GetMethods(externalDerived).Single(method =>
                 method.Name == "Touch");
 
-            CollectionAssert.Contains(localOverride.RelatedMethodIds.ToArray(), localBaseTouch.LogicalId);
-            CollectionAssert.DoesNotContain(localOverride.RelatedMethodIds.ToArray(), targetTouch.LogicalId);
-            CollectionAssert.Contains(externalOverride.RelatedMethodIds.ToArray(), targetTouch.LogicalId);
-            CollectionAssert.DoesNotContain(externalOverride.RelatedMethodIds.ToArray(), localBaseTouch.LogicalId);
         }
 
         // 对比单线程和四线程建立的稳定清单。

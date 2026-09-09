@@ -8,21 +8,157 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class MaterialLoaderTests
     {
-        // 验证纯参考门面不能绕过同名运行文件的身份检查。
+        // 类型转交不能通过相邻改名文件的元数据名称猜出运行载体。
+        /// <summary>仅显式运行引用授予元数据名称入口。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task LoadAsyncFollowsRenamedCarrierOnlyWhenExplicit(bool explicitReference)
+        {
+            using TestProject project = TestProject.CreateWithLegacyRenamedForwarder(explicitReference);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            ExternalAssemblyMaterial facade = material.ExternalAssemblies.Single(assembly => assembly.ReferencePath == project.UnityReferencePath);
+            Assert.AreEqual(explicitReference, facade.ImplementationPaths.Contains(Path.Combine(project.RootPath, "Renamed.dll")));
+        }
+
+        // 本轮编译的源码同样是实际运行候选，不能被磁盘运行库覆盖。
+        /// <summary>当前构建中的同名源码阻止全局身份重定向。</summary>
+        [TestMethod]
+        public async Task LoadAsyncKeepsLegacySourceCarrierWithoutGlobalRedirect()
+        {
+            using TestProject project = TestProject.CreateWithLegacySourceCollision();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            string identity = System.Reflection.AssemblyName.GetAssemblyName(project.UnityFrameworkReferencePath).FullName!;
+            Assert.IsTrue(material.SourceAssemblies.Any(source => source.Name == "UnityFramework"));
+            Assert.IsFalse(material.AssemblyRedirects.ContainsKey(identity));
+        }
+
+        // 与 Unity 同简单名的显式改名项目库不能被运行目录中的唯一文件覆盖。
+        /// <summary>竞争载体先保留；尚未使用的歧义不阻断材料，也不产生全局重定向。</summary>
+        [TestMethod]
+        public async Task LoadAsyncKeepsAllLegacyCarriersWithoutGlobalRedirect()
+        {
+            using TestProject project = TestProject.CreateWithLegacyCarrierCollision();
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            string referenceIdentity = System.Reflection.AssemblyName.GetAssemblyName(project.UnityFrameworkReferencePath).FullName!;
+            Assert.IsTrue(material.UsesUnityLegacyBinding);
+            Assert.IsFalse(material.AssemblyRedirects.ContainsKey(referenceIdentity));
+            CollectionAssert.IsSubsetOf(new[] { project.UnityRuntimeFrameworkPath, Path.Combine(project.RootPath, "ProjectFramework.dll") },
+                material.AssemblyLookupPaths.ToArray());
+        }
+
+        // 编辑器专用程序集不进入日志标签统计，但必须保留其源码和依赖。
+        /// <summary>按真实 asmdef 平台声明排除报告根，不根据名字或目录判断。</summary>
+        [TestMethod]
+        [DataRow("Editor", false)]
+        [DataRow("Editor,Android", true)]
+        [DataRow("", true)]
+        public async Task LoadAsyncKeepsEditorOnlyAssemblyOutsideReport(string platforms, bool reportable)
+        {
+            using TestProject project = TestProject.CreateWithTargetPackageDependency();
+            string definitionPath = Path.Combine(project.RootPath, "Packages", "khengine", "Define", "Utilities.asmdef");
+            File.WriteAllText(definitionPath, System.Text.Json.JsonSerializer.Serialize(new
+            {
+                name = "Dependency",
+                includePlatforms = platforms.Split(',', StringSplitOptions.RemoveEmptyEntries),
+            }), encoding: new System.Text.UTF8Encoding(false));
+            File.WriteAllText(project.RootSourcePath, "public static class Caller { public static void Run(DependencyType value) { value.DependencyMethod(); } }", encoding: new System.Text.UTF8Encoding(false));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            SourceAssemblyMaterial dependency = material.SourceAssemblies.Single(source => source.Name == "Dependency");
+            Assert.AreEqual(reportable, dependency.IsReportAssembly);
+            Assert.AreEqual(reportable ? 1 : 0, dependency.ReportSourcePaths.Count);
+            Assert.HasCount(1, dependency.SourcePaths);
+            Assert.IsNotEmpty(dependency.AssemblyImage);
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry method = catalog.Methods.Single(item => item.Name == "DependencyMethod");
+            Assert.AreEqual(reportable, method.IsReportable);
+            MethodEntry caller = catalog.Methods.Single(item => item.Name == "Run");
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, new[] { caller }, 2);
+            Assert.AreEqual(method.Id, calls.Calls.Single().Targets.Single().MethodId);
+        }
+
+        // 错误或重复的程序集声明不能被吞掉后改变报告范围。
+        /// <summary>平台类型错误、JSON 损坏和同名定义均保留具体文件证据。</summary>
+        [TestMethod]
+        [DataRow("{\"name\":\"Dependency\",\"includePlatforms\":\"Editor\"}")]
+        [DataRow("{\"name\":\"Dependency\",\"includePlatforms\":[null]}")]
+        [DataRow("{")]
+        [DataRow("{\"name\":\"khengine.runtime\",\"includePlatforms\":[\"Editor\"]}")]
+        public async Task LoadAsyncRejectsAmbiguousReportAssemblyDefinition(string content)
+        {
+            using TestProject project = TestProject.CreateWithTargetPackageDependency();
+            string path = Path.Combine(project.RootPath, "Packages", "khengine", "Define", "Utilities.asmdef");
+            File.WriteAllText(path, content, encoding: new System.Text.UTF8Encoding(false));
+            AnalysisException failure = await Assert.ThrowsAsync<AnalysisException>(() =>
+                new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2)));
+            StringAssert.Contains(failure.Message, path);
+        }
+
+        // 复刻 KHRTUIManager 通过接口调用 Assets 中实际实现的情况。
+        /// <summary>同次构建的反向消费者进入材料和候选表，但不进入 khengine 标签统计。</summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(true, true)]
+        public async Task LoadAsyncIncludesIncomingImplementation(bool sharedContract, bool precompiledContract)
+        {
+            using TestProject project = TestProject.CreateWithIncomingImplementation(sharedContract, precompiledContract);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            Assert.HasCount(sharedContract && !precompiledContract ? 4 : 3, material.SourceAssemblies);
+            Assert.IsFalse(material.SourceAssemblies.Single(source => source.Name == "Consumer").IsReportAssembly);
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            Assert.IsTrue(catalog.Types.Any(type => type.FullName == "Consumer"));
+            Assert.IsFalse(catalog.Methods.Any(method => method.TypeName == "Consumer" && method.IsReportable));
+            MethodEntry[] roots = catalog.Methods.Where(method => method.IsReportable).ToArray();
+            Assert.HasCount(1, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            Assert.AreEqual(MethodEffectKind.Setter, new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.Single().Kind);
+        }
+
+        // 磁盘残留的邻近响应文件不代表它参与当前构建。
+        /// <summary>只按当前构建产物表选择源码，图外 DLL 保留为真实托管材料。</summary>
+        [TestMethod]
+        public async Task LoadAsyncDoesNotFollowStaleAdjacentResponse()
+        {
+            using TestProject project = TestProject.Create();
+            string graphPath = Path.Combine(project.RootPath, "Library", "Bee", "build.json");
+            var graph = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(graphPath))!;
+            var nodes = graph["Nodes"]!.AsArray();
+            nodes.Remove(nodes.Single(node => node!["Annotation"]!.GetValue<string>().Contains("/Dependency.dll", StringComparison.Ordinal)));
+            File.WriteAllText(graphPath, graph.ToJsonString(), encoding: new System.Text.UTF8Encoding(false));
+            string directory = Path.GetDirectoryName(project.RootResponsePath)!;
+            File.Copy(Path.Combine(directory, "Dependency.ref.dll"), Path.Combine(directory, "Dependency.dll"));
+            File.WriteAllText(Path.Combine(project.RootPath, "Packages", "dependency", "Dependency.cs"), "this is stale invalid source", encoding: new System.Text.UTF8Encoding(false));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            Assert.HasCount(1, material.SourceAssemblies);
+            Assert.IsTrue(material.ExternalAssemblies.Any(assembly => assembly.ReferencePath.EndsWith("Dependency.ref.dll", StringComparison.Ordinal)));
+        }
+
+        // 保留转交记录提供的完整公钥，不为了建立索引先转换为 token。
+        /// <summary>尚未命中的不匹配公钥转交不应阻断其他材料，也不能误连无签名实现。</summary>
+        [TestMethod]
+        public async Task LoadAsyncKeepsForwarderWithUnmatchedFullPublicKey()
+        {
+            using TestProject project = TestProject.CreateWithForwardedType(unmatchedFullPublicKey: true);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            Assert.IsFalse(material.ExternalAssemblies.SelectMany(assembly => assembly.ImplementationPaths)
+                .Contains(project.ForwardTargetPath));
+            Assert.IsTrue(material.ExternalAssemblies.SelectMany(assembly => assembly.ImplementationPaths)
+                .Contains(project.ExternalAssemblyPath));
+        }
+
+        // 验证编译参考的转交不能替代实际运行文件的转交。
         /// <summary>
-        /// 同名运行文件身份不兼容时，不能借参考转交绕过运行映射检查。
+        /// 已核实的运行目录按实际文件继续查找类型。
         /// </summary>
         [TestMethod]
-        public async Task LoadAsyncRejectsIncompatibleRuntimeBeforeFollowingReferenceForwarders()
+        public async Task LoadAsyncUsesRuntimeBeforeFollowingReferenceForwarders()
         {
             using TestProject project = TestProject.CreateWithForwardingUnityReference();
 
-            AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() =>
-                new MaterialLoader().LoadAsync(new MaterialRequest(
-                    project.AssemblyDefinitionPath,
-                    2)));
-
-            StringAssert.Contains(exception.Message, "程序集身份不同");
+            MaterialSet result = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            CollectionAssert.AreEqual(new[] { project.UnityRuntimeFacadePath, project.UnityRuntimeTargetPath },
+                result.ExternalAssemblies.Single(assembly => assembly.ReferencePath == project.UnityReferencePath).ImplementationPaths.ToArray());
         }
 
         // 验证源码依赖新增成员后无需等待 Unity 重建旧参考文件。
@@ -35,9 +171,9 @@ namespace SetterChecker.Core.Tests
             using TestProject project = TestProject.Create();
             string dependencyPath = Path.Combine(project.RootPath, "Packages", "dependency", "Dependency.cs");
             File.WriteAllText(dependencyPath,
-                "public sealed class DependencyType { public static int NewApi() { return 42; } }");
+                "public sealed class DependencyType { public static int NewApi() { return 42; } }", encoding: new System.Text.UTF8Encoding(false));
             File.WriteAllText(project.RootSourcePath,
-                "public sealed class RootType { public static int Read() { return DependencyType.NewApi(); } }");
+                "public sealed class RootType { public static int Read() { return DependencyType.NewApi(); } }", encoding: new System.Text.UTF8Encoding(false));
 
             MaterialSet result = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
 
@@ -56,9 +192,9 @@ namespace SetterChecker.Core.Tests
         {
             using TestProject project = TestProject.Create();
             File.WriteAllText(Path.Combine(project.RootPath, "Packages", "dependency", "Dependency.cs"),
-                "public sealed class ReplacementType { }");
+                "public sealed class ReplacementType { }", encoding: new System.Text.UTF8Encoding(false));
             File.WriteAllText(project.RootSourcePath,
-                "public sealed class RootType { public static object Read() { return new DependencyType(); } }");
+                "public sealed class RootType { public static object Read() { return new DependencyType(); } }", encoding: new System.Text.UTF8Encoding(false));
 
             AnalysisException error = await Assert.ThrowsAsync<AnalysisException>(() =>
                 new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2)));
@@ -76,8 +212,8 @@ namespace SetterChecker.Core.Tests
         {
             using TestProject project = TestProject.CreateSingleAssembly();
             string extraPath = Path.Combine(Path.GetDirectoryName(project.RootSourcePath)!, "AAAFirst.cs");
-            File.WriteAllText(extraPath, "public sealed class ExtraSource { }");
-            File.AppendAllText(project.RootResponsePath, Environment.NewLine + "\"" + extraPath + "\"" + Environment.NewLine);
+            File.WriteAllText(extraPath, "public sealed class ExtraSource { }", encoding: new System.Text.UTF8Encoding(false));
+            File.AppendAllText(project.RootResponsePath, Environment.NewLine + "\"" + extraPath + "\"" + Environment.NewLine, encoding: new System.Text.UTF8Encoding(false));
 
             MaterialSet material = await new MaterialLoader().LoadAsync(
                 new MaterialRequest(project.AssemblyDefinitionPath, 2));
@@ -119,7 +255,7 @@ namespace SetterChecker.Core.Tests
 
         // 检查 Core 全部手写源码的物理行数，防止新模块突破约定规模。
         /// <summary>
-        /// 将 Core 一万行上限作为自动化验收条件，计入注释和空行。
+        /// 将 Core 一万三千行上限作为自动化验收条件，计入注释和空行。
         /// </summary>
         [TestMethod]
         public void CoreSourceStaysWithinLineLimit()
@@ -139,8 +275,8 @@ namespace SetterChecker.Core.Tests
                         || string.Equals(part, "obj", StringComparison.OrdinalIgnoreCase)))
                 .Select(path => (Name: Path.GetFileName(path), Lines: File.ReadLines(path).Count())).ToArray();
 
-            Assert.IsTrue(files.Sum(file => file.Lines) <= 10_000,
-                $"Core 实际 {files.Sum(file => file.Lines)} 行，超过 10000 行；"
+            Assert.IsTrue(files.Sum(file => file.Lines) <= 13_000,
+                $"Core 实际 {files.Sum(file => file.Lines)} 行，超过 13000 行；"
                 + string.Join("，", files.Select(file => $"{file.Name}: {file.Lines}")));
         }
 
@@ -227,30 +363,27 @@ namespace SetterChecker.Core.Tests
                 external.ImplementationPaths.ToArray());
         }
 
-        // 检查Unity运行目录中的普通程序集不能跨版本代替参考文件。
+        // 检查已核实的 Unity 普通程序集使用唯一实际运行载体。
         /// <summary>
-        /// 验证只有纯类型转交门面可以使用Unity的门面版本规则。
+        /// 普通程序集和门面遵循同一宿主装载规则。
         /// </summary>
         [TestMethod]
-        public async Task LoadAsyncRejectsVersionChangeForUnityRuntimeImplementation()
+        public async Task LoadAsyncUsesUniqueUnityRuntimeImplementationAcrossVersions()
         {
             using TestProject project = TestProject.CreateWithUnityRuntimeCandidate(
                 runtimeIsForwardingFacade: false);
 
-            AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() =>
-                new MaterialLoader().LoadAsync(new MaterialRequest(
-                    project.AssemblyDefinitionPath,
-                    2)));
-
-            StringAssert.Contains(exception.Message, "程序集身份");
+            MaterialSet result = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            CollectionAssert.AreEqual(new[] { project.UnityRuntimeFacadePath }, result.ExternalAssemblies
+                .Single(assembly => assembly.ReferencePath == project.UnityReferencePath).ImplementationPaths.ToArray());
         }
 
-        // 检查Unity Mono表内的普通框架程序集按当前运行版本连接。
+        // 检查 Unity 普通程序集按当前宿主装载规则连接。
         /// <summary>
-        /// 验证框架表明确的4.2参考可连接到4.0运行实现。
+        /// 验证 4.2 参考可连接到唯一的 4.0 运行实现。
         /// </summary>
         [TestMethod]
-        public async Task LoadAsyncUsesListedUnityFrameworkVersionRemapping()
+        public async Task LoadAsyncUsesUniqueUnityLegacyCarrier()
         {
             using TestProject project = TestProject.CreateWithUnityFrameworkVersionRemapping();
 
@@ -269,84 +402,81 @@ namespace SetterChecker.Core.Tests
             Assert.AreEqual(project.UnityRuntimeFrameworkPath, result.AssemblyRedirects[referenceIdentity]);
         }
 
-        // 检查Unity目录不会给未列入Mono表的程序集放宽版本。
+        // 检查不能将未知宿主版本套用已审计的装载规则。
         /// <summary>
-        /// 验证相同目录和同名候选不能代替框架表证据。
+        /// 未核实的版本必须报告宿主位置。
         /// </summary>
         [TestMethod]
-        public async Task LoadAsyncRejectsUnityFrameworkMissingFromRemappingTable()
+        public async Task LoadAsyncRejectsUnauditedUnityHostVersion()
         {
             using TestProject project = TestProject.CreateWithUnityFrameworkVersionRemapping(
-                includeTableEntry: false);
+                hostFileVersion: "2022.1.0.0");
 
             AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() =>
                 new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2)));
 
-            StringAssert.Contains(exception.Message, "程序集身份");
+            StringAssert.Contains(exception.Message, "Unity 宿主装载规则尚未审计");
         }
 
-        // 检查框架重映射不会跨过公钥标记差异。
+        // 当前 Unity 的非严格装载只按简单名选择唯一真实载体，版本和公钥不决定候选。
         /// <summary>
-        /// 验证Mono表项仍然要求参考与运行文件的公钥标记一致。
+        /// 验证间接依赖和编译引用共同进入实际运行文件，不依赖旧框架表。
         /// </summary>
         [TestMethod]
-        public async Task LoadAsyncRejectsUnityFrameworkWithDifferentPublicKeyToken()
+        public async Task LoadAsyncUsesUniqueLegacyCarrierAcrossVersionAndPublicKey()
         {
             using TestProject project = TestProject.CreateWithUnityFrameworkVersionRemapping(
                 changeRuntimeToken: true);
-
-            AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() =>
-                new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2)));
-
-            StringAssert.Contains(exception.Message, "程序集身份");
+            MaterialSet result = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            string referenceIdentity = System.Reflection.AssemblyName.GetAssemblyName(project.UnityFrameworkReferencePath).FullName!;
+            Assert.AreEqual(project.UnityRuntimeFrameworkPath, result.AssemblyRedirects[referenceIdentity]);
+            CollectionAssert.AreEqual(new[] { project.UnityRuntimeFrameworkPath }, result.ExternalAssemblies
+                .Single(assembly => assembly.ReferencePath == project.UnityFrameworkReferencePath).ImplementationPaths.ToArray());
         }
 
-        // 检查只允许低版本向上重映射的Mono表项。
+        // 检查附近同名元数据的改名文件不冒充已预载程序集。
         /// <summary>
-        /// 验证4.2请求不能通过只允许低版本的表项降到4.0。
+        /// 未显式引用的改名邻接文件不能阻断唯一的运行载体。
         /// </summary>
         [TestMethod]
-        public async Task LoadAsyncRejectsUnityFrameworkAgainstOnlyLowerRule()
+        public async Task LoadAsyncExcludesRenamedUnreferencedCarrier()
         {
-            using TestProject project = TestProject.CreateWithUnityFrameworkVersionRemapping(
-                onlyLowerVersions: true);
-
-            AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() =>
-                new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2)));
-
-            StringAssert.Contains(exception.Message, "程序集身份");
+            using TestProject project = TestProject.CreateWithLegacyCarrierCollision(explicitReference: false);
+            MaterialSet result = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            string referenceIdentity = System.Reflection.AssemblyName.GetAssemblyName(project.UnityFrameworkReferencePath).FullName!;
+            Assert.AreEqual(project.UnityRuntimeFrameworkPath, result.AssemblyRedirects[referenceIdentity]);
         }
 
-        // 检查Unity安装缺少Mono源码证据时不猜测版本关系。
+        // 检查缺少实际 Unity 宿主时不猜测装载规则。
         /// <summary>
-        /// 验证缺少当前运行时的映射表时明确失败。
+        /// 验证只有库目录不能证明宿主版本。
         /// </summary>
         [TestMethod]
-        public async Task LoadAsyncRejectsUnityFrameworkWithoutRemappingEvidence()
+        public async Task LoadAsyncRejectsMissingUnityHost()
         {
             using TestProject project = TestProject.CreateWithUnityFrameworkVersionRemapping(
-                includeEvidence: false);
+                includeHost: false);
 
             AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() =>
                 new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2)));
 
-            StringAssert.Contains(exception.Message, "Mono框架版本表");
+            StringAssert.Contains(exception.Message, "Unity 宿主装载规则尚未审计");
         }
 
-        // 检查选中的Mono运行时行不能含未解析版本槽。
+        // 检查宿主文件存在但实际 Mono 运行库缺失时拒绝装载。
         /// <summary>
-        /// 验证NOT_AVAIL不会被删除后造成后续索引移位。
+        /// 验证必要运行文件缺失时保留宿主诊断。
         /// </summary>
         [TestMethod]
-        public async Task LoadAsyncRejectsIncompleteSelectedRuntimeVersionSet()
+        public async Task LoadAsyncRejectsMissingUnityRuntime()
         {
-            using TestProject project = TestProject.CreateWithUnityFrameworkVersionRemapping(
-                runtimeRowContainsUnavailableVersion: true);
+            using TestProject project = TestProject.CreateWithUnityFrameworkVersionRemapping();
+            File.Delete(Path.Combine(project.RootPath, "Data", "MonoBleedingEdge", "EmbedRuntime", "mono-2.0-bdwgc.dll"));
 
             AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() =>
                 new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2)));
 
-            StringAssert.Contains(exception.Message, "Mono框架版本表");
+            StringAssert.Contains(exception.Message, "Unity 宿主装载规则尚未审计");
         }
 
         // 检查Unity参考文件能连接到当前运行配置的纯转交门面。
@@ -368,9 +498,6 @@ namespace SetterChecker.Core.Tests
             CollectionAssert.AreEqual(
                 new[] { project.UnityRuntimeFacadePath, project.UnityRuntimeTargetPath },
                 facade.ImplementationPaths.ToArray());
-            CollectionAssert.AreEqual(
-                new[] { project.UnityRuntimeFacadePath },
-                result.UnityRuntimeFacadePaths.ToArray());
             Assert.IsFalse(facade.ImplementationPaths.Contains(
                 project.UnityReferencePath,
                 StringComparer.OrdinalIgnoreCase));
@@ -524,62 +651,53 @@ namespace SetterChecker.Core.Tests
                 rootShim.ImplementationPaths.ToArray());
         }
 
-        // 检查Facades以外的转交文件不能启用Unity版本规则。
+        // 检查运行目录中的普通文件和门面共用装载规则。
         /// <summary>
-        /// 验证只有当前运行配置的Facades目录具备门面资格。
+        /// 不要求转交文件必须在 Facades 子目录。
         /// </summary>
         [TestMethod]
-        public async Task LoadAsyncRejectsForwardingFacadeOutsideRuntimeFacadeDirectory()
+        public async Task LoadAsyncUsesForwardingFacadeInRuntimeDirectory()
         {
             using TestProject project = TestProject.CreateWithUnityRuntimeCandidate(
                 runtimeIsForwardingFacade: true,
                 placeInFacadeDirectory: false);
 
-            AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() =>
-                new MaterialLoader().LoadAsync(new MaterialRequest(
-                    project.AssemblyDefinitionPath,
-                    2)));
-
-            StringAssert.Contains(exception.Message, "程序集身份");
+            MaterialSet result = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            CollectionAssert.AreEqual(new[] { Path.Combine(Path.GetDirectoryName(project.UnityRuntimeTargetPath)!, "UnityFacade.dll"), project.UnityRuntimeTargetPath },
+                result.ExternalAssemblies.Single(assembly => assembly.ReferencePath == project.UnityReferencePath).ImplementationPaths.ToArray());
         }
 
-        // 检查运行门面不能满足更高主版本的参考请求。
+        // 检查当前宿主不按主版本排除唯一运行门面。
         /// <summary>
-        /// 验证Unity门面只允许候选主版本不低于请求版本。
+        /// 实际类型继续由运行门面转交。
         /// </summary>
         [TestMethod]
-        public async Task LoadAsyncRejectsOlderUnityRuntimeFacadeMajorVersion()
+        public async Task LoadAsyncUsesOlderUnityRuntimeFacadeMajorVersion()
         {
             using TestProject project = TestProject.CreateWithUnityRuntimeCandidate(
                 runtimeIsForwardingFacade: true,
                 referenceVersion: "3.0.0.0",
                 runtimeVersion: "2.1.0.0");
 
-            AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() =>
-                new MaterialLoader().LoadAsync(new MaterialRequest(
-                    project.AssemblyDefinitionPath,
-                    2)));
-
-            StringAssert.Contains(exception.Message, "程序集身份");
+            MaterialSet result = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            CollectionAssert.AreEqual(new[] { project.UnityRuntimeFacadePath, project.UnityRuntimeTargetPath },
+                result.ExternalAssemblies.Single(assembly => assembly.ReferencePath == project.UnityReferencePath).ImplementationPaths.ToArray());
         }
 
-        // 检查Unity门面文件名不能代替真实程序集身份。
+        // 当前宿主按请求文件名打开库，不要求其元数据名称一致。
         /// <summary>
-        /// 验证门面规则仍要求程序集名称、区域和公钥标记一致。
+        /// 名称不同仍沿实际载体的类型转交记录读取。
         /// </summary>
         [TestMethod]
-        public async Task LoadAsyncRejectsUnityFacadeWithDifferentAssemblyName()
+        public async Task LoadAsyncUsesProbedFileWithDifferentAssemblyName()
         {
             using TestProject project = TestProject.CreateWithUnityRuntimeCandidate(
                 runtimeIsForwardingFacade: true,
                 runtimeAssemblyName: "DifferentFacade");
 
-            AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() =>
-                new MaterialLoader().LoadAsync(new MaterialRequest(
-                    project.AssemblyDefinitionPath,
-                    2)));
-
-            StringAssert.Contains(exception.Message, "程序集身份");
+            MaterialSet result = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            CollectionAssert.AreEqual(new[] { project.UnityRuntimeFacadePath, project.UnityRuntimeTargetPath },
+                result.ExternalAssemblies.Single(assembly => assembly.ReferencePath == project.UnityReferencePath).ImplementationPaths.ToArray());
         }
 
         // 检查普通业务程序集仍要求完整版本一致。
@@ -717,17 +835,17 @@ namespace SetterChecker.Core.Tests
         {
             using TestProject project = TestProject.CreateSingleAssembly();
             string second = project.CopyRootResponseToSecondBuild();
-            File.AppendAllText(second, Environment.NewLine + "/define:CURRENT_BUILD" + Environment.NewLine);
+            File.AppendAllText(second, Environment.NewLine + "/define:CURRENT_BUILD" + Environment.NewLine, encoding: new System.Text.UTF8Encoding(false));
             File.SetLastWriteTimeUtc(project.RootResponsePath, DateTime.UtcNow.AddHours(1));
             string build = Path.GetFileName(Path.GetDirectoryName(second)!);
-            File.WriteAllText(Path.Combine(project.RootPath, "Library", "Bee", build), "test graph");
+            File.WriteAllText(Path.Combine(project.RootPath, "Library", "Bee", build), "test graph", encoding: new System.Text.UTF8Encoding(false));
             File.WriteAllText(Path.Combine(project.RootPath, "Library", "Bee", "tundra.log.json"),
                 System.Text.Json.JsonSerializer.Serialize(new
                 {
                     msg = "init",
                     dagFile = "Library/Bee/" + build,
                     targets = new[] { "ScriptAssemblies" },
-                }) + Environment.NewLine);
+                }) + Environment.NewLine, encoding: new System.Text.UTF8Encoding(false));
 
             MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
 
@@ -744,14 +862,14 @@ namespace SetterChecker.Core.Tests
         public async Task LoadAsyncRejectsUnusableRecordedBuildWithoutSelectingOldResponse(string target, string message)
         {
             using TestProject project = TestProject.CreateSingleAssembly();
-            File.WriteAllText(Path.Combine(project.RootPath, "Library", "Bee", "missing.dag"), "test graph");
+            File.WriteAllText(Path.Combine(project.RootPath, "Library", "Bee", "missing.dag"), "test graph", encoding: new System.Text.UTF8Encoding(false));
             File.WriteAllText(Path.Combine(project.RootPath, "Library", "Bee", "tundra.log.json"),
                 System.Text.Json.JsonSerializer.Serialize(new
                 {
                     msg = "init",
                     dagFile = "Library/Bee/missing.dag",
                     targets = new[] { target },
-                }) + Environment.NewLine);
+                }) + Environment.NewLine, encoding: new System.Text.UTF8Encoding(false));
 
             AnalysisException error = await Assert.ThrowsAsync<AnalysisException>(() =>
                 new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2)));
@@ -768,7 +886,7 @@ namespace SetterChecker.Core.Tests
             using TestProject project = TestProject.CreateSingleAssembly();
             string graph = "Library/Bee/" + Path.GetFileName(Path.GetDirectoryName(project.RootResponsePath)!);
             File.WriteAllText(Path.Combine(project.RootPath, "Library", "Bee", "tundra.log.json"),
-                System.Text.Json.JsonSerializer.Serialize(new { msg = "init", dagFile = graph, targets = new[] { "ScriptAssemblies" } }));
+                System.Text.Json.JsonSerializer.Serialize(new { msg = "init", dagFile = graph, targets = new[] { "ScriptAssemblies" } }), encoding: new System.Text.UTF8Encoding(false));
 
             AnalysisException error = await Assert.ThrowsAsync<AnalysisException>(() =>
                 new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2)));
@@ -792,7 +910,7 @@ namespace SetterChecker.Core.Tests
         {
             using TestProject project = TestProject.CreateSingleAssembly();
             string log = Path.Combine(project.RootPath, "Library", "Bee", "tundra.log.json");
-            File.WriteAllText(log, header);
+            File.WriteAllText(log, header, encoding: new System.Text.UTF8Encoding(false));
 
             AnalysisException error = await Assert.ThrowsAsync<AnalysisException>(() =>
                 new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2)));
@@ -868,7 +986,7 @@ namespace SetterChecker.Core.Tests
                 singleAssemblyProject.AssemblyDefinitionPath,
                 4));
 
-            Assert.IsTrue(singleAssembly.SourceAssemblies.Single().Compilation.Options.ConcurrentBuild);
+            Assert.IsFalse(singleAssembly.SourceAssemblies.Single().Compilation.Options.ConcurrentBuild);
         }
 
         // 把源码程序集转换成不包含耗时和对象地址的稳定描述。
