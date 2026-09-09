@@ -6,6 +6,114 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class CallTargetResolverTests
     {
+        // 数组地址快排只能移除不相干存储，不能跳过真正写到字段或局部变量的引用。
+        /// <summary>未知数组下标不污染字段与局部值，直接和混合引用仍保留字段写入。</summary>
+        [TestMethod]
+        [DataRow("array", "7", "2")]
+        [DataRow("field", "9", "2")]
+        [DataRow("local", "7", "9")]
+        [DataRow("mixed", "7,9", "2")]
+        public async Task ResolveAsyncSeparatesArrayElementsFromObjectAndLocalSlots(string target, string field, string local)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Holder { public int Value; }
+                public static class Calls
+                {
+                    public static void Entry(int[] array, int index, bool choose)
+                    {
+                        var holder = new Holder();
+                        holder.Value = 7;
+                        int number = 2;
+                        WRITE
+                        Observe(holder.Value, number);
+                    }
+                    private static void Observe(int field, int local) { }
+                }
+                """.Replace("WRITE", target switch
+            {
+                "array" => "array[index] ^= 1;",
+                "field" => "ref int slot = ref holder.Value; slot = 9;",
+                "local" => "ref int slot = ref number; slot = 9;",
+                _ => "ref int slot = ref (choose ? ref array[0] : ref holder.Value); slot = 9;",
+            }));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            CallTargetResolutionResult result = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            Assert.IsEmpty(result.PendingCalls);
+            foreach (MethodEntry root in roots)
+            {
+                ResolvedCall call = result.Calls.Single(call => call.CallerMethodId == root.Id && call.Call.Target.Name == "Observe");
+                foreach ((int index, string expected) in new[] { (0, field), (1, local) })
+                {
+                    ValueOrigin[] values = result.ValueSources.GetCallOrigins(call.Targets.Single().Arguments[index].Single()).ToArray();
+                    Assert.IsTrue(values.All(value => value.Value.Kind == BehaviorValueKind.Constant), target);
+                    CollectionAssert.AreEquivalent(expected.Split(','), values.Select(value => value.Value.Reference).Distinct().ToArray(), target);
+                }
+            }
+        }
+
+        // 复刻 khengine Crypt.cs:575 的函数体，后续解密算法不参与循环计数存储的读取。
+        /// <summary>实例计数和字节数组地址写入不能互相扩大来源查询。</summary>
+        [TestMethod]
+        public async Task ResolveAsyncHandlesKhengineDecryptStoragePattern()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Calls
+                {
+                    private int pos, contextStart, crypt;
+                    private byte[] prePlain;
+                    private byte[] Decipher(byte[] input) => input;
+                    public bool Entry(byte[] input, int offset, int len)
+                    {
+                        for (pos = 0; pos < 8; pos++)
+                        {
+                            if (contextStart + pos >= len)
+                                return true;
+                            prePlain[pos] ^= input[offset + crypt + pos];
+                        }
+                        prePlain = Decipher(prePlain);
+                        if (prePlain == null)
+                            return false;
+                        contextStart += 8;
+                        crypt += 8;
+                        pos = 0;
+                        return true;
+                    }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            Assert.IsEmpty(calls.PendingCalls);
+            foreach (MethodEntry root in roots)
+            {
+                Assert.AreEqual(MethodEffectKind.Setter, new EffectAnalyzer().Analyze(catalog, new[] { root }, calls).Methods.Single().Kind, root.Id);
+            }
+        }
+
+        // 循环字段来源不应迫使同一段无环父链反复展开。
+        /// <summary>交换循环与普通字段链的选择顺序，保留相同实际调用。</summary>
+        [TestMethod]
+        [DataRow(6, false)]
+        [DataRow(12, false)]
+        [DataRow(12, true)]
+        public async Task ResolveAsyncHandlesDeepFieldsBesideLoopOrigins(int depth, bool reverse)
+        {
+            string field = "root" + string.Concat(Enumerable.Repeat(".Next", depth));
+            using TestProject project = TestProject.CreateWithCallTargets("namespace Samples; public sealed class Node { public Node Next; public int Value; } public static class Calls { public static void Entry(Node root, bool choose, int count) { Node p = root; for (int i = 0; i < count; i++) p = p.Next; Node q = choose ? " + (reverse ? field + " : p" : "p : " + field) + "; if (q.Value != 0) Observe(); } private static void Observe() { } }");
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            Assert.IsEmpty(calls.PendingCalls);
+            Assert.HasCount(2, calls.Calls);
+            Assert.IsTrue(calls.Calls.All(call => call.Call.Target.Name == "Observe"));
+        }
+
         // 一个入口继续发现子调用时，没有新事实的另一个入口无需重复检查执行条件。
         /// <summary>只缩小本轮重算范围，完整调用和最终行为仍保持一致。</summary>
         [TestMethod]

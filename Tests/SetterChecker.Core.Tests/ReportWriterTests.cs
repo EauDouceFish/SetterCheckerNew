@@ -168,7 +168,7 @@ namespace SetterChecker.Core.Tests
             File.AppendAllLines(project.RootResponsePath, new[] { "-unsafe+" }, new System.Text.UTF8Encoding(false));
             AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
             Assert.IsFalse(run.Complete);
-            Assert.Contains("地址来源循环尚未闭合", run.Annotations.Methods.Single(method => method.Name == "Entry").Failure!);
+            Assert.Contains("分支或对象来源仍缺少调用结果", run.Annotations.Methods.Single(method => method.Name == "Entry").Failure!);
             Assert.IsNull(run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
         }
 

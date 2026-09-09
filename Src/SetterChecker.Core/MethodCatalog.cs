@@ -457,6 +457,7 @@ namespace SetterChecker.Core
             {
                 DocumentationId = DocCommentId.GetDocCommentId(type),
                 IsValueType = type.IsValueType,
+                IsEnum = type.IsEnum,
                 IsExplicitLayout = type.IsExplicitLayout,
                 IsSealed = type.IsSealed,
                 IsCompilerGenerated = type.CustomAttributes.Any(attribute => attribute.AttributeType.FullName
@@ -1216,6 +1217,8 @@ namespace SetterChecker.Core
         internal string DocumentationId { get; init; } = string.Empty;
 
         internal bool IsValueType { get; init; }
+
+        internal bool IsEnum { get; init; }
 
         internal bool IsExplicitLayout { get; init; }
 

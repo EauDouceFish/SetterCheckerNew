@@ -358,9 +358,11 @@ namespace SetterChecker.Core
                     new BehaviorFlowBlock(instruction.Offset, BehaviorFlowBlockKind.Block,
                         reachableOffsets.Contains(instruction.Offset),
                         ReadManagedFlowEdges(instruction, body.CodeSize, handlers),
-                        instruction.OpCode.FlowControl == Cil.FlowControl.Cond_Branch && instruction.Operand is Cil.Instruction
+                        instruction.OpCode.FlowControl == Cil.FlowControl.Cond_Branch && instruction.Operand is Cil.Instruction or Cil.Instruction[]
                             && this.m_instructionValueIds.TryGetValue(instruction.Offset, out int condition) ? condition : null,
-                        instruction.Operand is Cil.Instruction target ? target.Offset : null)).ToArray();
+                        instruction.Operand is Cil.Instruction target ? target.Offset
+                            : instruction.OpCode == OpCodes.Switch ? instruction.Next?.Offset : null,
+                        instruction.Operand is Cil.Instruction[] targets ? targets.Select(target => target.Offset).ToArray() : null)).ToArray();
                 int entryTarget = body.Instructions.Count == 0 ? body.CodeSize : body.Instructions[0].Offset;
                 BehaviorFlowBlock entry = new(-1, BehaviorFlowBlockKind.Entry, true,
                     new[] { new BehaviorFlowEdge(entryTarget, false, BehaviorFlowBranchSemantics.Regular, Array.Empty<int>()) });
@@ -1264,7 +1266,8 @@ namespace SetterChecker.Core
         BehaviorFlowBlockKind Kind,
         bool IsReachable,
         IReadOnlyList<BehaviorFlowEdge> Successors,
-        int? ConditionValueId = null, int? JumpTargetBlockId = null);
+        int? ConditionValueId = null, int? JumpTargetBlockId = null,
+        IReadOnlyList<int>? SwitchTargetBlockIds = null);
 
     /// <summary>
     /// 按元数据顺序保存异常处理子句；所有范围均为包含起点、不含终点的指令区间。
