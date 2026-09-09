@@ -2410,6 +2410,30 @@ namespace SetterChecker.Core.Tests
             }
         }
 
+        // 源码和实际 DLL 都保留变量赋值与分支的对应关系。
+        /// <summary>互斥分支不能借用彼此的整数值，也不能删除合法的写入对照。</summary>
+        [TestMethod]
+        [DataRow("int y = x == 0 ? 0 : 1; if (x == 0 && y == 1) state = 1;", false)]
+        [DataRow("int y = 0; if (x == 0) y = 1; if (x == 0 && y == 0) state = 1;", false)]
+        [DataRow("int y = x == 0 ? 0 : 1; if (x != 0 && y == 0) state = 1;", false)]
+        [DataRow("int y = x == 0 ? 0 : 1; if (x == 0 && y == 0) state = 1;", true)]
+        [DataRow("int y = 0; if (x == 0) y = 1; if (x == 0 && y == 1) state = 1;", true)]
+        [DataRow("int y = x == 0 ? x : x + 1; if (x == 1 && y == 2) state = 1;", true)]
+        public async Task AnalyzeKeepsMergedIntegerConditions(string body, bool setter)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("namespace Samples; public static class Calls { private static int state; public static void Entry(int x) { " + body + " } }");
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+
+            EffectAnalysisResult result = new EffectAnalyzer().Analyze(catalog, roots, calls);
+
+            Assert.IsTrue(result.Methods.All(method => method.Kind == (setter ? MethodEffectKind.Setter : MethodEffectKind.Getter)));
+        }
+
         // 第二次经另一个函数返回递归入口时，不能套用第一次的参数条件。
         /// <summary>有限间接递归在下一次进入时才写入，源码和 DLL 都必须保留该效果。</summary>
         [TestMethod]

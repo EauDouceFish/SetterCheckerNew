@@ -193,6 +193,7 @@ namespace SetterChecker.Core
             private readonly Dictionary<int, int> m_instructionValueIds = new();
             private readonly Dictionary<(int Offset, int Index), int> m_mergeValueIds = new();
             private readonly Dictionary<int, int[]> m_incomingStacks = new();
+            private readonly Dictionary<int, int[]> m_outgoingStacks = new();
             private readonly Dictionary<Cecil.TypeReference, BehaviorTypeReference> m_typeReferences = new();
             private readonly Stack<int> m_stack = new();
             private int m_currentOffset;
@@ -272,6 +273,7 @@ namespace SetterChecker.Core
                     this.m_currentOrder = this.m_incomingStacks[offset].Length;
                     ReadInstruction(instruction);
                     int[] outgoingStack = this.m_stack.Reverse().ToArray();
+                    this.m_outgoingStacks[offset] = outgoingStack;
 
                     foreach (int successor in ReadSuccessors(instruction, instructionsByOffset))
                     {
@@ -283,6 +285,18 @@ namespace SetterChecker.Core
                 }
 
                 var flow = ReadManagedControlFlow(body, this.m_incomingStacks.Keys.ToHashSet());
+                ILookup<int, int> incoming = flow.Blocks.Where(block => block.IsReachable)
+                    .SelectMany(block => block.Successors.Where(edge => edge.TargetBlockId.HasValue)
+                        .Select(edge => (Target: edge.TargetBlockId!.Value, From: block.Id)))
+                    .ToLookup(edge => edge.Target, edge => edge.From);
+                foreach (var merge in this.m_mergeValueIds)
+                {
+                    this.m_values[merge.Value] = this.m_values[merge.Value] with
+                    {
+                        IncomingValues = incoming[merge.Key.Offset].Where(this.m_outgoingStacks.ContainsKey)
+                            .Select(from => new BehaviorMergeInput(from, this.m_outgoingStacks[from][merge.Key.Index])).ToArray(),
+                    };
+                }
                 return new MethodBehavior(
                     this.m_method.Id,
                     MethodBodyKind.Executable,
@@ -1366,7 +1380,12 @@ namespace SetterChecker.Core
         /// <summary>派生值被读取或产生的执行位置；根槽可以为空。</summary>
         public BehaviorFlowPoint? Point { get; init; }
 
+        /// <summary>指令栈汇合时每条真实入边携带的值，保留分支与值的对应。</summary>
+        public IReadOnlyList<BehaviorMergeInput> IncomingValues { get; init; } = Array.Empty<BehaviorMergeInput>();
     }
+
+    /// <summary>记录一个前驱指令向汇合位置传入的值。</summary>
+    public sealed record BehaviorMergeInput(int PredecessorBlockId, int ValueId);
 
     /// <summary>保存一个反射属性的真实访问函数。</summary>
     public sealed record BehaviorPropertyReference(BehaviorMethodReference? Getter, BehaviorMethodReference? Setter);

@@ -368,6 +368,15 @@ namespace SetterChecker.Core.Tests
         [DataRow("if ((x & 0) != 0) state = 1;", false)]
         [DataRow("if (x == 1) { if (x == 2) state = 1; }", false)]
         [DataRow("if (x == 1) Helper(x);", false)]
+        [DataRow("int y = x == 0 ? 0 : 1; if (x == 0 && y == 1) state = 1;", false)]
+        [DataRow("int y = 0; if (x == 0) y = 1; if (x == 0 && y == 0) state = 1;", false)]
+        [DataRow("int y = x == 0 ? 0 : 1; if (x != 0 && y == 0) state = 1;", false)]
+        [DataRow("int y = x == 0 ? 0 : 1; if (x == 0 && y == 0) state = 1;", true)]
+        [DataRow("int y = 0; if (x == 0) y = 1; if (x == 0 && y == 1) state = 1;", true)]
+        [DataRow("int y = x == 0 ? 0 : x == 1 ? 1 : 2; if (x == 2 && y != 2) state = 1;", false)]
+        [DataRow("int y = x == 0 ? 0 : x == 1 ? 1 : 2; if (x == 2 && y == 2) state = 1;", true)]
+        [DataRow("if (x == 0) Compare(x == 0 ? 0 : 1, 0);", false)]
+        [DataRow("if (x == 1) Compare(x == 0 ? 0 : 1, 0);", true)]
         [DataRow("if (x - x == 0) state = 1;", true)]
         [DataRow("if ((x & 1) != 0) state = 1;", true)]
         [DataRow("if (x == 1) { if (x != 2) state = 1; }", true)]
@@ -384,7 +393,7 @@ namespace SetterChecker.Core.Tests
         public async Task RunRequiresConsistentIntegerConditions(string body, bool setter)
         {
             using TestProject project = TestProject.CreateSingleAssembly();
-            project.WriteRootSource("public static class Calls { private static int state; private static void Helper(int y) { if (y == 2) state = 1; } public static void Entry(int x) { " + body + " } }");
+            project.WriteRootSource("public static class Calls { private static int state; private static void Helper(int y) { if (y == 2) state = 1; } private static void Compare(int left, int right) { if (left != right) state = 1; } public static void Entry(int x) { " + body + " } }");
             AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2), reportProgress: current =>
             {
                 if (!setter)
@@ -392,6 +401,70 @@ namespace SetterChecker.Core.Tests
                     Assert.AreNotEqual(MethodEffectKind.Setter, current.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
                 }
             });
+            Assert.IsTrue(run.Complete);
+            Assert.AreEqual(setter ? MethodEffectKind.Setter : MethodEffectKind.Getter,
+                run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+        }
+
+        // 共用条件检查环境时，各入口的参数身份和事实仍必须独立。
+        /// <summary>同一被调函数在不同入口条件下交替可写与不可写，且不受并行度影响。</summary>
+        [TestMethod]
+        [DataRow(1)]
+        [DataRow(4)]
+        public async Task RunSeparatesIntegerConditionsAcrossRoots(int jobs)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            string entries = string.Join(Environment.NewLine, Enumerable.Range(0, 32).Select(index =>
+                $"public static void Entry{index}(int x) {{ if (x == {index}) Helper(x); }}"));
+            project.WriteRootSource("public static class Calls { private static int state; private static void Helper(int x) { if ((x & 1) != 0) state = 1; } " + entries + " }");
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, jobs), reportProgress: current =>
+            {
+                foreach (int index in Enumerable.Range(0, 16).Select(index => index * 2))
+                {
+                    Assert.AreNotEqual(MethodEffectKind.Setter, current.Annotations.Methods.Single(method => method.Name == $"Entry{index}").Actual);
+                }
+            });
+            Assert.IsTrue(run.Complete);
+            foreach (int index in Enumerable.Range(0, 32))
+            {
+                Assert.AreEqual(index % 2 == 0 ? MethodEffectKind.Getter : MethodEffectKind.Setter,
+                    run.Annotations.Methods.Single(method => method.Name == $"Entry{index}").Actual);
+            }
+        }
+
+        // 异常处理器中的调用仍须检查父入口是否具有完整执行关系。
+        /// <summary>子函数条件不能直接索引尚未建模的 catch 路径并造成进程崩溃。</summary>
+        [TestMethod]
+        public async Task RunKeepsExceptionCallerBoundaryWhenCheckingCalleeConditions()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                public static class Calls
+                {
+                    private static int state;
+                    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]
+                    private static extern void Unknown();
+                    private static void Helper(int x) { if (x - x != 0) state = 1; }
+                    public static void Entry(int x) { try { Unknown(); } catch { Helper(x); } }
+                }
+                """);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            Assert.IsFalse(run.Complete);
+            Assert.IsNull(run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+            Assert.AreEqual(MethodEffectKind.Getter, run.Annotations.Methods.Single(method => method.Name == "Helper").Actual);
+        }
+
+        // 大函数的前驱遍历不能依赖进程调用栈深度。
+        /// <summary>数千条普通调用之后仍能检查真实条件，不崩溃也不省略路径。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task RunChecksLongStraightLinePrefix(bool setter)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("public static class Calls { private static int state; private static void Quiet() {} public static void Entry(int x) { "
+                + string.Concat(Enumerable.Repeat("Quiet();", 3000)) + "if (x - x " + (setter ? "==" : "!=") + " 0) state = 1; } }");
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
             Assert.IsTrue(run.Complete);
             Assert.AreEqual(setter ? MethodEffectKind.Setter : MethodEffectKind.Getter,
                 run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
