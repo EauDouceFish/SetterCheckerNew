@@ -43,6 +43,10 @@ namespace SetterChecker.Core
             Dictionary<(int InstanceId, int Position), string> failures = previous?.PendingCalls.Where(call => call.Failure != null)
                 .ToDictionary(call => (call.CallerInstanceId, call.Call.Position), call => call.Failure!) ?? new();
             BehaviorReader reader = new();
+            if (previous != null)
+            {
+                sources.MarkChangedMethods(behaviors.Keys.ToHashSet(StringComparer.Ordinal));
+            }
 
             // 发布同一份调用和值来源快照，尚未解析的调用独立保存。
             CallTargetResolutionResult ReadResult()
@@ -74,6 +78,7 @@ namespace SetterChecker.Core
                     {
                         behaviors.Add(body.MethodId, body);
                     }
+                    sources.MarkChangedMethods(batch.Methods.Select(body => body.MethodId).ToHashSet(StringComparer.Ordinal));
                     readingTime += batch.Elapsed;
                     foreach (MethodCallInstance instance in pending)
                     {
@@ -91,7 +96,10 @@ namespace SetterChecker.Core
                         .Select(call => (behaviors[instance.MethodId], call, instance))));
                 }
 
-                HashSet<int> changedRoots = sources.RefineReachability(provenSetters.Keys.ToHashSet());
+                HashSet<int> frozenRoots = provenSetters.Keys.ToHashSet();
+                HashSet<int> recheckRoots = sources.TakeChangedRoots(frozenRoots);
+                progress?.Invoke($"本轮重新检查 {recheckRoots.Count} 个入口的执行条件。");
+                HashSet<int> changedRoots = recheckRoots.Count == 0 ? new() : sources.RefineReachability(frozenRoots, recheckRoots);
                 if (changedRoots.Count != 0)
                 {
                     HashSet<int> invalidated = sources.ResetRoots(changedRoots);
@@ -112,6 +120,11 @@ namespace SetterChecker.Core
                 progress?.Invoke($"已读取 {behaviors.Count} 个函数体，已连接 {calls.Count} 个调用，待处理 {waiting.Count} 个调用。");
                 if (waiting.Count == 0)
                 {
+                    if (sources.HasChangedRoots(frozenRoots))
+                    {
+                        pending = Array.Empty<MethodCallInstance>();
+                        continue;
+                    }
                     break;
                 }
                 if (!requireCompleteCalls && previous == null && waiting.Count != 0)
@@ -209,11 +222,13 @@ namespace SetterChecker.Core
                                 IReadOnlyList<ValueOrigin> origins = (call.ConstrainedReceiverType == null ? receiver
                                     : receiver.SelectMany(value => sources.ReadAddressedValues(value, call.Point)).ToArray())
                                     .SelectMany(value => sources.GetCallOrigins(value, retainTypeChecks: true)).ToArray();
-                                if (origins.Any(origin => origin.Value.Kind == BehaviorValueKind.CallResult)
-                                    || sources.GetCallOrigins(receiver.Single()).Any(origin => origin.Value.Kind == BehaviorValueKind.CallResult))
+                                ValueOrigin[] pendingOrigins = origins.Concat(sources.GetCallOrigins(receiver.Single()))
+                                    .Where(origin => origin.Value.Kind == BehaviorValueKind.CallResult).ToArray();
+                                if (pendingOrigins.Length > 0 && !ArePendingReceiverTypesCovered(catalog, sources, origins, pendingOrigins))
                                 {
                                     continue;
                                 }
+                                origins = origins.Where(origin => origin.Value.Kind != BehaviorValueKind.CallResult).ToArray();
 
                                 try
                                 {
@@ -240,6 +255,8 @@ namespace SetterChecker.Core
                         {
                             continue;
                         }
+                        targets = targets.Select(target => (target.Definition, target.Binding with
+                        { DispatchTypes = target.Definition.DispatchTypes, DispatchFailure = target.Definition.DispatchFailure })).ToArray();
                         foreach (var target in targets)
                         {
                             if (!sources.TryFindRecursiveInstance(target.Binding, instance.Id, call.Point, out MethodCallInstance? recursive))
@@ -283,6 +300,11 @@ namespace SetterChecker.Core
                 waiting.RemoveAll(item => resolvedCalls.Contains((item.Instance.Id, item.Call.Position)));
                 if (next.Count == 0 && resolvedCalls.Count == 0 && waiting.Count != 0)
                 {
+                    if (sources.HasChangedRoots(frozenRoots))
+                    {
+                        pending = next;
+                        continue;
+                    }
                     if (!requireCompleteCalls)
                     {
                         break;
@@ -370,7 +392,8 @@ namespace SetterChecker.Core
                 {
                     throw new AnalysisException($"反射类型或函数名来源尚未闭合：{body.MethodId} @ {call.Position}");
                 }
-                if (types.Select(value => value.Value.Type).Distinct().Count() > 1
+                bool multipleTypes = types.Select(value => value.Value.Type).Distinct().Count() > 1;
+                if (multipleTypes
                     && names.Select(value => value.Value.Reference).Distinct().Count() > 1)
                 {
                     throw new AnalysisException($"反射分支关联尚未闭合：{body.MethodId} @ {call.Position}");
@@ -446,7 +469,8 @@ namespace SetterChecker.Core
                                 throw new AnalysisException($"反射字段查找没有唯一结果：{reflectedType.FullName}.{name.Value.Reference}");
                             }
                             members.Add(new ValueOrigin(resultReference, body.Values[resultReference.ValueId] with
-                            { Kind = BehaviorValueKind.Function, Member = fields[0] }));
+                            { Kind = BehaviorValueKind.Function, Member = fields[0] })
+                            { Selection = multipleTypes ? (receiver.Single(), type) : (arguments[0].Single(), name) });
                             continue;
                         }
                         MethodEntry[] matches = catalog.GetMethods(reflectedType)
@@ -536,7 +560,8 @@ namespace SetterChecker.Core
                             Member = reference,
                             InputValueIds = field.IsStatic
                             ? Array.Empty<int>() : new[] { call.Arguments[0].ValueId }
-                        }));
+                        })
+                        { Selection = (receiver.Single(), member) });
                     }
                     completedMembers++;
                 }
@@ -826,7 +851,7 @@ namespace SetterChecker.Core
                         {
                             GenericParameterRule rule = candidate.GenericParameters[index];
                             valueSources!.AddParameterRule(parameters[index], rule with
-                            { TypeConstraints = rule.TypeConstraints.Select(constraint => constraint.Substitute(typeArguments)).ToArray() });
+                            { TypeConstraints = rule.TypeConstraints.Select(constraint => constraint.Substitute(typeArguments)).ToArray() }, receiverOrigins[0].Reference.InstanceId);
                         }
                     }
                     if (!ReceiverMatchesType(catalog, candidate, typeArguments,
@@ -914,6 +939,7 @@ namespace SetterChecker.Core
                          + string.Join(",", item.Target.DeclaringTypeArguments.Select(type => type.Text))))
             {
                 string? missingProof = null;
+                List<TypeIdentityTemplate> dispatchTypes = new();
                 foreach (var selection in group.OrderBy(item => item.FreeParameters.Count).ThenBy(item => item.Receiver.Id, StringComparer.Ordinal))
                 {
                     string? failure = null;
@@ -921,14 +947,19 @@ namespace SetterChecker.Core
                         : HasCandidateWitness(catalog, selection.Receiver, selection.Arguments, selection.FreeParameters, valueSources!, out failure);
                     if (exists == true && SatisfiesGenericConstraints(catalog, selection.Receiver, selection.Arguments, valueSources))
                     {
-                        result.Add(group.Key, selection.Target);
-                        break;
+                        result.TryAdd(group.Key, selection.Target);
+                        dispatchTypes.Add(ConstructTypeIdentity(selection.Receiver, selection.Arguments));
+                        continue;
                     }
                     missingProof ??= failure;
                 }
                 if (!result.ContainsKey(group.Key) && missingProof != null)
                 {
                     throw new AnalysisException(missingProof);
+                }
+                if (result.TryGetValue(group.Key, out ResolvedMethodDefinition? selectedTarget))
+                {
+                    result[group.Key] = selectedTarget with { DispatchTypes = dispatchTypes.Distinct().ToArray(), DispatchFailure = missingProof };
                 }
             }
 
@@ -957,6 +988,86 @@ namespace SetterChecker.Core
                     pending.Enqueue(child);
                 }
             }
+        }
+
+        // 类型转换与虚调用共用实际类型及泛型实参的兼容性检查。
+        internal static IReadOnlyList<string> ReadConversionTypes(MethodCatalogResult catalog, ValueSourceIndex sources, ValueOrigin origin, ValueOrigin input)
+        {
+            BehaviorTypeReference target = sources.GetInstance(origin.Reference.InstanceId).Substitute(origin.Value.Type!);
+            List<string> result = new();
+            foreach (TypeEntry candidate in ReadReceiverTypes(catalog, ReadReferencedType(catalog, target))
+                .Where(type => !type.IsAbstract && !type.IsInterface))
+            {
+                foreach (IReadOnlyList<TypeIdentityTemplate> arguments in ReadReceiverArguments(catalog, candidate,
+                    origin with { Value = origin.Value with { Type = target } }, sources, new())
+                    .Where(arguments => ReceiverPathAllowsType(catalog, candidate, arguments, input, sources, new())))
+                {
+                    if (arguments.Any(argument => argument.HasUnspecifiedParameter || ContainsTypeParameter(argument.Text)))
+                    {
+                        throw new AnalysisException("类型转换的实际泛型实参尚未闭合");
+                    }
+                    if (SatisfiesGenericConstraints(catalog, candidate, arguments, sources))
+                    {
+                        result.Add(ConstructTypeIdentity(candidate, arguments).Text);
+                    }
+                }
+            }
+            return result.Distinct(StringComparer.Ordinal).ToArray();
+        }
+
+        // 具体输入声明本身就是合法对象；抽象声明须找到实际可构造的实现。
+        internal static IReadOnlyList<string> ReadInputTypeWitnesses(MethodCatalogResult catalog, ValueSourceIndex sources, ValueOrigin origin)
+        {
+            IReadOnlyList<StaticReceiverType> restrictions = ReadStaticReceiverTypes(catalog, new[] { origin }, sources);
+            if (restrictions.Count == 0)
+            {
+                throw new AnalysisException("对象实际类型的声明范围尚未闭合");
+            }
+            List<string> result = new();
+            foreach (StaticReceiverType restriction in restrictions)
+            {
+                IEnumerable<TypeEntry> candidates = !restriction.Definition.IsAbstract && !restriction.Definition.IsInterface
+                    ? new[] { restriction.Definition } : ReadReceiverTypes(catalog, restriction.Definition).Where(type => !type.IsAbstract && !type.IsInterface);
+                foreach (TypeEntry candidate in candidates)
+                {
+                    foreach (IReadOnlyList<TypeIdentityTemplate> arguments in ReadReceiverArguments(catalog, candidate, origin, sources, new()))
+                    {
+                        if (arguments.Any(argument => argument.HasUnspecifiedParameter || ContainsTypeParameter(argument.Text)))
+                        {
+                            throw new AnalysisException("对象实际类型的泛型范围尚未闭合");
+                        }
+                        if (SatisfiesGenericConstraints(catalog, candidate, arguments, sources))
+                        {
+                            result.Add(ConstructTypeIdentity(candidate, arguments).Text);
+                        }
+                    }
+                }
+            }
+            return result.Distinct(StringComparer.Ordinal).ToArray();
+        }
+
+        // 调用绑定的具体接收类型仍须符合本条对象来源及完整泛型约束。
+        internal static bool IsInputTypeAllowed(MethodCatalogResult catalog, ValueSourceIndex sources, ValueOrigin origin, TypeIdentityTemplate type)
+        {
+            if (type.HasUnspecifiedParameter || ContainsTypeParameter(type.Text))
+            {
+                throw new AnalysisException("动态实现的具体接收类型尚未闭合");
+            }
+            TypeEntry definition = ReadAssignableType(catalog, type.Text, out TypeIdentityTemplate[] arguments);
+            return ReceiverPathAllowsType(catalog, definition, arguments, origin, sources, new())
+                && SatisfiesGenericConstraints(catalog, definition, arguments, sources);
+        }
+
+        // 根参数已覆盖同一声明类型时，待查字段不会再增加虚调用目标；存储等待仍保留。
+        private static bool ArePendingReceiverTypesCovered(MethodCatalogResult catalog, ValueSourceIndex sources,
+            IReadOnlyList<ValueOrigin> origins, IReadOnlyList<ValueOrigin> pending)
+        {
+            HashSet<string> types = origins.Where(origin => origin.Value.Kind == BehaviorValueKind.Parameter
+                    && !origin.Value.IsManagedReferenceSlot && sources.GetInstance(origin.Reference.InstanceId).ParentId == 0)
+                .Select(origin => sources.GetInstance(origin.Reference.InstanceId).Substitute(catalog.ReadResolvedMethodSignature(
+                    sources.Definitions[origin.Reference.MethodId].AssemblyPath!, sources.Definitions[origin.Reference.MethodId].MetadataToken)
+                    .Parameters[origin.Value.ParameterIndex!.Value]).Text).ToHashSet(StringComparer.Ordinal);
+            return pending.All(origin => origin.Value.Member != null && origin.Value.Type != null && types.Contains(origin.Value.Type.Identity.Text));
         }
 
         // 从对象、参数或转换结果读取接收对象已经确定的类型限制。
@@ -1401,7 +1512,7 @@ namespace SetterChecker.Core
         }
 
         // 从真实定义与已经闭合的实参构造统一类型身份。
-        private static TypeIdentityTemplate ConstructTypeIdentity(TypeEntry definition, IReadOnlyList<TypeIdentityTemplate> arguments)
+        internal static TypeIdentityTemplate ConstructTypeIdentity(TypeEntry definition, IReadOnlyList<TypeIdentityTemplate> arguments)
         {
             return new TypeIdentityTemplate(definition.Id + (arguments.Count == 0 ? string.Empty
                 : "<" + string.Join(",", arguments.Select(argument => argument.Text)) + ">"));
@@ -1595,7 +1706,7 @@ namespace SetterChecker.Core
         }
 
         // 判断类型满足 CLR struct 约束要求的非 Nullable 值类型条件。
-        private static bool IsNonNullableValueType(MethodCatalogResult catalog, string identity)
+        internal static bool IsNonNullableValueType(MethodCatalogResult catalog, string identity)
         {
             if (!IsValueType(catalog, identity))
             {
@@ -2030,6 +2141,9 @@ namespace SetterChecker.Core
     public sealed record ValueOrigin(BehaviorValueReference Reference, BehaviorValue Value)
     {
         internal ReturnedValuePath? ReturnPath { get; init; }
+
+        /// <summary>运行时结果保留实际选择值及本候选对应的输入，不按结果编号混合成员。</summary>
+        internal (BehaviorValueReference Selector, ValueOrigin Selected)? Selection { get; init; }
     }
 
     // 把返回对象与真实传出它的出口绑定，供调用者观察容器内容时复用。
@@ -2044,7 +2158,7 @@ namespace SetterChecker.Core
         private readonly Dictionary<(BehaviorValueReference Reference, bool RetainTypeChecks, bool RetainSlots), IReadOnlyList<ValueOrigin>> m_origins = new();
         private readonly Dictionary<string, ValueFlowGraph> m_flowGraphs = new(StringComparer.Ordinal);
         private readonly Dictionary<StorageLocation, BehaviorValueReference> m_defaultFieldValues = new();
-        private readonly HashSet<(string Method, int Block)> m_singleAllocations = new();
+        private readonly HashSet<(string Method, int Block)> m_singleExecutionPoints = new();
         private readonly HashSet<(string Method, int Value)> m_activeAddressQueries = new();
         private readonly Dictionary<int, HashSet<int>> m_unreachableBlocks = new();
         private readonly Dictionary<int, HashSet<(int From, int To)>> m_excludedEdges = new();
@@ -2057,7 +2171,10 @@ namespace SetterChecker.Core
         private readonly Dictionary<BehaviorValueReference, IReadOnlyList<ValueOrigin>> m_runtimeValues = new();
         private readonly Dictionary<(BehaviorValueReference Reference, BehaviorFlowPoint Point, int Instance), BehaviorValueReference> m_addressReads = new();
         private readonly Dictionary<(BehaviorValueReference Reference, BehaviorFlowPoint Point, int Index), BehaviorValueReference> m_arrayReads = new();
-        private readonly Dictionary<(BehaviorValueReference Reference, int Instance, ReturnedValuePath? Path), BehaviorValueReference> m_observedValues = new();
+        private readonly Dictionary<(BehaviorValueReference Reference, int Instance, ReturnedValuePath? Path, StoredObservation? Storage), BehaviorValueReference> m_observedValues = new();
+        private readonly Dictionary<BehaviorValueReference, StoredObservation> m_observedStorage = new();
+        private readonly HashSet<int> m_changedRoots = new();
+        private int m_refinedGeneration = -1;
         private int m_nextRuntimeValueId = -1;
         private readonly Dictionary<int, List<BehaviorWrite>> m_runtimeWrites = new();
         private readonly Dictionary<int, Dictionary<BehaviorFlowPoint, ResolvedCall>> m_callsByCallerInstance = new();
@@ -2113,6 +2230,7 @@ namespace SetterChecker.Core
                     binding, invocationPoint, parentId == 0 ? this.m_instances.Count + 1 : this.m_instances[parentId].RootId);
                 this.m_instancesByKey.Add(key, instance);
                 this.m_instances.Add(instance.Id, instance);
+                this.m_changedRoots.Add(instance.RootId);
                 if (parentId == 0)
                 {
                     this.m_rootInstances.Add(methodId, instance);
@@ -2123,12 +2241,15 @@ namespace SetterChecker.Core
                     foreach (var parameter in parameters)
                     {
                         AddParameterRule(parameter.Parameter, parameter.Rule with
-                        { TypeConstraints = parameter.Rule.TypeConstraints.Select(instance.Substitute).ToArray() });
+                        { TypeConstraints = parameter.Rule.TypeConstraints.Select(instance.Substitute).ToArray() }, instance.Id);
                     }
                 }
             }
 
-            this.m_inactiveInstances.Remove(instance.Id);
+            if (this.m_inactiveInstances.Remove(instance.Id))
+            {
+                this.m_changedRoots.Add(instance.RootId);
+            }
             return instance;
         }
 
@@ -2411,10 +2532,13 @@ namespace SetterChecker.Core
         }
 
         // 只登记新作用域内的参数声明，不改写调用者已经存在的约束。
-        internal void AddParameterRule(TypeIdentityTemplate parameter, GenericParameterRule rule)
+        internal void AddParameterRule(TypeIdentityTemplate parameter, GenericParameterRule rule, int instanceId)
         {
-            if (!this.m_parameterRules.TryAdd(parameter, rule)
-                && this.m_parameterRules[parameter] is GenericParameterRule previous
+            if (this.m_parameterRules.TryAdd(parameter, rule))
+            {
+                this.m_changedRoots.Add(GetInstance(instanceId).RootId);
+            }
+            else if (this.m_parameterRules[parameter] is GenericParameterRule previous
                 && (previous with { TypeConstraints = Array.Empty<TypeIdentityTemplate>() } != rule with { TypeConstraints = Array.Empty<TypeIdentityTemplate>() }
                     || !previous.TypeConstraints.SequenceEqual(rule.TypeConstraints)))
             {
@@ -2518,7 +2642,7 @@ namespace SetterChecker.Core
         // 沿真实调用收集容器字段和数组位置，再共用存储查询读取返回时的内容。
         internal IReadOnlyList<BehaviorValueReference> ReadContainerValues(
             BehaviorValueReference reference, ValueOrigin allocated, BehaviorFlowPoint point, Action<string> recordFailure,
-            BehaviorFlowPoint? throughPoint = null)
+            BehaviorFlowPoint? throughPoint = null, IntegerPathProof? pathProof = null)
         {
             Queue<int> pending = new(new[] { reference.InstanceId });
             HashSet<int> visited = new();
@@ -2563,11 +2687,25 @@ namespace SetterChecker.Core
             {
                 try
                 {
-                    values.UnionWith(ReadStoredValuesAtPoint(GetInstance(reference.InstanceId),
+                    IReadOnlyList<BehaviorValueReference> stored = ReadStoredValuesAtPoint(GetInstance(reference.InstanceId),
                         item.Key.Definition.Length == 0 ? BehaviorWriteKind.ArrayElement : BehaviorWriteKind.Field,
                         item.Value.Member, new[] { item.Key }, point, -1, ReadPendingStorageValue(item.Value.Written, point, reference.InstanceId),
-                        () => new[] { s_defaultObjectMember }, throughPoint: throughPoint, returnedPath: allocated.ReturnPath)
-                        .Select(value => ObserveValue(value, reference.InstanceId, allocated.ReturnPath)));
+                        () => new[] { s_defaultObjectMember }, throughPoint: throughPoint, returnedPath: allocated.ReturnPath);
+                    if (pathProof == null)
+                    {
+                        values.UnionWith(stored.Select(value => ObserveValue(value, reference.InstanceId, allocated.ReturnPath)));
+                        continue;
+                    }
+                    var selected = pathProof.ReadSelectedOriginsAtPoint(GetInstance(reference.InstanceId).RootId,
+                        stored.SelectMany(value => GetCallOrigins(value, retainTypeChecks: true)).ToArray(), reference.InstanceId, point, reference,
+                        throughPoint, (item.Value.Member, item.Key, allocated.ReturnPath), normalReturn: true);
+                    if (!selected.Complete)
+                    {
+                        recordFailure("容器首轮存储见证不能排除其它执行中的业务对象输出");
+                    }
+                    values.UnionWith(selected.Origins.Select(origin => ObserveValue(origin.Reference, reference.InstanceId,
+                        MergeReturnPaths(origin.ReturnPath, allocated.ReturnPath), new StoredObservation(origin.Reference, reference, point,
+                            throughPoint, MergeReturnPaths(origin.ReturnPath, allocated.ReturnPath), item.Value.Member, item.Key))));
                 }
                 catch (AnalysisException exception)
                 {
@@ -2578,16 +2716,20 @@ namespace SetterChecker.Core
         }
 
         // 保留值原有身份与绑定，但把后续容器内容的观察位置放到实际返回的调用者中。
-        private BehaviorValueReference ObserveValue(BehaviorValueReference reference, int instanceId, ReturnedValuePath? path)
+        private BehaviorValueReference ObserveValue(BehaviorValueReference reference, int instanceId, ReturnedValuePath? path, StoredObservation? storage = null)
         {
-            if (reference.InstanceId == 0 || reference.InstanceId == instanceId && path == null)
+            if (storage == null && (reference.InstanceId == 0 || reference.InstanceId == instanceId && path == null))
             {
                 return reference;
             }
-            if (!this.m_observedValues.TryGetValue((reference, instanceId, path), out BehaviorValueReference observed))
+            if (!this.m_observedValues.TryGetValue((reference, instanceId, path, storage), out BehaviorValueReference observed))
             {
                 observed = new BehaviorValueReference(GetInstance(instanceId).MethodId, --this.m_nextRuntimeValueId, instanceId);
-                this.m_observedValues.Add((reference, instanceId, path), observed);
+                this.m_observedValues.Add((reference, instanceId, path, storage), observed);
+                if (storage != null)
+                {
+                    this.m_observedStorage.Add(observed, storage);
+                }
             }
             if (!this.m_runtimeValues.ContainsKey(observed))
             {
@@ -2682,16 +2824,43 @@ namespace SetterChecker.Core
             }
         }
 
+        // 新读出的共享函数体会影响所有使用它的活跃入口。
+        internal void MarkChangedMethods(IReadOnlySet<string> methods)
+        {
+            if (methods.Count == 0)
+            {
+                return;
+            }
+            this.m_changedRoots.UnionWith(this.Instances.Where(instance => methods.Contains(instance.MethodId)).Select(instance => instance.RootId));
+        }
+
+        // 查询前取走工作集，查询过程中新增的事实留到下一轮处理。
+        internal HashSet<int> TakeChangedRoots(IReadOnlySet<int> frozenRoots)
+        {
+            if (this.m_refinedGeneration != this.m_catalog.SemanticGeneration)
+            {
+                this.m_changedRoots.UnionWith(this.m_rootInstances.Values.Select(instance => instance.Id));
+                this.m_refinedGeneration = this.m_catalog.SemanticGeneration;
+            }
+            HashSet<int> changed = this.m_changedRoots.Except(frozenRoots).ToHashSet();
+            this.m_changedRoots.Clear();
+            return changed;
+        }
+
+        // 没有待绑定调用时，仍须消费最后一次查询产生的新事实。
+        internal bool HasChangedRoots(IReadOnlySet<int> frozenRoots)
+        {
+            return this.m_refinedGeneration != this.m_catalog.SemanticGeneration || this.m_changedRoots.Any(root => !frozenRoots.Contains(root));
+        }
+
         // 只使用前一轮独立证明的路径读条件，整批计算完才发布新路径，避免条件证明自己。
-        internal HashSet<int> RefineReachability(IReadOnlySet<int>? provenSetterRoots = null)
+        internal HashSet<int> RefineReachability(IReadOnlySet<int>? provenSetterRoots = null, IReadOnlySet<int>? requestedRoots = null)
         {
             this.m_integerValues.Clear();
             List<(int Instance, HashSet<int> Blocks, HashSet<(int From, int To)> Edges)> changes = new();
-            HashSet<int> reentered = this.m_callsByCallerInstance.Values.SelectMany(calls => calls.Values)
-                .SelectMany(call => call.Targets.Where(target => GetInstance(target.InstanceId).ParentId != call.CallerInstanceId
-                    || GetInstance(target.InstanceId).InvocationPoint != call.Call.Point).Select(target => target.InstanceId)).ToHashSet();
-            using IntegerPathProof proof = new(this, reentered);
-            foreach (IGrouping<string, MethodCallInstance> group in this.Instances.Where(instance => provenSetterRoots?.Contains(instance.RootId) != true)
+            using IntegerPathProof proof = CreatePathProof();
+            foreach (IGrouping<string, MethodCallInstance> group in this.Instances.Where(instance => provenSetterRoots?.Contains(instance.RootId) != true
+                         && (requestedRoots == null || requestedRoots.Contains(instance.RootId)))
                          .GroupBy(instance => instance.MethodId))
             {
                 if (!this.m_methods.TryGetValue(group.Key, out MethodBehavior? body)
@@ -2782,8 +2951,17 @@ namespace SetterChecker.Core
             return changedRoots;
         }
 
-        // 用现有前驱和参数绑定表达整数条件，只发布完整证明为不可能的边。
-        private sealed class IntegerPathProof : IDisposable
+        // 同一份调用绑定识别再次入口，供路径排除与写入来源查询共用。
+        internal IntegerPathProof CreatePathProof()
+        {
+            HashSet<int> reentered = this.m_callsByCallerInstance.Values.SelectMany(calls => calls.Values)
+                .SelectMany(call => call.Targets.Where(target => GetInstance(target.InstanceId).ParentId != call.CallerInstanceId
+                    || GetInstance(target.InstanceId).InvocationPoint != call.Call.Point).Select(target => target.InstanceId)).ToHashSet();
+            return new IntegerPathProof(this, reentered);
+        }
+
+        // 用现有前驱和参数绑定表达条件，不把未表达关系当作自由输入。
+        internal sealed class IntegerPathProof : IDisposable
         {
             private readonly ValueSourceIndex m_sources;
             private readonly IReadOnlySet<int> m_reentered;
@@ -2791,10 +2969,22 @@ namespace SetterChecker.Core
             private readonly Microsoft.Z3.Solver m_solver;
             private readonly Dictionary<(int Instance, FlowNode Node), Microsoft.Z3.BoolExpr> m_prefixes = new();
             private readonly HashSet<(int Instance, FlowNode Node)> m_activePrefixes = new();
-            private readonly Dictionary<BehaviorValueReference, Microsoft.Z3.BitVecExpr> m_values = new();
-            private readonly HashSet<BehaviorValueReference> m_activeValues = new();
+            private readonly Dictionary<(int Instance, BehaviorFlowPoint Point), Microsoft.Z3.BoolExpr> m_continuations = new();
+            private readonly HashSet<(int Instance, BehaviorFlowPoint Point)> m_activeContinuations = new();
+            private readonly Dictionary<(BehaviorValueReference Reference, bool Nullness), SelectedValue> m_values = new();
+            private readonly HashSet<(BehaviorValueReference Reference, bool Nullness)> m_activeValues = new();
             private readonly HashSet<int> m_approvedInstances = new();
             private readonly Dictionary<Microsoft.Z3.BoolExpr, Microsoft.Z3.BoolExpr> m_simplifiedConditions = new();
+            private readonly HashSet<(int Instance, int From, int To)> m_witnessBackEdges = new();
+            private bool m_buildWriteWitness;
+            private bool m_witnessHasExcludedPaths;
+            private bool m_checkNormalReturn;
+            private Microsoft.Z3.BoolExpr? m_selectedReturnCondition;
+            private Func<BehaviorValueReference, SelectedValue>? m_readObjectIdentity;
+            private Func<BehaviorValueReference, SelectedValue>? m_readObjectLabel;
+            private Func<ValueOrigin, SelectedValue>? m_readRuntimeLabel;
+            private readonly Dictionary<string, int> m_typeLabels = new(StringComparer.Ordinal);
+            private readonly Dictionary<string, (Microsoft.Z3.BitVecExpr Value, Microsoft.Z3.BoolExpr IsNull, HashSet<string> Types)> m_typeInputs = new(StringComparer.Ordinal);
 
             // 同一冻结批次共用公式环境，库内部保持单线程。
             public IntegerPathProof(ValueSourceIndex sources, IReadOnlySet<int> reentered)
@@ -2813,10 +3003,29 @@ namespace SetterChecker.Core
                 this.m_solver.Reset();
                 this.m_prefixes.Clear();
                 this.m_activePrefixes.Clear();
+                this.m_continuations.Clear();
+                this.m_activeContinuations.Clear();
                 this.m_values.Clear();
                 this.m_activeValues.Clear();
                 this.m_approvedInstances.Clear();
                 this.m_simplifiedConditions.Clear();
+                this.m_witnessBackEdges.Clear();
+                this.m_buildWriteWitness = false;
+                this.m_witnessHasExcludedPaths = false;
+                this.m_checkNormalReturn = false;
+                this.m_selectedReturnCondition = null;
+                this.m_readObjectIdentity = null;
+                this.m_readObjectLabel = null;
+                this.m_readRuntimeLabel = null;
+                this.m_typeLabels.Clear();
+                this.m_typeInputs.Clear();
+            }
+
+            // 数值分支、引用分支和强转都可能使子调用无法正常完成。
+            internal static bool HasPathConditions(MethodBehavior body)
+            {
+                return body.Values.Any(value => value.Kind == BehaviorValueKind.Conversion && value.Reference is "castclass" or "isinst")
+                    || body.Blocks.Any(block => block.ConditionValueId.HasValue);
             }
 
             // 不可能证明只用于排除边；有解和未能表达均不能充当修改见证。
@@ -2861,7 +3070,7 @@ namespace SetterChecker.Core
                                 .Select(parent => (instance.ParentId, parent)).ToArray();
                     }
                     return (graph.Predecessors.GetValueOrDefault(current.Node) ?? Array.Empty<FlowNode>())
-                        .Where(parent => this.m_sources.m_excludedEdges.GetValueOrDefault(current.Instance)?.Contains((parent.BlockId, current.Node.BlockId)) != true)
+                        .Where(parent => IsQueryEdge(current.Instance, parent.BlockId, current.Node.BlockId))
                         .Select(parent => (current.Instance, parent)).ToArray();
                 }
 
@@ -2874,15 +3083,84 @@ namespace SetterChecker.Core
                     }
                     if (current.Node.BlockId == -1)
                     {
-                        return this.m_sources.GetInstance(current.Instance).ParentId == 0 ? this.m_context.MkTrue()
-                            : MergeConditions(inputs.Select(input => this.m_prefixes[input]));
+                        MethodCallInstance instance = this.m_sources.GetInstance(current.Instance);
+                        return instance.ParentId == 0 ? this.m_context.MkTrue()
+                            : MergeConditions(inputs.Where(input => !SimplifyCondition(JoinConditions(this.m_selectedReturnCondition ?? this.m_context.MkTrue(), this.m_prefixes[input])).IsFalse).Select(input => JoinConditions(this.m_prefixes[input],
+                                JoinConditions(ReadExecutionBefore(instance.ParentId, instance.InvocationPoint!.Value), ReadDispatchCondition(instance)))));
                     }
                     ValueFlowGraph graph = ReadGraph(current.Instance);
-                    return MergeConditions(inputs.Select(input => JoinConditions(this.m_prefixes[input],
-                        ReadEdge(current.Instance, graph.Blocks[input.Node.BlockId], current.Node.BlockId))));
+                    return MergeConditions(inputs.Where(input => !SimplifyCondition(JoinConditions(this.m_selectedReturnCondition ?? this.m_context.MkTrue(), this.m_prefixes[input])).IsFalse).Select(input => JoinConditions(this.m_prefixes[input],
+                        JoinConditions(ReadExecutionBefore(current.Instance, new(input.Node.BlockId, int.MaxValue)),
+                            ReadEdge(current.Instance, graph.Blocks[input.Node.BlockId], current.Node.BlockId)))));
                 }
 
                 return ReadAcyclic((instanceId, node), this.m_prefixes, this.m_activePrefixes, ReadInputs, Compose);
+            }
+
+            // 只合并本次位置之前必须完成的指令，不让后续异常抹去前序写入。
+            private Microsoft.Z3.BoolExpr ReadExecutionBefore(int instanceId, BehaviorFlowPoint point)
+            {
+                MethodBehavior body = this.m_sources.m_methods[this.m_sources.GetInstance(instanceId).MethodId];
+                Microsoft.Z3.BoolExpr result = this.m_context.MkTrue();
+                foreach (BehaviorValue value in this.m_sources.ReadValueFlowGraph(body).Conversions[point.BlockId]
+                    .Where(value => value.Point!.Value.Order < point.Order))
+                {
+                    result = JoinConditions(result, ReadValue(new(body.MethodId, value.Id, instanceId), true).Condition);
+                }
+                if (this.m_buildWriteWitness)
+                {
+                    foreach (BehaviorCall call in ReadGraph(instanceId).Calls[point.BlockId].Where(call => call.Point.Order < point.Order))
+                    {
+                        result = JoinConditions(result, ReadNormalContinuation(instanceId, call.Point));
+                    }
+                }
+                return result;
+            }
+
+            // 每个实际调用的正常出口与父调用之前的条件共同约束后续执行。
+            private Microsoft.Z3.BoolExpr ReadNormalContinuation(int instanceId, BehaviorFlowPoint point)
+            {
+                var key = (instanceId, point);
+                if (this.m_continuations.TryGetValue(key, out Microsoft.Z3.BoolExpr? known))
+                {
+                    return known;
+                }
+                if (!this.m_activeContinuations.Add(key))
+                {
+                    throw new AnalysisException("调用正常完成的循环条件尚未闭合");
+                }
+                try
+                {
+                    ResolvedCall call = this.m_sources.m_callsByCallerInstance.GetValueOrDefault(instanceId)?.GetValueOrDefault(point)
+                        ?? throw new AnalysisException($"当前位置之前的调用尚未完成绑定：{this.m_sources.GetInstance(instanceId).MethodId}，{point}");
+                    if (!call.CompletesWithoutTarget && (call.Targets.Count == 0 || call.Targets.Count > 1 && call.Targets.Any(target => target.DispatchTypes == null)))
+                    {
+                        throw new AnalysisException("调用正常完成的实际目标选择尚未闭合");
+                    }
+                    // 首轮见证不借递归回边补一次返回，缺少见证时仍保留未闭合状态。
+                    Microsoft.Z3.BoolExpr ReadTargetContinuation(ResolvedCallTarget target)
+                    {
+                        MethodCallInstance instance = this.m_sources.GetInstance(target.InstanceId);
+                        if (instance.ParentId != instanceId || instance.InvocationPoint != point)
+                        {
+                            this.m_witnessHasExcludedPaths = true;
+                            return this.m_context.MkFalse();
+                        }
+                        return this.m_sources.IsRuntimeDelegateCreation(call, target) ? this.m_context.MkTrue()
+                            : MergeConditions(ReadTargetBody(target).Returns
+                                .Where(returned => this.m_sources.IsReachable(target.InstanceId, returned.Point.BlockId))
+                                .SelectMany(returned => ReadGraph(target.InstanceId).NodesByBlockId[returned.Point.BlockId].Select(node =>
+                                    JoinConditions(ReadPrefix(target.InstanceId, node), ReadExecutionBefore(target.InstanceId, returned.Point)))));
+                    }
+                    Microsoft.Z3.BoolExpr result = call.CompletesWithoutTarget ? this.m_context.MkTrue()
+                        : MergeConditions(call.Targets.DistinctBy(target => target.InstanceId).Select(ReadTargetContinuation));
+                    this.m_continuations.Add(key, result);
+                    return result;
+                }
+                finally
+                {
+                    this.m_activeContinuations.Remove(key);
+                }
             }
 
             // 前缀与赋值倒查共用显式工作栈，活动节点只用于识别未表达的循环。
@@ -2932,15 +3210,68 @@ namespace SetterChecker.Core
             private ValueFlowGraph ReadGraph(int instanceId)
             {
                 MethodBehavior body = this.m_sources.m_methods[this.m_sources.GetInstance(instanceId).MethodId];
+                ValueFlowGraph graph;
                 if (!this.m_approvedInstances.Contains(instanceId))
                 {
-                    if (body.BodyKind != MethodBodyKind.Executable || body.ExceptionHandlers.Count != 0 || this.m_reentered.Contains(instanceId))
+                    if (body.BodyKind != MethodBodyKind.Executable
+                        || body.ExceptionHandlers.Any(handler => !this.m_buildWriteWitness || handler.Kind != BehaviorExceptionHandlerKind.Finally)
+                        || !this.m_buildWriteWitness && this.m_reentered.Contains(instanceId))
                     {
                         throw new AnalysisException("整数路径的函数体、异常或再次调用关联尚未闭合");
+                    }
+                    graph = this.m_sources.ReadValueFlowGraph(body);
+                    if (this.m_buildWriteWitness)
+                    {
+                        this.m_witnessHasExcludedPaths |= this.m_reentered.Contains(instanceId) || !this.m_checkNormalReturn && body.ExceptionHandlers.Count != 0;
+                        ReadWitnessBackEdges(instanceId, graph);
                     }
                     this.m_approvedInstances.Add(instanceId);
                 }
                 return this.m_sources.ReadValueFlowGraph(body);
+            }
+
+            // 只在修改见证查询中限定不重复经过回边的执行，不改变原图或完整无解查询。
+            private void ReadWitnessBackEdges(int instanceId, ValueFlowGraph graph)
+            {
+                HashSet<FlowNode> visited = new();
+                HashSet<FlowNode> active = new();
+                Stack<(FlowNode Node, FlowNode[] Children, int Next)> pending = new();
+                foreach (FlowNode start in graph.NodesByBlockId[-1])
+                {
+                    visited.Add(start);
+                    active.Add(start);
+                    pending.Push((start, graph.Successors[start].ToArray(), 0));
+                    while (pending.TryPop(out var current))
+                    {
+                        if (current.Next == current.Children.Length)
+                        {
+                            active.Remove(current.Node);
+                            continue;
+                        }
+                        FlowNode child = current.Children[current.Next];
+                        pending.Push((current.Node, current.Children, current.Next + 1));
+                        if (!this.m_sources.IsReachable(instanceId, child.BlockId) || !IsQueryEdge(instanceId, current.Node.BlockId, child.BlockId))
+                        {
+                            continue;
+                        }
+                        if (active.Contains(child))
+                        {
+                            this.m_witnessBackEdges.Add((instanceId, current.Node.BlockId, child.BlockId));
+                        }
+                        else if (visited.Add(child))
+                        {
+                            active.Add(child);
+                            pending.Push((child, graph.Successors[child].ToArray(), 0));
+                        }
+                    }
+                }
+            }
+
+            // 全量排除边和本次见证限制分别保存，后者不能进入正式分析图。
+            private bool IsQueryEdge(int instanceId, int from, int to)
+            {
+                return this.m_sources.m_excludedEdges.GetValueOrDefault(instanceId)?.Contains((from, to)) != true
+                    && !this.m_witnessBackEdges.Contains((instanceId, from, to));
             }
 
             // 按实际跳转方向建立条件，缺失 switch 标签不能视为无条件。
@@ -2954,40 +3285,59 @@ namespace SetterChecker.Core
                 {
                     throw new AnalysisException("整数路径的分支条件尚未读取");
                 }
-                Microsoft.Z3.BitVecExpr value = ReadValue(new(this.m_sources.GetInstance(instanceId).MethodId, valueId, instanceId));
-                Microsoft.Z3.BoolExpr condition = this.m_context.MkNot(this.m_context.MkEq(value, this.m_context.MkBV(0, value.SortSize)));
-                return target == block.JumpTargetBlockId ? condition : this.m_context.MkNot(condition);
+                SelectedValue value = ReadValue(new(this.m_sources.GetInstance(instanceId).MethodId, valueId, instanceId));
+                Microsoft.Z3.BoolExpr condition = this.m_context.MkNot(this.m_context.MkEq(value.Expression, this.m_context.MkBV(0, value.Expression.SortSize)));
+                return JoinConditions(value.Condition, target == block.JumpTargetBlockId ? condition : this.m_context.MkNot(condition));
             }
 
             // 保留局部赋值和指令栈入边的选择，未知调用仍不生成自由变量。
-            private Microsoft.Z3.BitVecExpr ReadValue(BehaviorValueReference reference)
+            private SelectedValue ReadValue(BehaviorValueReference reference, bool readNullness = false)
             {
-                if (this.m_values.TryGetValue(reference, out Microsoft.Z3.BitVecExpr? known))
+                var key = (reference, readNullness);
+                if (this.m_values.TryGetValue(key, out SelectedValue known))
                 {
                     return known;
                 }
-                if (!this.m_activeValues.Add(reference))
+                if (!this.m_activeValues.Add(key))
                 {
                     throw new AnalysisException("整数值的循环赋值尚未闭合");
                 }
                 try
                 {
-                    Microsoft.Z3.BitVecExpr result;
+                    SelectedValue result;
+                    Func<BehaviorValueReference, SelectedValue> readInput = input => ReadValue(input, readNullness);
                     BehaviorValue? raw = reference.ValueId >= 0 && !this.m_sources.m_runtimeValues.ContainsKey(reference)
                         ? this.m_sources.m_methods[reference.MethodId].Values[reference.ValueId] : null;
-                    if (raw?.Kind == BehaviorValueKind.SlotRead)
+                    if (this.m_sources.m_observedStorage.TryGetValue(reference, out StoredObservation? observation))
                     {
-                        result = ReadStoredInteger(reference, raw);
+                        result = ReadObservedStorageChoice(reference, observation, readInput);
+                    }
+                    else if (this.m_sources.m_runtimeValues.TryGetValue(reference, out IReadOnlyList<ValueOrigin>? runtime)
+                        && runtime.Any(origin => origin.Selection.HasValue))
+                    {
+                        result = ReadRuntimeChoice(runtime, origin => origin.Value.Kind == BehaviorValueKind.FieldRead
+                            ? ReadFieldValueChoice(reference, origin.Value, readNullness)
+                            : readNullness ? ReadNullness(origin) : throw new AnalysisException("运行时数值结果尚未进入统一选择读取"));
+                    }
+                    else if (this.m_sources.m_runtimeValues.TryGetValue(reference, out runtime) && runtime.Any(origin => origin.ReturnPath != null))
+                    {
+                        result = ReadObservedChoice(reference, runtime, readInput);
+                    }
+                    else if (raw?.Kind == BehaviorValueKind.SlotRead)
+                    {
+                        result = ReadStoredChoice(reference, raw, readInput);
                     }
                     else if (raw?.Kind == BehaviorValueKind.Merge)
                     {
-                        int blockId = raw.Point!.Value.BlockId;
-                        ValueFlowGraph graph = ReadGraph(reference.InstanceId);
-                        result = ReadChoices(raw.IncomingValues.Where(input => this.m_sources.IsReachable(reference.InstanceId, input.PredecessorBlockId)
-                            && this.m_sources.m_excludedEdges.GetValueOrDefault(reference.InstanceId)?.Contains((input.PredecessorBlockId, blockId)) != true)
-                            .SelectMany(input => graph.NodesByBlockId[input.PredecessorBlockId].Select(node =>
-                                (Guard: JoinConditions(ReadPrefix(reference.InstanceId, node), ReadEdge(reference.InstanceId, graph.Blocks[node.BlockId], blockId)),
-                                    Value: (Func<Microsoft.Z3.BitVecExpr>)(() => ReadValue(reference with { ValueId = input.ValueId }))))));
+                        result = ReadMergedChoice(reference, raw, readInput);
+                    }
+                    else if (raw?.Kind == BehaviorValueKind.CallResult)
+                    {
+                        result = ReadReturnedChoice(reference, readInput);
+                    }
+                    else if (raw?.Kind == BehaviorValueKind.FieldRead && raw.InputValueIds.Count == 1 && this.m_readObjectIdentity != null)
+                    {
+                        result = ReadFieldValueChoice(reference, raw, readNullness);
                     }
                     else if (raw?.Kind == BehaviorValueKind.Parameter
                         && this.m_sources.GetInstance(reference.InstanceId).Binding is ResolvedCallTarget binding)
@@ -2997,7 +3347,7 @@ namespace SetterChecker.Core
                         {
                             throw new AnalysisException("整数实参的目标选择尚未闭合");
                         }
-                        result = ReadValue(arguments[0]);
+                        result = readInput(arguments[0]);
                     }
                     else
                     {
@@ -3007,60 +3357,472 @@ namespace SetterChecker.Core
                             throw new AnalysisException("整数值的分支或返回关联尚未闭合");
                         }
                         ValueOrigin origin = origins[0];
-                        if (origin.Value.Kind == BehaviorValueKind.Computation)
+                        if (readNullness)
+                        {
+                            result = ReadNullness(origin);
+                        }
+                        else if (origin.Value.Kind == BehaviorValueKind.Computation)
                         {
                             result = ReadOperation(origin);
                         }
                         else
                         {
-                            MethodCallInstance owner = this.m_sources.GetInstance(origin.Reference.InstanceId);
-                            string? type = origin.Value.Kind == BehaviorValueKind.Parameter
-                                ? owner.Substitute(this.m_sources.m_definitions[owner.MethodId].Parameters[origin.Value.ParameterIndex!.Value].TypeIdentity).Text
-                                : origin.Value.Type?.Id;
+                            string? type = ReadOriginType(origin);
                             uint bits = type switch
                             {
                                 "System.Int32" or "System.UInt32" or "System.Boolean" or "System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16" or "System.Char" => 32,
                                 "System.Int64" or "System.UInt64" => 64,
-                                _ => throw new AnalysisException("整数值的实际类型尚未闭合"),
+                                _ => throw new AnalysisException($"整数值的实际类型尚未闭合：{type ?? "无类型"}，{origin.Value.Kind}，{origin.Reference.ValueId}"),
                             };
-                            result = origin.Value.Kind switch
+                            result = origin.Value.Kind == BehaviorValueKind.FieldRead ? ReadInputField(origin, bits, false) : new SelectedValue(origin.Value.Kind switch
                             {
                                 BehaviorValueKind.Constant => this.m_context.MkBV(origin.Value.Reference!, bits),
                                 BehaviorValueKind.Parameter when !origin.Value.IsManagedReferenceSlot => this.m_context.MkBVConst($"p{origin.Reference.InstanceId}_{origin.Reference.ValueId}_{bits}", bits),
                                 _ => throw new AnalysisException("整数值的存储状态尚未闭合"),
-                            };
+                            }, this.m_context.MkTrue());
                         }
                     }
-                    this.m_values.Add(reference, result);
+                    this.m_values.Add(key, result);
                     return result;
                 }
                 finally
                 {
-                    this.m_activeValues.Remove(reference);
+                    this.m_activeValues.Remove(key);
                 }
             }
 
-            // 使用原倒查记录的最后写入切点，保留赋值到本次读取之间的条件。
-            private Microsoft.Z3.BitVecExpr ReadStoredInteger(BehaviorValueReference reference, BehaviorValue value)
+            // 运行时值的分支仍交给同一个选择合并，不把不同成员当成同一结果。
+            private SelectedValue ReadRuntimeChoice(IReadOnlyList<ValueOrigin> origins, Func<ValueOrigin, SelectedValue> readValue)
+            {
+                if (this.m_readObjectIdentity == null || this.m_readRuntimeLabel == null || origins.Any(origin => !origin.Selection.HasValue))
+                {
+                    throw new AnalysisException("运行时结果的输入选择尚未闭合");
+                }
+                return ReadChoices(origins.Select(origin =>
+                {
+                    var selection = origin.Selection!.Value;
+                    SelectedValue selected = this.m_readObjectIdentity(selection.Selector);
+                    Microsoft.Z3.BoolExpr guard = JoinConditions(selected.Condition,
+                        this.m_context.MkEq(selected.Expression, this.m_readRuntimeLabel(selection.Selected).Expression));
+                    return (Guard: guard, Value: (Func<SelectedValue>)(() => readValue(origin)));
+                }));
+            }
+
+            // 字段数值与写入接收对象使用同一次选择，再共用实际赋值倒查。
+            private SelectedValue ReadFieldValueChoice(BehaviorValueReference reference, BehaviorValue value, bool readNullness)
+            {
+                if (value.InputValueIds.Count == 0)
+                {
+                    ValueOrigin input = new(reference, value);
+                    string? type = ReadOriginType(input);
+                    if (readNullness && (type == null || !CallTargetResolver.IsReferenceType(this.m_sources.m_catalog, type, this.m_sources)))
+                    {
+                        throw new AnalysisException("静态字段空值查询的引用类型尚未闭合");
+                    }
+                    return ReadStaticFieldChoice(reference, value, stored => stored != reference ? ReadValue(stored, readNullness)
+                        : ReadInputField(input, type is "System.Int64" or "System.UInt64" ? 64u : 32u, readNullness));
+                }
+                BehaviorValueReference receiver = reference with { ValueId = value.InputValueIds[0] };
+                SelectedValue selected = this.m_readObjectIdentity!(receiver);
+                return ReadChoices(this.m_sources.GetCallOrigins(receiver).Select(origin =>
+                {
+                    Microsoft.Z3.BoolExpr guard = JoinConditions(selected.Condition,
+                        this.m_context.MkEq(selected.Expression, this.m_readObjectLabel!(origin.Reference).Expression));
+                    return (Guard: guard, Value: (Func<SelectedValue>)(() =>
+                    {
+                        if (origin.ReturnPath != null)
+                        {
+                            throw new AnalysisException("字段数值的返回接收对象选择尚未闭合");
+                        }
+                        IReadOnlyList<StorageLocation> locations = this.m_sources.ReadStorageLocations(reference, value.Member,
+                            value.InputValueIds[0], Array.Empty<int>(), new[] { origin })
+                            ?? throw new AnalysisException("字段数值的接收对象身份尚未闭合");
+                        ValueOrigin input = new(reference, value);
+                        string? type = ReadOriginType(input);
+                        if (readNullness && (type == null || !CallTargetResolver.IsReferenceType(this.m_sources.m_catalog, type, this.m_sources)))
+                        {
+                            throw new AnalysisException("字段空值查询的引用类型尚未闭合");
+                        }
+                        uint bits = type is "System.Int64" or "System.UInt64" ? 64u : 32u;
+                        return ReadStorageChoice(reference, this.m_sources.GetInstance(reference.InstanceId), value.Point!.Value, BehaviorWriteKind.Field, value.Member, locations, value.InputValueIds[0],
+                            () => this.m_sources.ReadStorageValuesBeforeInvocation(this.m_sources.GetInstance(reference.InstanceId), BehaviorWriteKind.Field,
+                                value.Member, locations, reference),
+                            stored => stored != reference ? ReadValue(stored, readNullness) : ReadInputField(input, bits, readNullness, new[] { origin }), guard);
+                    }));
+                }));
+            }
+
+            // 静态字段没有实例接收对象，仍使用同一存储位置和最后赋值查询。
+            private SelectedValue ReadStaticFieldChoice(BehaviorValueReference reference, BehaviorValue value,
+                Func<BehaviorValueReference, SelectedValue> readValue)
             {
                 MethodCallInstance instance = this.m_sources.GetInstance(reference.InstanceId);
-                ValueFlowGraph graph = ReadGraph(instance.Id);
+                IReadOnlyList<StorageLocation> locations = this.m_sources.ReadStorageLocations(reference, value.Member, -1, Array.Empty<int>())!;
+                return ReadStorageChoice(reference, instance, value.Point!.Value, BehaviorWriteKind.Field, value.Member, locations, -1,
+                    () => this.m_sources.ReadStorageValuesBeforeInvocation(instance, BehaviorWriteKind.Field, value.Member, locations, reference), readValue);
+            }
+
+            // 只表达是否为空，不把非空标记当作两个对象相等的证明。
+            private SelectedValue ReadNullness(ValueOrigin origin)
+            {
+                if (origin.Value.Kind == BehaviorValueKind.Constant && origin.Value.Reference == null && origin.Value.Type == null)
+                {
+                    return new SelectedValue(this.m_context.MkBV(0, 32), this.m_context.MkTrue());
+                }
+                string? type = ReadOriginType(origin);
+                if (origin.Value.Kind == BehaviorValueKind.Conversion && origin.Value.Reference is "castclass" or "isinst")
+                {
+                    BehaviorValueReference input = origin.Reference with { ValueId = origin.Value.InputValueIds.Single() };
+                    SelectedValue inputValue = ReadValue(input, true);
+                    Microsoft.Z3.BoolExpr matches = ReadConversionCondition(origin);
+                    Microsoft.Z3.BoolExpr isNull = this.m_context.MkEq(inputValue.Expression, this.m_context.MkBV(0, 32));
+                    return origin.Value.Reference == "castclass"
+                        ? inputValue with { Condition = JoinConditions(inputValue.Condition, this.m_context.MkOr(isNull, matches)) }
+                        : new SelectedValue((Microsoft.Z3.BitVecExpr)this.m_context.MkITE(JoinConditions(this.m_context.MkNot(isNull), matches),
+                            this.m_context.MkBV(1, 32), this.m_context.MkBV(0, 32)), inputValue.Condition);
+                }
+                if (origin.Value.Kind == BehaviorValueKind.Conversion && origin.Value.Reference == "box" && type != null
+                    && CallTargetResolver.IsNonNullableValueType(this.m_sources.m_catalog, type))
+                {
+                    return new SelectedValue(this.m_context.MkBV(1, 32), this.m_context.MkTrue());
+                }
+                if (type == null || !CallTargetResolver.IsReferenceType(this.m_sources.m_catalog, type, this.m_sources))
+                {
+                    throw new AnalysisException($"空值比较的引用类型尚未闭合：{origin.Value.Kind}，{type ?? "无类型"}，{origin.Value.Reference}");
+                }
+                if (origin.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray or BehaviorValueKind.Type or BehaviorValueKind.Constant)
+                {
+                    return new SelectedValue(this.m_context.MkBV(1, 32), this.m_context.MkTrue());
+                }
+                if (origin.Value.Kind == BehaviorValueKind.FieldRead)
+                {
+                    return ReadInputField(origin, 32, true);
+                }
+                if (origin.Value.Kind is not (BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance) || origin.Value.IsManagedReferenceSlot)
+                {
+                    throw new AnalysisException("空值比较的存储来源尚未闭合");
+                }
+                Microsoft.Z3.BitVecExpr value = this.m_context.MkBVConst($"n{origin.Reference.InstanceId}_{origin.Reference.ValueId}", 32);
+                return new SelectedValue(value, this.m_context.MkOr(this.m_context.MkEq(value, this.m_context.MkBV(0, 32)),
+                    this.m_context.MkEq(value, this.m_context.MkBV(1, 32))));
+            }
+
+            // 同一对象快照共用一个实际类型变量，不能分别满足互不相容的转换。
+            private Microsoft.Z3.BoolExpr ReadConversionCondition(ValueOrigin conversion)
+            {
+                return ReadTypeSelection(conversion.Reference with { ValueId = conversion.Value.InputValueIds.Single() },
+                    origin => CallTargetResolver.ReadConversionTypes(this.m_sources.m_catalog, this.m_sources, conversion, origin));
+            }
+
+            // 子实例的入口只允许本次接收对象实际选中的动态实现。
+            private Microsoft.Z3.BoolExpr ReadDispatchCondition(MethodCallInstance instance)
+            {
+                ResolvedCall call = this.m_sources.m_callsByCallerInstance.GetValueOrDefault(instance.ParentId)?
+                    .GetValueOrDefault(instance.InvocationPoint!.Value) ?? throw new AnalysisException("子实例的实际父调用尚未登记");
+                ResolvedCallTarget[] bindings = call.Targets.Where(target => target.InstanceId == instance.Id).ToArray();
+                if (bindings.Length == 0)
+                {
+                    throw new AnalysisException("子实例与实际父调用目标尚未对应");
+                }
+                if (bindings.All(binding => binding.DispatchTypes == null))
+                {
+                    return this.m_context.MkTrue();
+                }
+                ResolvedCallTarget binding = bindings[0];
+                string? failure = bindings.Select(target => target.DispatchFailure).FirstOrDefault(value => value != null);
+                if (failure != null || binding.Receiver.Count != 1 || bindings.Any(target => target.DispatchTypes == null))
+                {
+                    throw new AnalysisException(failure ?? "动态调用接收对象的选择尚未闭合");
+                }
+                SelectedValue nonNull = ReadValue(binding.Receiver[0], true);
+                Microsoft.Z3.BoolExpr validReceiver = JoinConditions(nonNull.Condition,
+                    this.m_context.MkNot(this.m_context.MkEq(nonNull.Expression, this.m_context.MkBV(0, 32))));
+                if (call.CoversDeclaredReceivers && call.Targets.All(target => target.InstanceId == instance.Id))
+                {
+                    return validReceiver;
+                }
+                Microsoft.Z3.BoolExpr matches = ReadTypeSelection(binding.Receiver[0], origin => bindings.SelectMany(target => target.DispatchTypes!).Distinct()
+                    .Where(type => CallTargetResolver.IsInputTypeAllowed(this.m_sources.m_catalog, this.m_sources, origin, type))
+                    .Select(type => type.Text).ToArray());
+                return JoinConditions(matches, validReceiver);
+            }
+
+            // 转换和动态调用按同一对象选择与实际类型范围建立条件。
+            private Microsoft.Z3.BoolExpr ReadTypeSelection(BehaviorValueReference input, Func<ValueOrigin, IReadOnlyList<string>> readTypes)
+            {
+                if (this.m_readObjectIdentity == null || this.m_readObjectLabel == null)
+                {
+                    throw new AnalysisException("类型转换尚未进入对象联合查询");
+                }
+                SelectedValue selected = this.m_readObjectIdentity(input);
+                IReadOnlyList<ValueOrigin> origins = ReadObjectTypeOrigins(input);
+                if (origins.Count == 0)
+                {
+                    throw new AnalysisException("类型转换的接收对象来源尚未闭合");
+                }
+                List<Microsoft.Z3.BoolExpr> choices = new();
+                foreach (ValueOrigin origin in origins)
+                {
+                    if (origin.Value.Kind == BehaviorValueKind.Constant && origin.Value.Reference == null)
+                    {
+                        continue;
+                    }
+                    Microsoft.Z3.BoolExpr selection = JoinConditions(selected.Condition,
+                        this.m_context.MkEq(selected.Expression, this.m_readObjectLabel(origin.Reference).Expression));
+                    if (SimplifyCondition(selection).IsFalse)
+                    {
+                        continue;
+                    }
+                    string key = origin.Reference.ToString();
+                    if (origin.Value.Kind == BehaviorValueKind.FieldRead)
+                    {
+                        key = this.m_sources.ReadRootInputPath(origin)
+                            ?? throw new AnalysisException("类型转换的字段快照身份尚未闭合");
+                    }
+                    else if (origin.Value.Kind is not (BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance or BehaviorValueKind.NewObject
+                        or BehaviorValueKind.NewArray or BehaviorValueKind.Constant)
+                        && !(origin.Value.Kind == BehaviorValueKind.Conversion && origin.Value.Reference == "box"))
+                    {
+                        throw new AnalysisException("类型转换的对象身份尚未闭合");
+                    }
+                    Microsoft.Z3.BitVecExpr actual = this.m_context.MkBVConst("t" + key, 32);
+                    IReadOnlyList<string> types = readTypes(origin);
+                    if (!this.m_typeInputs.TryGetValue(key, out var inputTypes))
+                    {
+                        SelectedValue nonNull = ReadValue(origin.Reference, true);
+                        inputTypes = (actual, this.m_context.MkEq(nonNull.Expression, this.m_context.MkBV(0, 32)),
+                            new HashSet<string>(CallTargetResolver.ReadInputTypeWitnesses(this.m_sources.m_catalog, this.m_sources, origin), StringComparer.Ordinal));
+                        this.m_typeInputs.Add(key, inputTypes);
+                    }
+                    inputTypes.Types.UnionWith(types);
+                    Microsoft.Z3.BoolExpr allowed = ReadTypeChoices(actual, types);
+                    choices.Add(JoinConditions(selection, allowed));
+                }
+                return MergeConditions(choices);
+            }
+
+            // 引用强转不换对象，装箱却产生独立对象，类型查询必须保留这一区别。
+            private IReadOnlyList<ValueOrigin> ReadObjectTypeOrigins(BehaviorValueReference reference)
+            {
+                Queue<BehaviorValueReference> pending = new(new[] { reference });
+                HashSet<BehaviorValueReference> visited = new();
+                List<ValueOrigin> result = new();
+                while (pending.TryDequeue(out BehaviorValueReference current))
+                {
+                    if (!visited.Add(current))
+                    {
+                        continue;
+                    }
+                    foreach (ValueOrigin origin in this.m_sources.GetCallOrigins(current, retainTypeChecks: true))
+                    {
+                        if (origin.Value.Kind == BehaviorValueKind.Conversion && origin.Value.Reference is "castclass" or "isinst")
+                        {
+                            pending.Enqueue(origin.Reference with { ValueId = origin.Value.InputValueIds.Single() });
+                        }
+                        else
+                        {
+                            result.Add(origin);
+                        }
+                    }
+                }
+                return result.Distinct().ToArray();
+            }
+
+            // 同一实际类型在本次查询中使用同一编号，编号本身没有业务含义。
+            private Microsoft.Z3.BoolExpr ReadTypeChoices(Microsoft.Z3.BitVecExpr actual, IEnumerable<string> types)
+            {
+                return MergeConditions(types.Select(type =>
+                {
+                    if (!this.m_typeLabels.TryGetValue(type, out int label))
+                    {
+                        label = this.m_typeLabels.Count;
+                        this.m_typeLabels.Add(type, label);
+                    }
+                    return this.m_context.MkEq(actual, this.m_context.MkBV(label, 32));
+                }));
+            }
+
+            // 值域只纳入已找到的真实类型见证，禁止求解器发明不存在的对象类型。
+            private Microsoft.Z3.BoolExpr ReadTypeDomains()
+            {
+                return this.m_context.MkAnd(this.m_typeInputs.Values.Select(input =>
+                    this.m_context.MkOr(input.IsNull, ReadTypeChoices(input.Value, input.Types))).ToArray());
+            }
+
+            // 参数类型来自本次实际调用签名，其余值使用已读取的真实类型。
+            private string? ReadOriginType(ValueOrigin origin)
+            {
+                MethodCallInstance owner = this.m_sources.GetInstance(origin.Reference.InstanceId);
+                return origin.Value.Kind == BehaviorValueKind.Parameter
+                    ? owner.Substitute(this.m_sources.m_definitions[owner.MethodId].Parameters[origin.Value.ParameterIndex!.Value].TypeIdentity).Text
+                    : origin.Value.Kind == BehaviorValueKind.CurrentInstance
+                        ? CallTargetResolver.ConstructTypeIdentity(this.m_sources.m_catalog.TypesById[this.m_sources.m_definitions[owner.MethodId].TypeId], owner.TypeArguments).Text
+                    : origin.Value.Kind == BehaviorValueKind.FieldRead && origin.Value.Member != null
+                        ? owner.Substitute(this.m_sources.m_catalog.ReadResolvedFieldType(origin.Value.Member)).Text
+                    : origin.Value.Type?.Id;
+            }
+
+            // 原存储倒查落到根入口后，公开可写字段才作为尚未给定的实际输入。
+            private SelectedValue ReadInputField(ValueOrigin origin, uint bits, bool readNullness, IReadOnlyList<ValueOrigin>? receivers = null)
+            {
+                if (origin.Value.Member == null || origin.Value.InputValueIds.Count > 1)
+                {
+                    throw new AnalysisException("字段初始值的实例来源尚未闭合");
+                }
+                bool isStatic = origin.Value.InputValueIds.Count == 0;
+                IReadOnlyList<StorageLocation>? locations = this.m_sources.ReadStorageLocations(origin.Reference, origin.Value.Member,
+                    origin.Value.InputValueIds.FirstOrDefault(-1), Array.Empty<int>(), receivers);
+                if (locations is not { Count: 1 } || !isStatic && (locations[0].Receiver is not BehaviorValueReference receiver
+                    || locations[0].InputPath == null && (this.m_sources.GetInstance(receiver.InstanceId).ParentId != 0
+                        || this.m_sources.m_methods[receiver.MethodId].Values[receiver.ValueId].Kind is not (BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance))))
+                {
+                    throw new AnalysisException("字段初始值的根对象身份尚未闭合");
+                }
+                (TypeEntry type, _) = this.m_sources.ReadMemberType(origin.Value.Member, this.m_sources.GetInstance(origin.Reference.InstanceId));
+                var field = this.m_sources.m_catalog.GetFields(type).Single(value => value.Name == origin.Value.Member.Name);
+                if (!field.IsPublic || field.IsStatic != isStatic || field.IsInitOnly || field.IsLiteral
+                    || !readNullness && locations[0].ValueType is not ("System.Boolean" or "System.Int32" or "System.UInt32" or "System.Int64" or "System.UInt64"))
+                {
+                    throw new AnalysisException("字段初始值的可输入范围尚未闭合");
+                }
+                Microsoft.Z3.BitVecExpr value = this.m_context.MkBVConst($"f{readNullness}_{bits}_{ReadStorageLocationKey(locations)}", bits);
+                Microsoft.Z3.BoolExpr valid = this.m_context.MkTrue();
+                if (!isStatic)
+                {
+                    SelectedValue nonNull = ReadValue(locations[0].Receiver!.Value, true);
+                    valid = JoinConditions(nonNull.Condition, this.m_context.MkNot(this.m_context.MkEq(nonNull.Expression, this.m_context.MkBV(0, 32))));
+                }
+                if (readNullness)
+                {
+                    valid = JoinConditions(valid, this.m_context.MkOr(this.m_context.MkEq(value, this.m_context.MkBV(0, bits)), this.m_context.MkEq(value, this.m_context.MkBV(1, bits))));
+                }
+                else if (locations[0].ValueType == "System.Boolean")
+                {
+                    valid = JoinConditions(valid, this.m_context.MkBVULE(value, this.m_context.MkBV(255, bits)));
+                }
+                return new SelectedValue(value, valid);
+            }
+
+            // 整数和对象来源共用实际入边；值的解释由当前读取用途提供。
+            private SelectedValue ReadMergedChoice(BehaviorValueReference reference, BehaviorValue value,
+                Func<BehaviorValueReference, SelectedValue> readValue)
+            {
+                int blockId = value.Point!.Value.BlockId;
+                ValueFlowGraph graph = ReadGraph(reference.InstanceId);
+                return ReadChoices(value.IncomingValues.Where(input => this.m_sources.IsReachable(reference.InstanceId, input.PredecessorBlockId)
+                    && IsQueryEdge(reference.InstanceId, input.PredecessorBlockId, blockId))
+                    .SelectMany(input => graph.NodesByBlockId[input.PredecessorBlockId].Select(node =>
+                        (Guard: JoinConditions(ReadPrefix(reference.InstanceId, node), ReadEdge(reference.InstanceId, graph.Blocks[node.BlockId], blockId)),
+                            Value: (Func<SelectedValue>)(() => readValue(reference with { ValueId = input.ValueId }))))));
+            }
+
+            // 已闭合目标的返回沿实际接收对象、参数和返回位置读取。
+            private SelectedValue ReadReturnedChoice(BehaviorValueReference reference,
+                Func<BehaviorValueReference, SelectedValue> readValue)
+            {
+                ResolvedCall? call = this.m_sources.m_resultCalls.GetValueOrDefault((reference.MethodId, reference.ValueId, reference.InstanceId));
+                if (call == null || call.Targets.Count == 0 || call.Targets.Count > 1 && call.Targets.Any(target => target.DispatchTypes == null))
+                {
+                    throw new AnalysisException("返回值的实际调用目标尚未闭合");
+                }
+                HashSet<(int Instance, BehaviorFlowPoint Point, bool EveryPath, bool Conditions)> closedPrefixes = new();
+                var choices = call.Targets.DistinctBy(target => target.InstanceId).SelectMany(target =>
+                    ReadTargetBody(target).Returns.Where(returned => returned.ValueId.HasValue && this.m_sources.IsReachable(target.InstanceId, returned.Point.BlockId))
+                        .SelectMany(returned => ReadGraph(target.InstanceId).NodesByBlockId[returned.Point.BlockId].Select(node =>
+                            (Guard: JoinConditions(ReadPrefix(target.InstanceId, node), ReadExecutionBefore(target.InstanceId, returned.Point)), Value: (Func<SelectedValue>)(() =>
+                            {
+                                if (!this.m_sources.HasClosedPrefix(target.InstanceId, returned.Point, closedPrefixes))
+                                {
+                                    throw new AnalysisException("返回位置之前的调用尚未证明可以正常返回");
+                                }
+                                return readValue(new BehaviorValueReference(target.MethodId, returned.ValueId!.Value, target.InstanceId));
+                            }))))).ToArray();
+                return ReadChoices(choices);
+            }
+
+            // 容器观察值沿已有的实际返回路径读取，不丢失嵌套调用的出口选择。
+            private SelectedValue ReadObservedStorageChoice(BehaviorValueReference reference, StoredObservation observation,
+                Func<BehaviorValueReference, SelectedValue> readValue)
+            {
+                if (this.m_readObjectIdentity == null || this.m_readObjectLabel == null)
+                {
+                    throw new AnalysisException("容器观察值尚未进入同次对象选择查询");
+                }
+                SelectedValue container = this.m_readObjectIdentity(observation.Container);
+                Microsoft.Z3.BoolExpr guard = JoinConditions(container.Condition,
+                    this.m_context.MkEq(container.Expression, this.m_readObjectLabel(observation.Location.Receiver!.Value).Expression));
+                SelectedValue stored = ReadStorageChoice(reference, this.m_sources.GetInstance(reference.InstanceId), observation.Point,
+                    observation.Location.Definition.Length == 0 ? BehaviorWriteKind.ArrayElement : BehaviorWriteKind.Field,
+                    observation.Member, new[] { observation.Location }, -1, () => new[] { s_defaultObjectMember }, this.m_readObjectIdentity,
+                    guard, observation.Path, observation.ThroughPoint);
+                SelectedValue source = this.m_readObjectIdentity(observation.Value);
+                SelectedValue result = readValue(observation.Value);
+                return result with
+                {
+                    Condition = JoinConditions(result.Condition, JoinConditions(stored.Condition,
+                    JoinConditions(source.Condition, this.m_context.MkEq(stored.Expression, source.Expression))))
+                };
+            }
+
+            // 返回链提供实际出口条件，底层值仍使用原函数内的来源。
+            private SelectedValue ReadObservedChoice(BehaviorValueReference reference, IReadOnlyList<ValueOrigin> origins,
+                Func<BehaviorValueReference, SelectedValue> readValue)
+            {
+                return ReadChoices(origins.Select(origin =>
+                {
+                    if (origin.Reference == reference)
+                    {
+                        throw new AnalysisException("返回观察值的原始来源尚未闭合");
+                    }
+                    Microsoft.Z3.BoolExpr condition = this.m_context.MkTrue();
+                    for (ReturnedValuePath? path = origin.ReturnPath; path != null; path = path.Previous)
+                    {
+                        condition = JoinConditions(condition, JoinConditions(ReadExecutionBefore(path.InstanceId, path.ReturnPoint),
+                            MergeConditions(ReadGraph(path.InstanceId).NodesByBlockId[path.ReturnPoint.BlockId].Select(node => ReadPrefix(path.InstanceId, node)))));
+                        condition = JoinConditions(condition, MergeConditions(ReadGraph(path.InstanceId).NodesByBlockId[path.ValuePoint.BlockId]
+                            .Select(node => ReadPrefix(path.InstanceId, node))));
+                    }
+                    return (Guard: condition, Value: (Func<SelectedValue>)(() => readValue(origin.Reference)));
+                }));
+            }
+
+            // 已绑定尚未读体的目标仍是证明缺口，不能解释成没有返回出口。
+            private MethodBehavior ReadTargetBody(ResolvedCallTarget target)
+            {
+                return this.m_sources.m_methods.TryGetValue(target.MethodId, out MethodBehavior? body) && body.BodyKind == MethodBodyKind.Executable
+                    ? body : throw new AnalysisException("调用目标的可执行函数体尚未读取完成：" + target.MethodId);
+            }
+
+            // 使用原倒查记录的最后写入切点，保留赋值到本次读取之间的条件。
+            private SelectedValue ReadStoredChoice(BehaviorValueReference reference, BehaviorValue value,
+                Func<BehaviorValueReference, SelectedValue> readValue)
+            {
                 BehaviorValueReference slot = reference with { ValueId = value.InputValueIds.Single() };
+                return ReadStorageChoice(reference, this.m_sources.GetInstance(reference.InstanceId), value.Point!.Value, BehaviorWriteKind.Indirect, null,
+                    new[] { new StorageLocation(slot, "slot", string.Empty, string.Empty) }, -1, () => new[] { slot }, readValue);
+            }
+
+            // 局部变量、字段和数组共用最后写入记录与实际分支条件。
+            private SelectedValue ReadStorageChoice(BehaviorValueReference reference, MethodCallInstance instance, BehaviorFlowPoint readPoint,
+                BehaviorWriteKind kind, BehaviorMemberReference? member, IReadOnlyList<StorageLocation> locations, int receiverId,
+                Func<IReadOnlyList<BehaviorValueReference>> readInitial, Func<BehaviorValueReference, SelectedValue> readValue,
+                Microsoft.Z3.BoolExpr? selection = null, ReturnedValuePath? returnedPath = null, BehaviorFlowPoint? throughPoint = null)
+            {
+                ValueFlowGraph graph = ReadGraph(instance.Id);
                 Dictionary<FlowSearchPoint, ReachingWrite<BehaviorValueReference>?> trace = new();
-                this.m_sources.ReadStoredValuesAtPoint(instance, BehaviorWriteKind.Indirect, null,
-                    new[] { new StorageLocation(slot, "slot", string.Empty, string.Empty) }, value.Point!.Value,
-                    -1, reference, () => new[] { slot }, trace: trace);
-                Dictionary<FlowSearchPoint, Microsoft.Z3.BitVecExpr> known = new();
+                this.m_sources.ReadStoredValuesAtPoint(instance, kind, member, locations, readPoint,
+                    receiverId, reference, readInitial, throughPoint: throughPoint, returnedPath: returnedPath, trace: trace);
+                Dictionary<FlowSearchPoint, SelectedValue> known = new();
                 HashSet<FlowSearchPoint> active = new();
 
                 // 在相同切点复用公式，长路径通过原工作栈逐步合并。
-                Microsoft.Z3.BitVecExpr ReadAt(FlowSearchPoint current)
+                SelectedValue ReadAt(FlowSearchPoint current)
                 {
                     // 先读取真实入边条件，不为已经排除的分支读取赋值。
                     Microsoft.Z3.BoolExpr ReadGuard(FlowSearchPoint parent, FlowSearchPoint point)
                     {
-                        return JoinConditions(ReadPrefix(instance.Id, parent.Node),
-                            ReadEdge(instance.Id, graph.Blocks[parent.Node.BlockId], point.Node.BlockId));
+                        return JoinConditions(selection ?? this.m_context.MkTrue(), JoinConditions(ReadPrefix(instance.Id, parent.Node),
+                            ReadEdge(instance.Id, graph.Blocks[parent.Node.BlockId], point.Node.BlockId)));
                     }
 
                     // 写入切点之后不再查找被覆盖的旧值。
@@ -3069,42 +3831,381 @@ namespace SetterChecker.Core
                         return trace[point] != null || point.Node.BlockId == -1 ? Array.Empty<FlowSearchPoint>()
                             : (graph.Predecessors.GetValueOrDefault(point.Node) ?? Array.Empty<FlowNode>())
                                 .Where(parent => this.m_sources.IsReachable(instance.Id, parent.BlockId)
-                                    && this.m_sources.m_excludedEdges.GetValueOrDefault(instance.Id)?.Contains((parent.BlockId, point.Node.BlockId)) != true)
+                                    && IsQueryEdge(instance.Id, parent.BlockId, point.Node.BlockId))
                                 .Select(parent => new FlowSearchPoint(parent, int.MaxValue))
+                                .Where(trace.ContainsKey)
                                 .Where(parent => !SimplifyCondition(ReadGuard(parent, point)).IsFalse).ToArray();
                     }
 
                     // 条件只选择当前倒查路径上仍有效的赋值。
-                    Microsoft.Z3.BitVecExpr Compose(FlowSearchPoint point, IReadOnlyList<FlowSearchPoint> inputs)
+                    SelectedValue Compose(FlowSearchPoint point, IReadOnlyList<FlowSearchPoint> inputs)
                     {
                         ReachingWrite<BehaviorValueReference>? write = trace[point];
                         if (write != null)
                         {
+                            ResolvedCall? call = this.m_sources.m_callsByCallerInstance.GetValueOrDefault(instance.Id)?.GetValueOrDefault(write.Point);
+                            if (call != null)
+                            {
+                                if (call.Targets.Count == 0)
+                                {
+                                    throw new AnalysisException("存储赋值的别名或子调用出口选择尚未闭合");
+                                }
+                                HashSet<(int Instance, BehaviorFlowPoint Point, bool EveryPath, bool Conditions)> closedPrefixes = new();
+                                return ReadChoices(ReadPathTargets(call, returnedPath).DistinctBy(target => target.InstanceId).SelectMany(target =>
+                                {
+                                    ReturnedValuePath? selectedReturn = FindReturnPath(returnedPath, target.InstanceId);
+                                    return ReadTargetBody(target).Returns
+                                        .Where(returned => this.m_sources.IsReachable(target.InstanceId, returned.Point.BlockId)
+                                            && (selectedReturn == null || selectedReturn.ReturnPoint == returned.Point))
+                                        .SelectMany(returned => ReadGraph(target.InstanceId).NodesByBlockId[returned.Point.BlockId].Select(node =>
+                                            (Guard: JoinConditions(ReadPrefix(target.InstanceId, node), ReadExecutionBefore(target.InstanceId, returned.Point)),
+                                                Value: (Func<SelectedValue>)(() =>
+                                                {
+                                                    if (!this.m_sources.HasClosedPrefix(target.InstanceId, returned.Point, closedPrefixes))
+                                                    {
+                                                        throw new AnalysisException("存储赋值的子调用尚未证明可以正常返回");
+                                                    }
+                                                    return ReadStorageChoice(reference, this.m_sources.GetInstance(target.InstanceId), returned.Point,
+                                                        kind, member, locations, -1, () => new[] { s_previousStorageValue },
+                                                        stored => stored == s_previousStorageValue ? ReadAt(new FlowSearchPoint(point.Node, write.Point.Order)) : readValue(stored),
+                                                        selection, returnedPath, selectedReturn?.ValuePoint);
+                                                }))));
+                                }));
+                            }
                             if (!write.ReplacesPrevious || write.Values.Count != 1)
                             {
-                                throw new AnalysisException("整数赋值的别名或子调用出口选择尚未闭合");
+                                BehaviorWrite[] declared = this.m_sources.GetWrites(instance.Id, write.Point.BlockId)
+                                    .Where(item => item.Point == write.Point).ToArray();
+                                if (write.Values.Count != 1 || declared.Length != 1 || declared[0].ReceiverValueId is not int writeReceiver
+                                    || this.m_readObjectIdentity == null || this.m_readObjectLabel == null)
+                                {
+                                    throw new AnalysisException("存储赋值的别名选择尚未闭合");
+                                }
+                                BehaviorValueReference address = new(instance.MethodId, writeReceiver, instance.Id);
+                                SelectedValue selected = this.m_readObjectIdentity(address);
+                                Microsoft.Z3.BoolExpr matches = MergeConditions(this.m_sources.GetCallOrigins(address).Select(origin =>
+                                {
+                                    IReadOnlyList<StorageLocation> assigned = this.m_sources.ReadStorageLocations(write.Values[0], declared[0].Member,
+                                        writeReceiver, declared[0].IndexValueIds, new[] { origin })
+                                        ?? throw new AnalysisException("间接写入的实际存储选择尚未闭合");
+                                    return assigned.Any(actual => locations.Any(expected => this.m_sources.StorageLocationsMatch(actual, expected)))
+                                        ? this.m_context.MkEq(selected.Expression, this.m_readObjectLabel(origin.Reference).Expression) : this.m_context.MkFalse();
+                                }));
+                                return ReadChoices(new[]
+                                {
+                                    (Guard: JoinConditions(selected.Condition, matches), Value: (Func<SelectedValue>)(() => readValue(write.Values[0]))),
+                                    (Guard: JoinConditions(selected.Condition, this.m_context.MkNot(matches)),
+                                        Value: (Func<SelectedValue>)(() => ReadAt(new FlowSearchPoint(point.Node, write.Point.Order)))),
+                                });
                             }
-                            return ReadValue(write.Values[0]);
+                            return readValue(write.Values[0]);
                         }
                         if (point.Node.BlockId == -1)
                         {
-                            return ReadValue(slot);
+                            IReadOnlyList<BehaviorValueReference> initial = readInitial();
+                            if (initial.Count != 1)
+                            {
+                                if (instance.ParentId != 0)
+                                {
+                                    MethodCallInstance parent = this.m_sources.GetInstance(instance.ParentId);
+                                    return ReadStorageChoice(reference, parent, instance.InvocationPoint!.Value, kind, member, locations, -1,
+                                        () => this.m_sources.ReadStorageValuesBeforeInvocation(parent, kind, member, locations, reference, returnedPath), readValue, selection, returnedPath);
+                                }
+                                throw new AnalysisException("存储初值的调用选择尚未闭合");
+                            }
+                            return readValue(initial[0]);
                         }
                         return ReadChoices(inputs.Select(parent =>
                             (Guard: ReadGuard(parent, point),
-                                Value: (Func<Microsoft.Z3.BitVecExpr>)(() => known[parent]))));
+                                Value: (Func<SelectedValue>)(() => known[parent]))));
                     }
                     return ReadAcyclic(current, known, active, ReadInputs, Compose);
                 }
 
-                return ReadChoices(graph.NodesByBlockId[value.Point.Value.BlockId].Select(node =>
-                    (Guard: ReadPrefix(instance.Id, node), Value: (Func<Microsoft.Z3.BitVecExpr>)(() => ReadAt(new FlowSearchPoint(node, value.Point.Value.Order))))));
+                return ReadChoices(graph.NodesByBlockId[readPoint.BlockId].Where(node => trace.ContainsKey(new FlowSearchPoint(node, readPoint.Order))).Select(node =>
+                    (Guard: JoinConditions(selection ?? this.m_context.MkTrue(), JoinConditions(ReadPrefix(instance.Id, node),
+                        ReadExecutionBefore(instance.Id, readPoint))),
+                        Value: (Func<SelectedValue>)(() => ReadAt(new FlowSearchPoint(node, readPoint.Order))))));
+            }
+
+            // 候选序号仅表示来源选择，绝不把它解释成对象地址或不别名证明。
+            internal (IReadOnlyList<ValueOrigin> Origins, bool Complete, bool Possible) ReadSelectedOriginsAtPoint(int stopAtInstance,
+                IReadOnlyList<ValueOrigin> origins, int instanceId, BehaviorFlowPoint point, BehaviorValueReference? receiver,
+                BehaviorFlowPoint? throughPoint = null, (BehaviorMemberReference? Member, StorageLocation Location, ReturnedValuePath? Path)? storage = null,
+                bool normalReturn = false)
+            {
+                ClearQuery();
+                this.m_buildWriteWitness = true;
+                this.m_checkNormalReturn = normalReturn;
+                Dictionary<BehaviorValueReference, int> labels = new();
+                Dictionary<BehaviorMemberReference, int> runtimeLabels = new();
+                int nextLabel = 0;
+                Dictionary<(BehaviorValueReference Reference, bool Identity), SelectedValue> known = new();
+                HashSet<(BehaviorValueReference Reference, bool Identity)> active = new();
+
+                // 每个已确定来源使用本次查询内的唯一序号。
+                SelectedValue ReadLeaf(BehaviorValueReference leaf)
+                {
+                    if (!labels.TryGetValue(leaf, out int label))
+                    {
+                        label = nextLabel++;
+                        labels.Add(leaf, label);
+                    }
+                    return new SelectedValue(this.m_context.MkBV(label, 32), this.m_context.MkTrue());
+                }
+
+                // 同一个查找调用可产出不同成员，成员身份不能压成调用结果编号。
+                SelectedValue ReadRuntimeLeaf(ValueOrigin origin)
+                {
+                    if (origin.Value.Member == null || origin.Value.Kind != BehaviorValueKind.Function
+                        && !(origin.Value.Kind == BehaviorValueKind.FieldRead && origin.Value.InputValueIds.Count == 0))
+                    {
+                        return ReadLeaf(origin.Reference);
+                    }
+                    if (!runtimeLabels.TryGetValue(origin.Value.Member, out int label))
+                    {
+                        label = nextLabel++;
+                        runtimeLabels.Add(origin.Value.Member, label);
+                    }
+                    return new SelectedValue(this.m_context.MkBV(label, 32), this.m_context.MkTrue());
+                }
+
+                // 普通读取和运行时生成的读取共用字段、数组及最后赋值追查。
+                SelectedValue ReadFieldOrigin(BehaviorValueReference current, BehaviorValue value, bool identity)
+                {
+                    if (value.InputValueIds.Count == 0)
+                    {
+                        return ReadStaticFieldChoice(current, value, stored => stored != current ? ReadOrigin(stored, identity)
+                            : ReadRuntimeLeaf(new ValueOrigin(current, value)));
+                    }
+                    BehaviorValueReference receiver = current with { ValueId = value.InputValueIds[0] };
+                    SelectedValue selectedReceiver = ReadOrigin(receiver, true);
+                    return ReadChoices(this.m_sources.GetCallOrigins(receiver).Select(origin =>
+                    {
+                        Microsoft.Z3.BoolExpr guard = JoinConditions(selectedReceiver.Condition,
+                            this.m_context.MkEq(selectedReceiver.Expression, ReadLeaf(origin.Reference).Expression));
+                        return (Guard: guard, Value: (Func<SelectedValue>)(() =>
+                        {
+                            if (origin.ReturnPath != null)
+                            {
+                                throw new AnalysisException("对象字段的返回接收对象选择尚未闭合");
+                            }
+                            IReadOnlyList<StorageLocation> locations = this.m_sources.ReadStorageLocations(current, value.Member,
+                                value.InputValueIds[0], value.Kind == BehaviorValueKind.ArrayElementRead ? value.InputValueIds.Skip(1).ToArray() : Array.Empty<int>(), new[] { origin })
+                                ?? throw new AnalysisException("对象字段的接收对象身份尚未闭合");
+                            BehaviorWriteKind kind = value.Kind == BehaviorValueKind.FieldRead ? BehaviorWriteKind.Field : BehaviorWriteKind.ArrayElement;
+
+                            // 从旧字段取得实际写入接收对象时，该字段值本身也必须非空。
+                            SelectedValue ReadInitial()
+                            {
+                                if (this.m_sources.m_runtimeValues.ContainsKey(current))
+                                {
+                                    throw new AnalysisException("运行时字段初值的独立成员身份尚未闭合");
+                                }
+                                SelectedValue leaf = identity || origins.Any(candidate => candidate.Reference == current) ? ReadLeaf(current) : ReadOrigin(receiver);
+                                if (kind == BehaviorWriteKind.Field && ReadOriginType(new ValueOrigin(current, value)) is string type
+                                    && CallTargetResolver.IsReferenceType(this.m_sources.m_catalog, type, this.m_sources))
+                                {
+                                    SelectedValue nonNull = ReadInputField(new ValueOrigin(current, value), 32, true, new[] { origin });
+                                    leaf = leaf with
+                                    {
+                                        Condition = JoinConditions(leaf.Condition, JoinConditions(nonNull.Condition,
+                                        this.m_context.MkNot(this.m_context.MkEq(nonNull.Expression, this.m_context.MkBV(0, 32)))))
+                                    };
+                                }
+                                return leaf;
+                            }
+                            return ReadStorageChoice(current, this.m_sources.GetInstance(current.InstanceId), value.Point!.Value, kind, value.Member, locations, value.InputValueIds[0],
+                                () => this.m_sources.ReadStorageValuesBeforeInvocation(this.m_sources.GetInstance(current.InstanceId), kind, value.Member, locations, current),
+                                stored => stored != current ? ReadOrigin(stored, identity) : ReadInitial(), guard);
+                        }));
+                    }));
+                }
+
+                // 分支和局部存储共用原规则，叶子保留相对当前调用者的真实来源。
+                SelectedValue ReadOrigin(BehaviorValueReference current, bool identity = false)
+                {
+                    var key = (current, identity);
+                    if (known.TryGetValue(key, out SelectedValue cached))
+                    {
+                        return cached;
+                    }
+                    if (!active.Add(key))
+                    {
+                        throw new AnalysisException("对象来源的循环选择尚未闭合");
+                    }
+                    try
+                    {
+                        BehaviorValue? value = current.ValueId >= 0 && !this.m_sources.m_runtimeValues.ContainsKey(current)
+                            ? this.m_sources.m_methods[current.MethodId].Values[current.ValueId] : null;
+                        SelectedValue result;
+                        if (this.m_sources.m_observedStorage.TryGetValue(current, out StoredObservation? observation))
+                        {
+                            result = ReadObservedStorageChoice(current, observation, input => ReadOrigin(input, identity));
+                        }
+                        else if (this.m_sources.m_runtimeValues.TryGetValue(current, out IReadOnlyList<ValueOrigin>? runtime)
+                            && runtime.Any(origin => origin.Selection.HasValue))
+                        {
+                            result = ReadRuntimeChoice(runtime, origin => origin.Value.Kind == BehaviorValueKind.FieldRead
+                                ? ReadFieldOrigin(current, origin.Value, identity) : ReadRuntimeLeaf(origin));
+                        }
+                        else if (this.m_sources.m_runtimeValues.TryGetValue(current, out runtime) && runtime.Any(origin => origin.ReturnPath != null))
+                        {
+                            result = ReadObservedChoice(current, runtime, input => ReadOrigin(input, identity));
+                        }
+                        else if (value?.Kind == BehaviorValueKind.SlotRead)
+                        {
+                            result = ReadStoredChoice(current, value, input => ReadOrigin(input, identity));
+                        }
+                        else if (value?.Kind == BehaviorValueKind.Merge)
+                        {
+                            result = ReadMergedChoice(current, value, input => ReadOrigin(input, identity));
+                        }
+                        else if (value?.Kind == BehaviorValueKind.CallResult)
+                        {
+                            result = ReadReturnedChoice(current, input => ReadOrigin(input, identity));
+                        }
+                        else if (value?.Kind == BehaviorValueKind.Conversion && value.Reference is "castclass" or "isinst")
+                        {
+                            result = ReadOrigin(current with { ValueId = value.InputValueIds.Single() }, identity);
+                            SelectedValue nonNull = ReadValue(current, true);
+                            result = result with
+                            {
+                                Condition = JoinConditions(result.Condition, JoinConditions(nonNull.Condition,
+                                this.m_context.MkNot(this.m_context.MkEq(nonNull.Expression, this.m_context.MkBV(0, 32)))))
+                            };
+                        }
+                        else if (value?.Kind is BehaviorValueKind.FieldRead or BehaviorValueKind.ArrayElementRead && value.InputValueIds.Count > 0)
+                        {
+                            result = ReadFieldOrigin(current, value, identity);
+                        }
+                        else if (current.InstanceId != stopAtInstance
+                            && value?.Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance
+                            && this.m_sources.GetInstance(current.InstanceId).Binding is ResolvedCallTarget binding)
+                        {
+                            IReadOnlyList<BehaviorValueReference> inputs = value.Kind == BehaviorValueKind.Parameter
+                                ? binding.Arguments[value.ParameterIndex!.Value] : binding.Receiver;
+                            if (inputs.Count != 1)
+                            {
+                                throw new AnalysisException("对象实参的调用选择尚未闭合");
+                            }
+                            result = ReadOrigin(inputs[0], identity);
+                        }
+                        else
+                        {
+                            IReadOnlyList<ValueOrigin> values = this.m_sources.GetRelativeOrigins(current, stopAtInstance, retainTypeChecks: true);
+                            if (values.Count != 1 || values[0].ReturnPath != null)
+                            {
+                                throw new AnalysisException("对象来源的存储或返回选择尚未闭合");
+                            }
+                            if (values[0].Value.Kind is BehaviorValueKind.FieldRead or BehaviorValueKind.ArrayElementRead or BehaviorValueKind.Address or BehaviorValueKind.Conversion
+                                && !identity && values[0].Value.InputValueIds.Count > 0 && !origins.Any(origin => origin.Reference == values[0].Reference))
+                            {
+                                result = ReadOrigin(values[0].Reference with { ValueId = values[0].Value.InputValueIds[0] });
+                                known.Add(key, result);
+                                return result;
+                            }
+                            result = ReadRuntimeLeaf(values[0]);
+                        }
+                        known.Add(key, result);
+                        return result;
+                    }
+                    finally
+                    {
+                        active.Remove(key);
+                    }
+                }
+
+                this.m_readObjectIdentity = reference => ReadOrigin(reference, true);
+                this.m_readObjectLabel = ReadLeaf;
+                this.m_readRuntimeLabel = ReadRuntimeLeaf;
+                if (throughPoint.HasValue && throughPoint.Value != point)
+                {
+                    this.m_selectedReturnCondition = MergeConditions(ReadGraph(instanceId).NodesByBlockId[throughPoint.Value.BlockId]
+                        .Select(node => ReadPrefix(instanceId, node)));
+                }
+                Microsoft.Z3.BoolExpr prefix = JoinConditions(this.m_selectedReturnCondition ?? this.m_context.MkTrue(), JoinConditions(ReadExecutionBefore(instanceId, point),
+                    MergeConditions(ReadGraph(instanceId).NodesByBlockId[point.BlockId].Select(node => ReadPrefix(instanceId, node)))));
+                Microsoft.Z3.BoolExpr? storageSelection = null;
+                if (storage.HasValue)
+                {
+                    SelectedValue container = ReadOrigin(receiver!.Value, true);
+                    storageSelection = JoinConditions(container.Condition,
+                        this.m_context.MkEq(container.Expression, ReadLeaf(storage.Value.Location.Receiver!.Value).Expression));
+                    prefix = JoinConditions(prefix, storageSelection);
+                }
+                if (SimplifyCondition(prefix).IsFalse)
+                {
+                    return (Array.Empty<ValueOrigin>(), this.m_witnessBackEdges.Count == 0 && !this.m_witnessHasExcludedPaths, false);
+                }
+                SelectedValue selected = storage.HasValue
+                    ? ReadStorageChoice(receiver!.Value, this.m_sources.GetInstance(instanceId), point,
+                        storage.Value.Location.Definition.Length == 0 ? BehaviorWriteKind.ArrayElement : BehaviorWriteKind.Field,
+                        storage.Value.Member, new[] { storage.Value.Location }, -1, () => new[] { s_defaultObjectMember }, input => ReadOrigin(input),
+                        storageSelection, returnedPath: storage.Value.Path, throughPoint: throughPoint)
+                    : receiver.HasValue ? ReadOrigin(receiver.Value)
+                    : new SelectedValue(this.m_context.MkBV(0, 32), this.m_context.MkTrue());
+                prefix = JoinConditions(prefix, selected.Condition);
+                if (!receiver.HasValue)
+                {
+                    this.m_solver.Reset();
+                    this.m_solver.Assert(JoinConditions(prefix, ReadTypeDomains()));
+                    Microsoft.Z3.Status status = this.m_solver.Check();
+                    if (status == Microsoft.Z3.Status.UNKNOWN)
+                    {
+                        throw new AnalysisException("静态写入位置的合法路径尚未证明");
+                    }
+                    return (Array.Empty<ValueOrigin>(), this.m_witnessBackEdges.Count == 0 && !this.m_witnessHasExcludedPaths, status == Microsoft.Z3.Status.SATISFIABLE);
+                }
+                List<ValueOrigin> possible = new();
+                foreach (ValueOrigin origin in origins)
+                {
+                    SelectedValue candidateValue;
+                    if (labels.TryGetValue(origin.Reference, out int label))
+                    {
+                        candidateValue = new SelectedValue(this.m_context.MkBV(label, 32), this.m_context.MkTrue());
+                    }
+                    else if (origin.Value.Kind == BehaviorValueKind.Conversion && origin.Value.Reference is "castclass" or "isinst")
+                    {
+                        candidateValue = ReadOrigin(origin.Reference);
+                    }
+                    else
+                    {
+                        if (origin.Value.Kind == BehaviorValueKind.CallResult)
+                        {
+                            throw new AnalysisException("未闭合的返回来源不能作为不可达候选删除");
+                        }
+                        continue;
+                    }
+                    this.m_solver.Reset();
+                    Microsoft.Z3.BoolExpr candidate = JoinConditions(prefix, JoinConditions(candidateValue.Condition,
+                        this.m_context.MkEq(selected.Expression, candidateValue.Expression)));
+                    if (origin.Value.Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance && !origin.Value.IsManagedReferenceSlot
+                        && ReadOriginType(origin) is string type && CallTargetResolver.IsReferenceType(this.m_sources.m_catalog, type, this.m_sources))
+                    {
+                        SelectedValue nonNull = ReadValue(origin.Reference, true);
+                        candidate = JoinConditions(candidate, JoinConditions(nonNull.Condition,
+                            this.m_context.MkNot(this.m_context.MkEq(nonNull.Expression, this.m_context.MkBV(0, 32)))));
+                    }
+                    this.m_solver.Assert(JoinConditions(candidate, ReadTypeDomains()));
+                    Microsoft.Z3.Status status = this.m_solver.Check();
+                    if (status == Microsoft.Z3.Status.UNKNOWN)
+                    {
+                        throw new AnalysisException("对象来源与写入路径的条件尚未证明");
+                    }
+                    if (status == Microsoft.Z3.Status.SATISFIABLE)
+                    {
+                        possible.Add(origin);
+                    }
+                }
+                return (possible, this.m_witnessBackEdges.Count == 0 && !this.m_witnessHasExcludedPaths, possible.Count != 0);
             }
 
             // 每条真实入边选择它实际带来的值，不把不同分支的候选自由组合。
-            private Microsoft.Z3.BitVecExpr ReadChoices(IEnumerable<(Microsoft.Z3.BoolExpr Guard, Func<Microsoft.Z3.BitVecExpr> Value)> choices)
+            private SelectedValue ReadChoices(IEnumerable<(Microsoft.Z3.BoolExpr Guard, Func<SelectedValue> Value)> choices)
             {
                 Microsoft.Z3.BitVecExpr? result = null;
+                List<Microsoft.Z3.BoolExpr> conditions = new();
                 foreach (var choice in choices)
                 {
                     Microsoft.Z3.BoolExpr guard = SimplifyCondition(choice.Guard);
@@ -3112,15 +4213,19 @@ namespace SetterChecker.Core
                     {
                         continue;
                     }
-                    Microsoft.Z3.BitVecExpr value = choice.Value();
+                    SelectedValue selected = choice.Value();
+                    Microsoft.Z3.BitVecExpr value = selected.Expression;
+                    conditions.Add(JoinConditions(guard, selected.Condition));
                     if (result != null && result.SortSize != value.SortSize)
                     {
                         throw new AnalysisException("整数合流的位宽不一致");
                     }
                     result = result == null ? value : (Microsoft.Z3.BitVecExpr)this.m_context.MkITE(guard, value, result);
                 }
-                return result ?? throw new AnalysisException("整数值没有可到达的选择分支");
+                return new SelectedValue(result ?? throw new AnalysisException("值没有可到达的选择分支"), MergeConditions(conditions));
             }
+
+            private readonly record struct SelectedValue(Microsoft.Z3.BitVecExpr Expression, Microsoft.Z3.BoolExpr Condition);
 
             // 无条件的顺序指令沿用原公式，避免给长路径逐层包裹恒真条件。
             private Microsoft.Z3.BoolExpr JoinConditions(Microsoft.Z3.BoolExpr left, Microsoft.Z3.BoolExpr right)
@@ -3148,16 +4253,35 @@ namespace SetterChecker.Core
             }
 
             // 位宽、有符号比较与普通溢出遵从原指令，不使用无限精度整数替代。
-            private Microsoft.Z3.BitVecExpr ReadOperation(ValueOrigin origin)
+            private SelectedValue ReadOperation(ValueOrigin origin)
             {
                 string operation = origin.Value.Reference!;
+                if (operation == "ldlen")
+                {
+                    var length = this.m_sources.ReadInteger(origin.Reference, new())
+                        ?? throw new AnalysisException("数组实际长度的分支选择尚未闭合");
+                    return new SelectedValue(this.m_context.MkBV(length.Value, (uint)length.Bits), this.m_context.MkTrue());
+                }
                 if (operation is not ("brtrue" or "brfalse" or "beq" or "ceq" or "bne.un" or "bgt" or "cgt" or "bge" or "blt" or "clt" or "ble"
                     or "bgt.un" or "cgt.un" or "bge.un" or "blt.un" or "clt.un" or "ble.un" or "add" or "sub" or "mul" or "and" or "or" or "xor"
                     or "neg" or "not" or "conv.i4" or "conv.u4" or "conv.i8" or "conv.u8"))
                 {
                     throw new AnalysisException($"整数指令尚未完整表达：{operation}");
                 }
-                Microsoft.Z3.BitVecExpr[] inputs = origin.Value.InputValueIds.Select(id => ReadValue(origin.Reference with { ValueId = id })).ToArray();
+                bool nullComparison = origin.Value.InputValueIds.Count == 2 && operation is "beq" or "ceq" or "bne.un" or "cgt.un"
+                    && origin.Value.InputValueIds.Any(id => this.m_sources.GetCallOrigins(origin.Reference with { ValueId = id }, retainTypeChecks: true)
+                        is { Count: 1 } values && values[0].Value.Kind == BehaviorValueKind.Constant
+                            && values[0].Value.Type == null && values[0].Value.Reference == null);
+                if (origin.Value.InputValueIds.Count == 1 && operation is "brtrue" or "brfalse")
+                {
+                    IReadOnlyList<ValueOrigin> values = this.m_sources.GetCallOrigins(origin.Reference with { ValueId = origin.Value.InputValueIds[0] }, retainTypeChecks: true);
+                    nullComparison = values.Count > 0 && values.All(value => value.Value.Kind == BehaviorValueKind.Constant && value.Value.Type == null && value.Value.Reference == null
+                        || value.Value.Kind == BehaviorValueKind.Conversion && value.Value.Reference is "box" or "castclass" or "isinst"
+                        || ReadOriginType(value) is string type && CallTargetResolver.IsReferenceType(this.m_sources.m_catalog, type, this.m_sources));
+                }
+                SelectedValue[] selected = origin.Value.InputValueIds.Select(id => ReadValue(origin.Reference with { ValueId = id }, nullComparison)).ToArray();
+                Microsoft.Z3.BitVecExpr[] inputs = selected.Select(value => value.Expression).ToArray();
+                Microsoft.Z3.BoolExpr valid = this.m_context.MkAnd(selected.Select(value => value.Condition));
                 if (inputs.Length == 0 || inputs.Length > 2 || inputs.Length == 2 && inputs[0].SortSize != inputs[1].SortSize)
                 {
                     throw new AnalysisException("整数指令的参数位宽尚未闭合");
@@ -3182,9 +4306,9 @@ namespace SetterChecker.Core
                 };
                 if (condition != null)
                 {
-                    return (Microsoft.Z3.BitVecExpr)this.m_context.MkITE(condition, this.m_context.MkBV(1, 32), this.m_context.MkBV(0, 32));
+                    return new SelectedValue((Microsoft.Z3.BitVecExpr)this.m_context.MkITE(condition, this.m_context.MkBV(1, 32), this.m_context.MkBV(0, 32)), valid);
                 }
-                return operation switch
+                return new SelectedValue(operation switch
                 {
                     "add" => this.m_context.MkBVAdd(left, right!),
                     "sub" => this.m_context.MkBVSub(left, right!),
@@ -3198,7 +4322,7 @@ namespace SetterChecker.Core
                     "conv.i8" or "conv.u8" => left.SortSize == 64 ? left : operation == "conv.u8"
                         ? this.m_context.MkZeroExt(32, left) : this.m_context.MkSignExt(32, left),
                     _ => throw new AnalysisException($"整数指令尚未完整表达：{operation}"),
-                };
+                }, valid);
             }
 
             // 公式和求解状态不越过当前冻结批次的生命周期。
@@ -3212,6 +4336,7 @@ namespace SetterChecker.Core
         // 路径缩小时撤销受影响入口的派生事实；保留实例编号和已证路径，重新命中才激活子调用。
         internal HashSet<int> ResetRoots(HashSet<int> roots)
         {
+            this.m_changedRoots.UnionWith(roots);
             HashSet<int> instances = this.m_instances.Values.Where(instance => roots.Contains(instance.RootId)).Select(instance => instance.Id).ToHashSet();
             this.m_inactiveInstances.UnionWith(instances.Except(roots));
             foreach (int id in instances)
@@ -3648,6 +4773,7 @@ namespace SetterChecker.Core
                 this.m_runtimeWrites.Add(instanceId, writes);
             }
             writes.Add(write);
+            this.m_changedRoots.Add(GetInstance(instanceId).RootId);
         }
 
         // 指令写入和运行时反射写入共用后续存储及效果流程。
@@ -3664,6 +4790,7 @@ namespace SetterChecker.Core
         internal void BindRuntimeValue(BehaviorValueReference reference, IReadOnlyList<ValueOrigin> values)
         {
             this.m_runtimeValues.Add(reference, values);
+            this.m_changedRoots.Add(GetInstance(reference.InstanceId).RootId);
         }
 
         // 把一个明确调用的返回值连接到其真实目标，供后续使用位置继续追踪。
@@ -3678,6 +4805,7 @@ namespace SetterChecker.Core
             }
 
             calls.Add(call.Call.Point, call);
+            this.m_changedRoots.Add(GetInstance(call.CallerInstanceId).RootId);
             if (call.Call.ResultValueId is int resultId)
             {
                 this.m_resultCalls.Add((call.CallerMethodId, resultId, call.CallerInstanceId), call);
@@ -3943,8 +5071,19 @@ namespace SetterChecker.Core
             {
                 IEnumerable<BehaviorValue> values = this.m_runtimeValues.TryGetValue(reference, out IReadOnlyList<ValueOrigin>? origins)
                     ? origins.Select(origin => origin.Value) : new[] { this.m_methods[reference.MethodId].Values[reference.ValueId] };
-                BindRuntimeValue(pending, values.Select(value => new ValueOrigin(pending, value with
-                { Id = pending.ValueId, Kind = BehaviorValueKind.CallResult, Point = point })).ToArray());
+                BindRuntimeValue(pending, values.Select(value =>
+                {
+                    BehaviorTypeReference? type = value.Type;
+                    if (value.Kind == BehaviorValueKind.FieldRead && value.Member != null)
+                    {
+                        TypeIdentityTemplate identity = GetInstance(reference.InstanceId).Substitute(this.m_catalog.ReadResolvedFieldType(value.Member));
+                        bool constructed = CallTargetResolver.TryReadConstructedType(identity.Text, out string definition, out string[] arguments);
+                        type = new BehaviorTypeReference(identity, constructed ? new TypeIdentityTemplate(definition) : identity,
+                            constructed ? arguments.Select(argument => new TypeIdentityTemplate(argument)).ToArray() : Array.Empty<TypeIdentityTemplate>(),
+                            null, value.Member.ReferringAssemblyPath, null);
+                    }
+                    return new ValueOrigin(pending, value with { Id = pending.ValueId, Kind = BehaviorValueKind.CallResult, Point = point, Type = type });
+                }).ToArray());
             }
             return pending;
         }
@@ -4243,18 +5382,9 @@ namespace SetterChecker.Core
             return reference;
         }
 
-        // 把同一调用点所有运行时目标对指定存储的效果合并为一次写入。
-        private ReachingWrite<BehaviorValueReference>? ReadStorageCallWrite(
-            ResolvedCall call,
-            BehaviorWriteKind kind,
-            BehaviorMemberReference? member,
-            IReadOnlyList<StorageLocation> locations,
-            BehaviorValueReference unresolvedRead, ReturnedValuePath? returnedPath = null)
+        // 观察既定返回路径时，只保留该次调用真正选中的目标。
+        private static IEnumerable<ResolvedCallTarget> ReadPathTargets(ResolvedCall call, ReturnedValuePath? returnedPath)
         {
-            RequireRuntimeInitialization(call);
-            HashSet<BehaviorValueReference> values = new();
-            bool includesPrevious = false;
-            bool hasEffect = false;
             int? selectedTarget = null;
             for (ReturnedValuePath? path = returnedPath; path != null; path = path.Previous)
             {
@@ -4267,7 +5397,32 @@ namespace SetterChecker.Core
                     selectedTarget = path.InstanceId;
                 }
             }
-            foreach (ResolvedCallTarget target in call.Targets.Where(target => !selectedTarget.HasValue || target.InstanceId == selectedTarget))
+            return call.Targets.Where(target => !selectedTarget.HasValue || target.InstanceId == selectedTarget);
+        }
+
+        // 在已经记录的返回链中找到本实例的真实出口与赋值位置。
+        private static ReturnedValuePath? FindReturnPath(ReturnedValuePath? path, int instanceId)
+        {
+            while (path != null && path.InstanceId != instanceId)
+            {
+                path = path.Previous;
+            }
+            return path;
+        }
+
+        // 把同一调用点所有运行时目标对指定存储的效果合并为一次写入。
+        private ReachingWrite<BehaviorValueReference>? ReadStorageCallWrite(
+            ResolvedCall call,
+            BehaviorWriteKind kind,
+            BehaviorMemberReference? member,
+            IReadOnlyList<StorageLocation> locations,
+            BehaviorValueReference unresolvedRead, ReturnedValuePath? returnedPath = null)
+        {
+            RequireRuntimeInitialization(call);
+            HashSet<BehaviorValueReference> values = new();
+            bool includesPrevious = false;
+            bool hasEffect = false;
+            foreach (ResolvedCallTarget target in ReadPathTargets(call, returnedPath))
             {
                 MethodEntry definition = this.m_definitions[target.MethodId];
                 if (kind == BehaviorWriteKind.Indirect && locations.All(location => location.Definition == "slot")
@@ -4312,7 +5467,7 @@ namespace SetterChecker.Core
                 includesPrevious |= effect.IncludesPrevious;
             }
 
-            return hasEffect
+            return hasEffect && (values.Count != 0 || !includesPrevious)
                 ? new ReachingWrite<BehaviorValueReference>(values.ToArray(), call.Call.Point, !includesPrevious)
                 : null;
         }
@@ -4470,7 +5625,7 @@ namespace SetterChecker.Core
                 .ThenBy(location => location.Receiver?.MethodId, StringComparer.Ordinal)
                 .ThenBy(location => location.Receiver?.ValueId)
                 .ThenBy(location => location.Receiver?.InstanceId)
-                .Select(location => $"{location.Receiver}:{location.Member}:{location.Indices}"));
+                .Select(location => $"{location.InputPath ?? location.Receiver?.ToString()}:{location.Member}:{location.Indices}"));
         }
 
         // 保存确定对象的存储身份；尚未知道对象或下标时保留原始读取等待闭合。
@@ -4499,6 +5654,14 @@ namespace SetterChecker.Core
             }
 
             receivers ??= GetCallOrigins(reference with { ValueId = receiverId });
+            if (expectedReceivers != null)
+            {
+                receivers = receivers.Where(origin => !(origin.Value.Kind == BehaviorValueKind.Constant && origin.Value.Reference == null)).ToArray();
+                if (receivers.Count == 0)
+                {
+                    return Array.Empty<StorageLocation>();
+                }
+            }
             if (receivers.Count == 0)
             {
                 return null;
@@ -4535,47 +5698,37 @@ namespace SetterChecker.Core
                 }
                 return slots.Distinct().ToArray();
             }
-            if (receivers.Any(origin => origin.Value.Kind is not (BehaviorValueKind.NewObject or BehaviorValueKind.NewArray)))
+            if (receivers.Any(origin => origin.Value.Kind is not (BehaviorValueKind.NewObject or BehaviorValueKind.NewArray or BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance or BehaviorValueKind.FieldRead)
+                || origin.Value.IsManagedReferenceSlot))
             {
                 return null;
             }
-            if (expectedReceivers != null && receivers.All(origin => !expectedReceivers.Contains(origin.Reference)))
+            Dictionary<BehaviorValueReference, string> inputPaths = new();
+            foreach (ValueOrigin receiver in receivers.Where(origin => origin.Value.Kind == BehaviorValueKind.FieldRead))
+            {
+                string? path = ReadRootInputPath(receiver);
+                if (path == null)
+                {
+                    return null;
+                }
+                inputPaths.Add(receiver.Reference, path);
+            }
+            BehaviorValueReference?[]? expected = expectedReceivers?.ToArray();
+            if (expected != null && expected.All(item => item == null || item.Value.ValueId >= 0
+                    && !this.m_runtimeValues.ContainsKey(item.Value)
+                    && this.m_methods[item.Value.MethodId].Values[item.Value.ValueId].Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray
+                        or BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance)
+                && receivers.All(origin => origin.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray && !expected.Contains(origin.Reference)))
             {
                 return Array.Empty<StorageLocation>();
             }
 
-            if (new TypeIdentityTemplate(memberId).HasUnspecifiedParameter)
+            foreach (ValueOrigin receiver in receivers.Where(receiver => receiver.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray))
             {
-                throw new AnalysisException($"未指定类型参数参与对象存储身份：{reference.MethodId}，字段 {member!.Name}");
-            }
-
-            foreach (ValueOrigin receiver in receivers.Where(receiver => !this.m_singleAllocations.Contains((receiver.Reference.MethodId, receiver.Value.Point!.Value.BlockId))))
-            {
-                MethodBehavior body = this.m_methods[receiver.Reference.MethodId];
-                int allocationBlock = receiver.Value.Point!.Value.BlockId;
-                ValueFlowGraph graph = ReadValueFlowGraph(body);
-                if (!graph.NodesByBlockId.TryGetValue(allocationBlock, out FlowNode[]? allocations))
+                if (!IsSingleExecutionPoint(receiver.Reference, receiver.Value.Point!.Value))
                 {
-                    throw new AnalysisException($"对象分配位置没有可达控制流：{body.MethodId} @ {allocationBlock}");
+                    throw new AnalysisException($"循环创建对象的存储身份尚未闭合：{receiver.Reference.MethodId}，值 {receiver.Reference.ValueId}");
                 }
-                Queue<FlowNode> pending = new(allocations.SelectMany(node => graph.Predecessors.GetValueOrDefault(node) ?? Array.Empty<FlowNode>()));
-                HashSet<FlowNode> visited = new();
-                while (pending.TryDequeue(out FlowNode node))
-                {
-                    if (node.BlockId == allocationBlock)
-                    {
-                        throw new AnalysisException($"循环创建对象的存储身份尚未闭合：{body.MethodId}，值 {receiver.Reference.ValueId}");
-                    }
-
-                    if (visited.Add(node))
-                    {
-                        foreach (FlowNode predecessor in graph.Predecessors.GetValueOrDefault(node) ?? Array.Empty<FlowNode>())
-                        {
-                            pending.Enqueue(predecessor);
-                        }
-                    }
-                }
-                this.m_singleAllocations.Add((body.MethodId, allocationBlock));
             }
 
             List<string> indexValues = new();
@@ -4591,14 +5744,97 @@ namespace SetterChecker.Core
             }
 
             return receivers.Select(origin => new StorageLocation(origin.Reference, definitionId, memberId,
-                string.Join(",", indexValues), valueType)).Distinct().ToArray();
+                string.Join(",", indexValues), valueType, inputPaths.GetValueOrDefault(origin.Reference))).Distinct().ToArray();
+        }
+
+        // 入口字段路径只由已经倒查后的真实父对象组成，循环快照不冒充稳定身份。
+        private string? ReadRootInputPath(ValueOrigin origin)
+        {
+            List<string> members = new();
+            HashSet<BehaviorValueReference> visited = new();
+            while (origin.Value.Kind == BehaviorValueKind.FieldRead)
+            {
+                if (!visited.Add(origin.Reference) || origin.ReturnPath != null || origin.Value.Member == null || origin.Value.InputValueIds.Count != 1)
+                {
+                    return null;
+                }
+                MethodCallInstance instance = GetInstance(origin.Reference.InstanceId);
+                (TypeEntry type, TypeIdentityTemplate[] arguments) = ReadMemberType(origin.Value.Member, instance);
+                if (!IsSingleExecutionPoint(origin.Reference, origin.Value.Point!.Value))
+                {
+                    return null;
+                }
+                members.Add(type.Id + "<" + string.Join(",", arguments.Select(argument => argument.Text)) + ">::" + origin.Value.Member.Name);
+                IReadOnlyList<ValueOrigin> parents = GetCallOrigins(origin.Reference with { ValueId = origin.Value.InputValueIds[0] });
+                if (parents.Count != 1)
+                {
+                    return null;
+                }
+                origin = parents[0];
+            }
+            return origin.Value.Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance
+                && !origin.Value.IsManagedReferenceSlot && GetInstance(origin.Reference.InstanceId).ParentId == 0
+                ? origin.Reference + "/" + string.Join("/", members.AsEnumerable().Reverse()) : null;
+        }
+
+        // 字段快照和对象分配共用原控制流，确认当前指令不会沿回边重复执行。
+        private bool IsSingleExecutionPoint(BehaviorValueReference reference, BehaviorFlowPoint point)
+        {
+            var key = (reference.MethodId, point.BlockId);
+            if (this.m_singleExecutionPoints.Contains(key))
+            {
+                return true;
+            }
+            ValueFlowGraph graph = ReadValueFlowGraph(this.m_methods[reference.MethodId]);
+            if (!graph.NodesByBlockId.TryGetValue(point.BlockId, out FlowNode[]? starts))
+            {
+                throw new AnalysisException($"对象读取或分配位置没有可达控制流：{reference.MethodId} @ {point.BlockId}");
+            }
+            Queue<FlowNode> pending = new(starts.SelectMany(node => graph.Predecessors.GetValueOrDefault(node) ?? Array.Empty<FlowNode>()));
+            HashSet<FlowNode> visited = new();
+            while (pending.TryDequeue(out FlowNode node))
+            {
+                if (node.BlockId == point.BlockId)
+                {
+                    return false;
+                }
+                if (visited.Add(node))
+                {
+                    foreach (FlowNode predecessor in graph.Predecessors.GetValueOrDefault(node) ?? Array.Empty<FlowNode>())
+                    {
+                        pending.Enqueue(predecessor);
+                    }
+                }
+            }
+            this.m_singleExecutionPoints.Add(key);
+            return true;
         }
 
         // 比较同一字段的实际存储，不能把尚未指定的类型参数猜成互不相等。
-        private static bool StorageLocationsMatch(StorageLocation left, StorageLocation right)
+        private bool StorageLocationsMatch(StorageLocation left, StorageLocation right)
         {
-            if (left.Receiver != right.Receiver || left.Definition != right.Definition || left.Indices != right.Indices)
+            if (left.Definition != right.Definition || left.Indices != right.Indices)
             {
+                return false;
+            }
+            if (left.Receiver != right.Receiver && (left.InputPath == null || left.InputPath != right.InputPath))
+            {
+                if (left.InputPath != null || right.InputPath != null)
+                {
+                    StorageLocation other = left.InputPath != null ? right : left;
+                    if (other.Receiver is BehaviorValueReference allocated
+                        && this.m_methods[allocated.MethodId].Values[allocated.ValueId].Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray)
+                    {
+                        return false;
+                    }
+                    throw new AnalysisException("根对象字段路径之间的别名关系尚未闭合");
+                }
+                if (left.Definition != "slot" && left.Receiver is BehaviorValueReference first && right.Receiver is BehaviorValueReference second
+                    && this.m_methods[first.MethodId].Values[first.ValueId].Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance
+                    && this.m_methods[second.MethodId].Values[second.ValueId].Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance)
+                {
+                    throw new AnalysisException("两个根参数是否指向同一对象尚未闭合");
+                }
                 return false;
             }
             if (left.Member == right.Member)
@@ -4613,7 +5849,10 @@ namespace SetterChecker.Core
             return false;
         }
 
-        private readonly record struct StorageLocation(BehaviorValueReference? Receiver, string Definition, string Member, string Indices, string? ValueType = null);
+        internal readonly record struct StorageLocation(BehaviorValueReference? Receiver, string Definition, string Member, string Indices, string? ValueType = null, string? InputPath = null);
+
+        private sealed record StoredObservation(BehaviorValueReference Value, BehaviorValueReference Container, BehaviorFlowPoint Point,
+            BehaviorFlowPoint? ThroughPoint, ReturnedValuePath? Path, BehaviorMemberReference? Member, StorageLocation Location);
 
         private readonly record struct StorageEffect(
             IReadOnlyList<BehaviorValueReference> Values,
@@ -4746,7 +5985,10 @@ namespace SetterChecker.Core
                 }
 
                 ReachingWrite<T>? write = readWrites(current).MaxBy(item => item.Point.Order);
-                trace?.Add(current, write);
+                if (trace != null)
+                {
+                    trace[current] = write;
+                }
                 if (write != null)
                 {
                     foreach (T value in write.Values)
@@ -4943,7 +6185,8 @@ namespace SetterChecker.Core
             return new ValueFlowGraph(blocks, orderedPredecessors, nodesByBlockId,
                 method.Assignments.ToLookup(item => item.Point.BlockId), method.Writes.ToLookup(item => item.Point.BlockId),
                 method.Calls.ToLookup(item => item.Point.BlockId), method.Values.Where(value => value.Kind is BehaviorValueKind.FieldRead or BehaviorValueKind.Address
-                    && value.Member != null && value.InputValueIds.Count == 0).ToLookup(value => value.Point!.Value.BlockId));
+                    && value.Member != null && value.InputValueIds.Count == 0).ToLookup(value => value.Point!.Value.BlockId),
+                method.Values.Where(value => value.Kind == BehaviorValueKind.Conversion && value.Reference == "castclass").ToLookup(value => value.Point!.Value.BlockId));
         }
 
         // 同一函数的 finally 展开图供值倒查与分配次数检查共同复用。
@@ -4968,7 +6211,8 @@ namespace SetterChecker.Core
             ILookup<int, BehaviorAssignment> Assignments,
             ILookup<int, BehaviorWrite> Writes,
             ILookup<int, BehaviorCall> Calls,
-            ILookup<int, BehaviorValue> StaticReads)
+            ILookup<int, BehaviorValue> StaticReads,
+            ILookup<int, BehaviorValue> Conversions)
         {
             private ILookup<FlowNode, FlowNode>? m_successors;
 
@@ -4988,6 +6232,12 @@ namespace SetterChecker.Core
     {
         /// <summary>被调函数在本组具体类型实参下的分析环境。</summary>
         public int InstanceId { get; init; }
+
+        /// <summary>本调用点中实际选择此实现的接收类型。</summary>
+        internal IReadOnlyList<TypeIdentityTemplate>? DispatchTypes { get; init; }
+
+        /// <summary>接收类型集合中仍未闭合的证明。</summary>
+        internal string? DispatchFailure { get; init; }
     }
 
     /// <summary>保存一个调用点和它所有合法目标的绑定。</summary>

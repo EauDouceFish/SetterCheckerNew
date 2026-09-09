@@ -31,6 +31,10 @@ namespace SetterChecker.Core
                 .SelectMany(call => call.Targets.Select(target => (Call: call, Target: target))).ToLookup(item => item.Target.InstanceId);
             IReadOnlyDictionary<(int Instance, int Block), string> unsettled = resolution.ValueSources.ReadConditionFailures(instances);
             HashSet<int> unsettledRoots = unsettled.Keys.Select(key => resolution.ValueSources.GetInstance(key.Instance).RootId).ToHashSet();
+            using ValueSourceIndex.IntegerPathProof pathProof = resolution.ValueSources.CreatePathProof();
+            HashSet<string> conditionalMethods = resolution.Behaviors.Methods.Where(ValueSourceIndex.IntegerPathProof.HasPathConditions)
+                .Select(body => body.MethodId).ToHashSet(StringComparer.Ordinal);
+            HashSet<int> pathConditions = instances.Where(instance => conditionalMethods.Contains(instance.MethodId)).Select(instance => instance.RootId).ToHashSet();
 
             // 每处证据沿真实调用边独立传播，保留递归回边及逐参数失败隔离。
             void Propagate(int instanceId, WriteSubject subject, EffectEvidence evidence, BehaviorFlowPoint? point = null)
@@ -48,17 +52,22 @@ namespace SetterChecker.Core
                     if (current.Subject.Failure == null && current.Point.HasValue
                         && !resolution.ValueSources.HasClosedPrefix(current.Instance, current.Point.Value, closedPrefixes, conditionFailures: unsettled))
                     {
-                        current.Subject = new WriteSubject(null, "修改位置之前的调用尚未证明可以正常返回");
+                        current.Subject = new WriteSubject(null, "修改位置之前的调用尚未证明可以正常返回", current.Subject.Witness);
+                    }
+                    if (current.Subject.Failure != null)
+                    {
+                        if (boundaries.TryGetValue(current.Instance, out EffectEvidence? previous)
+                            && previous.MethodPath.Count <= current.Evidence.MethodPath.Count)
+                        {
+                            continue;
+                        }
+                        boundaries[current.Instance] = current.Evidence with { Detail = current.Subject.Failure };
                     }
                     if (current.Instance == rootId)
                     {
                         if (current.Subject.Failure == null)
                         {
                             proofs.Add(rootId, current.Evidence);
-                        }
-                        else if (!boundaries.TryGetValue(rootId, out EffectEvidence? previous) || current.Evidence.MethodPath.Count < previous.MethodPath.Count)
-                        {
-                            boundaries[rootId] = current.Evidence with { Detail = current.Subject.Failure };
                         }
                         continue;
                     }
@@ -71,7 +80,8 @@ namespace SetterChecker.Core
                             IEnumerable<BehaviorValueReference> arguments = reference.InstanceId == current.Instance
                                 ? value.Kind == BehaviorValueKind.Parameter ? item.Target.Arguments[value.ParameterIndex!.Value] : item.Target.Receiver
                                 : new[] { reference };
-                            mapped = arguments.SelectMany(argument => ReadWriteSubjects(catalog, resolution, argument, item.Call.CallerInstanceId));
+                            mapped = arguments.SelectMany(argument => ReadWriteSubjects(catalog, resolution, argument, rootId,
+                                pathProof, current.Subject.Witness, pathConditions.Contains(rootId)));
                         }
                         foreach (WriteSubject mappedSubject in mapped)
                         {
@@ -116,12 +126,44 @@ namespace SetterChecker.Core
                          .TakeWhile(_ => !proofs.ContainsKey(instance.RootId)))
                 {
                     EffectEvidence evidence = new(new[] { instance.MethodId }, write.Position, write.Member?.Name ?? write.Kind.ToString());
-                    foreach (WriteSubject subject in write.ReceiverValueId == null ? new[] { new WriteSubject(null) }
-                                 : ReadWriteSubjects(catalog, resolution, new BehaviorValueReference(instance.MethodId, write.ReceiverValueId.Value, instance.Id), instance.Id))
+                    foreach (WriteSubject subject in write.ReceiverValueId == null ? ReadStaticWriteSubjects(instance, write)
+                                 : ReadWriteSubjects(catalog, resolution, new BehaviorValueReference(instance.MethodId, write.ReceiverValueId.Value, instance.Id), instance.RootId,
+                                     pathProof, (new BehaviorValueReference(instance.MethodId, write.ReceiverValueId.Value, instance.Id), write.Point), pathConditions.Contains(instance.RootId)))
                     {
                         Propagate(instance.Id, subject, evidence, write.Point);
                     }
                 }
+            }
+
+            // 静态写入没有接收对象，但仍必须满足写入之前的引用及转换条件。
+            IEnumerable<WriteSubject> ReadStaticWriteSubjects(MethodCallInstance instance, BehaviorWrite write)
+            {
+                if (pathConditions.Contains(instance.RootId))
+                {
+                    string? failure = null;
+                    try
+                    {
+                        var selected = pathProof.ReadSelectedOriginsAtPoint(instance.RootId, Array.Empty<ValueOrigin>(), instance.Id, write.Point, null);
+                        if (!selected.Possible)
+                        {
+                            if (selected.Complete)
+                            {
+                                yield break;
+                            }
+                            failure = "单次经过循环未取得静态写入见证，不能据此排除其它迭代";
+                        }
+                    }
+                    catch (AnalysisException exception)
+                    {
+                        failure = exception.Message;
+                    }
+                    if (failure != null)
+                    {
+                        yield return new WriteSubject(null, failure);
+                        yield break;
+                    }
+                }
+                yield return new WriteSubject(null);
             }
 
             HashSet<string?> businessAssemblies = roots.Select(method => method.AssemblyPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -155,16 +197,28 @@ namespace SetterChecker.Core
                             continue;
                         }
                         BehaviorValueReference reference = site.Reference;
-                        Queue<BehaviorValueReference> returnedObjects = new(new[] { reference });
-                        HashSet<(BehaviorValueReference, ReturnedValuePath?)> visitedObjects = new();
-                        while (returnedObjects.TryDequeue(out BehaviorValueReference current) && proof == null)
+                        Queue<(BehaviorValueReference Reference, IReadOnlySet<(BehaviorValueReference, ReturnedValuePath?)> Ancestors)> returnedObjects = new();
+                        returnedObjects.Enqueue((reference, new HashSet<(BehaviorValueReference, ReturnedValuePath?)>()));
+                        while (returnedObjects.TryDequeue(out var observation) && proof == null)
                         {
+                            BehaviorValueReference current = observation.Reference;
                             try
                             {
-                                foreach (ValueOrigin origin in resolution.ValueSources.GetCallOrigins(current)
+                                IReadOnlyList<ValueOrigin> returnedOrigins = resolution.ValueSources.GetCallOrigins(current);
+                                if (pathConditions.Contains(instanceId) && returnedOrigins.Any(origin => origin.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray))
+                                {
+                                    var selected = pathProof.ReadSelectedOriginsAtPoint(instanceId, returnedOrigins, instanceId, returned.Point, current, site.Point, normalReturn: true);
+                                    if (!selected.Complete)
+                                    {
+                                        boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Position, "单次经过循环不能排除其它迭代返回新对象"));
+                                    }
+                                    returnedOrigins = selected.Origins;
+                                }
+                                foreach (ValueOrigin origin in returnedOrigins
                                              .OrderBy(origin => origin.Value.Kind == BehaviorValueKind.NewObject ? 0 : 1))
                                 {
-                                    if (!visitedObjects.Add((origin.Reference, origin.ReturnPath)))
+                                    // 同一返回位置的祖先对象已在更宽条件下读取；兄弟槽的不同观察不能合并。
+                                    if (observation.Ancestors.Contains((origin.Reference, origin.ReturnPath)))
                                     {
                                         continue;
                                     }
@@ -177,10 +231,15 @@ namespace SetterChecker.Core
                                     }
                                     else if (origin.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray)
                                     {
-                                        foreach (BehaviorValueReference member in resolution.ValueSources.ReadContainerValues(current, origin, returned.Point,
-                                            failure => boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Position, failure)), site.Point))
+                                        HashSet<(BehaviorValueReference, ReturnedValuePath?)> ancestors = new(observation.Ancestors)
                                         {
-                                            returnedObjects.Enqueue(member);
+                                            (origin.Reference, origin.ReturnPath),
+                                        };
+                                        foreach (BehaviorValueReference member in resolution.ValueSources.ReadContainerValues(current, origin, returned.Point,
+                                            failure => boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Position, failure)), site.Point,
+                                            pathConditions.Contains(instanceId) ? pathProof : null))
+                                        {
+                                            returnedObjects.Enqueue((member, ancestors));
                                         }
                                     }
                                     else if (origin.Value.Kind == BehaviorValueKind.CallResult)
@@ -214,10 +273,13 @@ namespace SetterChecker.Core
 
         // 将写入目标还原为当前函数的参数、接收对象或静态存储。
         private static IEnumerable<WriteSubject> ReadWriteSubjects(
-            MethodCatalogResult catalog, CallTargetResolutionResult resolution, BehaviorValueReference reference, int instanceId)
+            MethodCatalogResult catalog, CallTargetResolutionResult resolution, BehaviorValueReference reference, int instanceId,
+            ValueSourceIndex.IntegerPathProof pathProof, (BehaviorValueReference Receiver, BehaviorFlowPoint Point)? witness, bool hasPathConditions)
         {
             Queue<BehaviorValueReference> pending = new(new[] { reference });
             HashSet<BehaviorValueReference> visited = new();
+            bool complete = true;
+            bool publishedSubject = false;
             while (pending.TryDequeue(out BehaviorValueReference current))
             {
                 if (!visited.Add(current))
@@ -229,14 +291,26 @@ namespace SetterChecker.Core
                 try
                 {
                     origins = resolution.ValueSources.GetRelativeOrigins(current, instanceId, retainTypeChecks: true);
+                    if (witness.HasValue && (hasPathConditions && origins.Any(origin => origin.Value.Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance
+                            && !origin.Value.IsManagedReferenceSlot)
+                        || origins.Any(origin => origin.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray or BehaviorValueKind.Local or BehaviorValueKind.Constant)
+                            && origins.Any(origin => origin.Value.Kind is not (BehaviorValueKind.NewObject or BehaviorValueKind.NewArray or BehaviorValueKind.Local or BehaviorValueKind.Constant))))
+                    {
+                        var selected = pathProof.ReadSelectedOriginsAtPoint(instanceId, origins,
+                            witness.Value.Receiver.InstanceId, witness.Value.Point, witness.Value.Receiver);
+                        origins = selected.Origins;
+                        complete &= selected.Complete;
+                    }
                 }
                 catch (AnalysisException exception)
                 {
+                    origins = null;
                     failure = exception.Message;
                 }
                 if (origins == null)
                 {
-                    yield return new WriteSubject(current, failure);
+                    publishedSubject = true;
+                    yield return new WriteSubject(current, failure, witness);
                     continue;
                 }
                 foreach (ValueOrigin origin in origins)
@@ -245,11 +319,13 @@ namespace SetterChecker.Core
                     {
                         case BehaviorValueKind.CurrentInstance:
                         case BehaviorValueKind.Parameter:
-                            yield return new WriteSubject(origin.Reference);
+                            publishedSubject = true;
+                            yield return new WriteSubject(origin.Reference, Witness: witness);
                             break;
                         case BehaviorValueKind.FieldRead when origin.Value.InputValueIds.Count == 0:
                         case BehaviorValueKind.Address when origin.Value.Member != null && origin.Value.InputValueIds.Count == 0:
-                            yield return new WriteSubject(null);
+                            publishedSubject = true;
+                            yield return new WriteSubject(null, Witness: witness);
                             break;
                         case BehaviorValueKind.Address when origin.Value.Reference?.StartsWith("argument:", StringComparison.Ordinal) == true
                             || origin.Value.Reference?.StartsWith("local:", StringComparison.Ordinal) == true:
@@ -272,14 +348,20 @@ namespace SetterChecker.Core
                         case BehaviorValueKind.Constant:
                             break;
                         default:
-                            yield return new WriteSubject(origin.Reference, "被写对象来源尚未闭合");
+                            publishedSubject = true;
+                            yield return new WriteSubject(origin.Reference, "被写对象来源尚未闭合", witness);
                             break;
                     }
                 }
             }
+            if (!complete && !publishedSubject)
+            {
+                yield return new WriteSubject(reference, "单次经过循环未取得旧对象写入见证，不能据此排除其它迭代", witness);
+            }
         }
 
-        private readonly record struct WriteSubject(BehaviorValueReference? Reference, string? Failure = null);
+        private readonly record struct WriteSubject(BehaviorValueReference? Reference, string? Failure = null,
+            (BehaviorValueReference Receiver, BehaviorFlowPoint Point)? Witness = null);
     }
 
     /// <summary>函数自身的真实行为，与日志豁免无关。</summary>

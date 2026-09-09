@@ -225,11 +225,8 @@ namespace SetterChecker.Core
                     {
                         type = ((Cecil.TypeSpecification)type).ElementType;
                     }
-                    if (type.IsByReference)
-                    {
-                        int slot = GetLocalValueId(variable.Index);
-                        this.m_values[slot] = this.m_values[slot] with { IsManagedReferenceSlot = true };
-                    }
+                    int slot = GetLocalValueId(variable.Index);
+                    this.m_values[slot] = this.m_values[slot] with { IsManagedReferenceSlot = type.IsByReference, Type = ReadTypeReference(type) };
                 }
 
                 if (instructions.Length == 0)

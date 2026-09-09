@@ -470,6 +470,33 @@ namespace SetterChecker.Core.Tests
                 run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
         }
 
+        // 写入条件必须和这次真正选中的对象同时成立。
+        /// <summary>新对象分支不能借另一条分支的旧对象作为修改证据。</summary>
+        [TestMethod]
+        [DataRow("var target = flag ? new Data() : old; if (flag) target.Value = 1;", false)]
+        [DataRow("var target = old; if (flag) target = new Data(); if (flag) target.Value = 1;", false)]
+        [DataRow("var target = flag ? old : new Data(); if (!flag) target.Value = 1;", false)]
+        [DataRow("var target = flag ? new Data() : old; if (!flag) target.Value = 1;", true)]
+        [DataRow("var target = flag ? new Data() : old; target.Value = 1;", true)]
+        [DataRow("var target = flag ? new Data() : old; Write(target, flag);", false)]
+        [DataRow("var target = flag ? new Data() : old; Pick(target, new Data(), flag);", false)]
+        [DataRow("var target = flag ? old : new Data(); Pick(target, new Data(), flag);", true)]
+        public async Task RunRequiresSameObjectAndWritePath(string body, bool setter)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("public sealed class Data { public int Value; } public static class Calls { private static void Write(Data target, bool flag) { if (flag) target.Value = 1; } private static void Pick(Data a, Data b, bool flag) { (flag ? a : b).Value = 1; } public static void Entry(bool flag, Data old) { " + body + " } }");
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2), reportProgress: current =>
+            {
+                if (!setter)
+                {
+                    Assert.AreNotEqual(MethodEffectKind.Setter, current.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+                }
+            });
+            Assert.IsTrue(run.Complete);
+            Assert.AreEqual(setter ? MethodEffectKind.Setter : MethodEffectKind.Getter,
+                run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+        }
+
         // 提前放弃整数求值不能遗漏另一个来源中的原生调用失败。
         /// <summary>交换未知整数来源后，只有条件前已发生的写入可以独立证明。</summary>
         [TestMethod]
@@ -501,6 +528,25 @@ namespace SetterChecker.Core.Tests
             Assert.AreEqual(writesFirst ? MethodEffectKind.Setter : (MethodEffectKind?)null,
                 run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
             Assert.AreEqual(MethodEffectKind.Getter, run.Annotations.Methods.Single(method => method.Name == "Independent").Actual);
+        }
+
+        // 条件函数的返回值仍使用实际参数，不把两个调用的真假自由组合。
+        /// <summary>返回分支与外层条件矛盾时不能形成修改证据。</summary>
+        [TestMethod]
+        [DataRow("if (x <= 0 && Positive(x)) state = 1;", false)]
+        [DataRow("if (x > 0 && Positive(x)) state = 1;", true)]
+        [DataRow("if (x <= 0 && Select(x) > 0) state = 1;", false)]
+        [DataRow("if (x > 0 && Select(x) > 0) state = 1;", true)]
+        [DataRow("if (x <= 0 && Require(x) == 1) state = 1;", false)]
+        [DataRow("if (x > 0 && Require(x) == 1) state = 1;", true)]
+        public async Task RunPreservesConditionsAcrossReturnedValues(string body, bool setter)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("public static class Calls { private static int state; private static bool Positive(int x) => x > 0; private static int Select(int x) { if (x > 0) return x; return 0; } private static int Require(int x) { if (x > 0) return 1; throw null; } public static void Entry(int x) { " + body + " } }");
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            Assert.IsTrue(run.Complete);
+            Assert.AreEqual(setter ? MethodEffectKind.Setter : MethodEffectKind.Getter,
+                run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
         }
 
         // 已排除的调用不阻挡存储证明，可达的未知调用和实际写回仍需保留。
@@ -568,6 +614,99 @@ namespace SetterChecker.Core.Tests
             JsonElement[] pending = json.RootElement.GetProperty("Pending").EnumerateArray().ToArray();
             Assert.IsTrue(pending.Any(item => item.GetProperty("Count").GetInt32() > 1));
             Assert.AreEqual(run.Calls!.PendingCalls.Count, pending.Sum(item => item.GetProperty("Count").GetInt32()));
+        }
+
+        // 循环中的一条修改见证不能反过来充当全部迭代无修改的证明。
+        /// <summary>首轮已有明确旧对象写入可证明；首轮只有临时对象时不能漏掉后续旧对象。</summary>
+        [TestMethod]
+        [DataRow(true)]
+        [DataRow(false)]
+        public async Task RunDistinguishesLoopWriteWitnessFromCompleteCoverage(bool firstWrites)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                public sealed class Data { public int Value; }
+                public static class Calls
+                {
+                    public static void Entry(Data old)
+                    {
+                        var target = INITIAL;
+                        for (int i = 0; i < 2; i++)
+                        {
+                            if (i == 1) target = LATER;
+                            target.Value = 1;
+                        }
+                    }
+                }
+                """.Replace("INITIAL", firstWrites ? "old" : "new Data()")
+                .Replace("LATER", firstWrites ? "new Data()" : "old"));
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            AnnotationMethod entry = run.Annotations.Methods.Single(method => method.Name == "Entry");
+            if (firstWrites)
+            {
+                Assert.AreEqual(MethodEffectKind.Setter, entry.Actual);
+            }
+            else
+            {
+                Assert.AreNotEqual(MethodEffectKind.Getter, entry.Actual);
+                Assert.IsFalse(run.Complete);
+                Assert.IsNull(entry.Decision);
+            }
+        }
+
+        // 首轮的装箱副本不是旧对象写入，不能据此漏掉后续修改已有装箱对象的迭代。
+        /// <summary>有限循环见证的完整性检查遵从真实写入归属，不能只列几种临时对象类别。</summary>
+        [TestMethod]
+        public async Task RunKeepsLaterBoxedObjectWriteUnproved()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                public interface I { void Mutate(); }
+                public struct Item : I { private int value; public void Mutate() { value = 1; } }
+                public static class Calls
+                {
+                    public static void Entry(I old)
+                    {
+                        I target = new Item();
+                        for (int i = 0; i < 2; i++)
+                        {
+                            if (i == 1) target = old;
+                            if (old != null) target.Mutate();
+                        }
+                    }
+                }
+                """);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            Assert.AreNotEqual(MethodEffectKind.Getter, run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+        }
+
+        // 重复的未确定调用只影响最短失败过程，不得遮住已经发生的独立写入。
+        /// <summary>较短失败后到时替换旧路径，相同层的重复失败不改变报告结论。</summary>
+        [TestMethod]
+        [DataRow(1)]
+        [DataRow(4)]
+        public async Task RunKeepsShortestRepeatedFailureAndIndependentWrite(int jobs)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                public static class Calls
+                {
+                    private static int state;
+                    [System.Runtime.InteropServices.DllImport("missing_native")] private static extern System.Action Native();
+                    public static void Entry() { Deep(); Direct(); }
+                    public static void Writer() { state = 1; Deep(); }
+                    private static void Deep() => Middle();
+                    private static void Middle() => Direct();
+                    private static void Direct() { CALLS }
+                }
+                """.Replace("CALLS", string.Join(" ", Enumerable.Repeat("Native()();", 80))));
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, jobs));
+            AnnotationMethod entry = run.Annotations.Methods.Single(method => method.Name == "Entry");
+            Assert.IsNull(entry.Actual);
+            Assert.HasCount(2, entry.Evidence!.MethodPath);
+            CollectionAssert.AreEqual(new[] { "Entry", "Direct" }, entry.Evidence.MethodPath
+                .Select(id => run.Calls!.Methods.Single(method => method.Id == id).Name).ToArray());
+            Assert.AreEqual(MethodEffectKind.Setter, run.Annotations.Methods.Single(method => method.Name == "Writer").Actual);
         }
 
         // 运行中的报告只发布已证明事实，随后正常生成最终报告。

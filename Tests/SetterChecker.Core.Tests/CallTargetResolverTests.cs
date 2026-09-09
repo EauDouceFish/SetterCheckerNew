@@ -6,6 +6,24 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class CallTargetResolverTests
     {
+        // 一个入口继续发现子调用时，没有新事实的另一个入口无需重复检查执行条件。
+        /// <summary>只缩小本轮重算范围，完整调用和最终行为仍保持一致。</summary>
+        [TestMethod]
+        public async Task ResolveAsyncRechecksOnlyChangedRoots()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("public static class Calls { private static int state; public static void Entry() => A(); public static void Quiet() { } private static void A() => B(); private static void B() => C(); private static void C() { state = 1; } }");
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Methods.Where(method => method.Name is "Entry" or "Quiet").ToArray();
+            List<string> progress = new();
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2, progress: progress.Add);
+            Assert.Contains("本轮重新检查 1 个入口的执行条件。", progress);
+            EffectAnalysisResult effects = new EffectAnalyzer().Analyze(catalog, roots, calls);
+            Assert.AreEqual(MethodEffectKind.Setter, effects.Methods.Single(method => method.MethodId == roots.Single(root => root.Name == "Entry").Id).Kind);
+            Assert.AreEqual(MethodEffectKind.Getter, effects.Methods.Single(method => method.MethodId == roots.Single(root => root.Name == "Quiet").Id).Kind);
+        }
+
         // 两个字段可以占用同一块内存，不能按字段名把另一个字段的写入当作无关。
         /// <summary>未实现重叠字段关系时明确指出缺口，绝不把默认空值当成没有 Setter。</summary>
         [TestMethod]
@@ -545,7 +563,7 @@ namespace SetterChecker.Core.Tests
                 "已读取 2 个函数体，已连接 0 个调用，待处理 8 个调用。",
                 "已读取 4 个函数体，已连接 2 个调用，待处理 6 个调用。",
                 "已读取 10 个函数体，已连接 8 个调用，待处理 0 个调用。",
-            }, batches);
+            }, batches.Where(message => message.StartsWith("已读取", StringComparison.Ordinal)).ToArray());
             Assert.IsEmpty(result.PendingCalls);
             foreach (MethodEntry root in roots)
             {
@@ -2271,7 +2289,6 @@ namespace SetterChecker.Core.Tests
         [DataRow("Reallocated", "循环创建对象的存储身份尚未闭合")]
         [DataRow("ReallocatedFinally", "循环创建对象的存储身份尚未闭合")]
         [DataRow("Static", "调用目标来源尚未闭合")]
-        [DataRow("PossibleAlias", "调用目标来源尚未闭合")]
         public async Task ResolveAsyncRejectsUnclosedStoredCallbackRelations(string name, string message)
         {
             using TestProject project = TestProject.CreateWithCallTargets("""
@@ -2331,14 +2348,6 @@ namespace SetterChecker.Core.Tests
                     {
                         Holder holder = new Holder(); holder.Callback = StaticTarget; holder.Callback();
                     }
-                    // 写入对象包含尚未查清的参数时不能忽略这次写入。
-                    public void PossibleAlias(bool condition, Holder external)
-                    {
-                        Holder first = new Holder(); first.Callback = Old;
-                        Holder target = condition ? first : external;
-                        target.Callback = Current;
-                        first.Callback();
-                    }
                     // 提供三个彼此不同的绑定目标。
                     public void Old() { }
                     public void Current() { }
@@ -2355,6 +2364,87 @@ namespace SetterChecker.Core.Tests
                 new CallTargetResolver().ResolveAsync(material, catalog, roots, 2));
 
             StringAssert.Contains(exception.Message, message);
+        }
+
+        // 新对象与入口参数必不相同，两个入口参数则可能指向同一对象。
+        /// <summary>按真实对象身份处理字段弱写，不通过参数名称排除别名。</summary>
+        [TestMethod]
+        [DataRow(true)]
+        [DataRow(false)]
+        public async Task ResolveAsyncDistinguishesNewObjectFromPossibleRootAliases(bool allocate)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                using System;
+                namespace Samples;
+                public sealed class Holder { public Action Callback; }
+                public sealed class Calls
+                {
+                    public void Entry(bool condition, Holder input, Holder external)
+                    {
+                        Holder first = INITIAL;
+                        first.Callback = Old;
+                        Holder target = TARGET;
+                        target.Callback = Current;
+                        first.Callback();
+                    }
+                    public void Old() { }
+                    public void Current() { }
+                    public void Other() { }
+                }
+                """.Replace("INITIAL", allocate ? "new Holder()" : "input")
+                .Replace("TARGET", allocate ? "condition ? first : external" : "external"));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            if (!allocate)
+            {
+                AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() => new CallTargetResolver().ResolveAsync(material, catalog, roots, 2));
+                StringAssert.Contains(exception.Message, "两个根参数是否指向同一对象尚未闭合");
+                return;
+            }
+            CallTargetResolutionResult result = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEntry root in roots)
+            {
+                MethodEntry[] targets = result.Calls.Where(call => call.CallerMethodId == root.Id && call.Call.Kind == BehaviorCallKind.Delegate)
+                    .SelectMany(call => call.Targets).Select(target => result.Methods.Single(method => method.Id == target.MethodId)).ToArray();
+                CollectionAssert.AreEquivalent(new[] { "Old", "Current" }, targets.Select(method => method.Name).ToArray());
+                Assert.IsTrue(targets.All(method => method.TypeId == root.TypeId));
+            }
+        }
+
+        // 根字段路径先应用真实写入，既不能沿用被替换初值，也不能假设不同路径不别名。
+        /// <summary>通过具体委托目标检验字段输入身份与读取快照，不借先前写入掩盖错误。</summary>
+        [TestMethod]
+        [DataRow("var fresh = new Holder(); old.Left = fresh; fresh.Callback = Current; old.Left.Callback();", "Current")]
+        [DataRow("old.Left.Callback = Old; old.Right.Callback = Current; old.Left.Callback();", null)]
+        [DataRow("var snapshot = old.Left; old.Left = new Holder(); old.Left.Callback = Current; snapshot.Callback = Old; snapshot.Callback();", "Old")]
+        [DataRow("old.Left.Callback = Current; old.Left.Callback();", "Current")]
+        public async Task ResolveAsyncPreservesRootFieldInputsAndSnapshots(string body, string? expected)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                using System;
+                namespace Samples;
+                public sealed class Holder { public Holder Left; public Holder Right; public Action Callback; }
+                public sealed class Calls
+                {
+                    public void Entry(Holder old) { BODY }
+                    public void Old() { }
+                    public void Current() { }
+                }
+                """.Replace("BODY", body));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            if (expected == null)
+            {
+                AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() => new CallTargetResolver().ResolveAsync(material, catalog, roots, 2));
+                StringAssert.Contains(exception.Message, "根对象字段路径之间的别名关系尚未闭合");
+                return;
+            }
+            CallTargetResolutionResult result = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            ResolvedCallTarget[] targets = result.Calls.Where(call => call.Call.Kind == BehaviorCallKind.Delegate).SelectMany(call => call.Targets).ToArray();
+            Assert.HasCount(2, targets);
+            Assert.IsTrue(targets.All(target => result.Methods.Single(method => method.Id == target.MethodId).Name == expected));
         }
 
         // 循环字段回指同一对象时，稳定后的委托来源仍只有实际保存的函数。

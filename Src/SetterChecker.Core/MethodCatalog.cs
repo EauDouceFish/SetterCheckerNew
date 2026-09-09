@@ -1111,7 +1111,14 @@ namespace SetterChecker.Core
     /// <summary>保存一个函数声明及其实际声明类型参数。</summary>
     internal sealed record ResolvedMethodDefinition(
         MethodEntry Method,
-        IReadOnlyList<TypeIdentityTemplate> DeclaringTypeArguments);
+        IReadOnlyList<TypeIdentityTemplate> DeclaringTypeArguments)
+    {
+        /// <summary>虚调用中实际选择此实现的接收类型，直接调用不需要此限制。</summary>
+        internal IReadOnlyList<TypeIdentityTemplate>? DispatchTypes { get; init; }
+
+        /// <summary>无法完整表达的接收类型不能缩成空集合。</summary>
+        internal string? DispatchFailure { get; init; }
+    }
 
     /// <summary>表示函数在源码或托管文件中的种类。</summary>
     public enum CatalogMethodKind
@@ -1283,6 +1290,8 @@ namespace SetterChecker.Core
         private readonly object m_loadedTypeLock = new();
         private readonly Dictionary<bool, int> m_dispatchGenerations = new();
         private int m_typeGeneration;
+        private int m_semanticGeneration;
+
         private TypeEntry[] m_types;
         private IReadOnlyDictionary<string, TypeEntry> m_typesById;
         private IReadOnlyDictionary<string, TypeEntry> m_typesByManagedLocation;
@@ -1382,6 +1391,9 @@ namespace SetterChecker.Core
 
         /// <summary>启动时建立的全部源码函数。</summary>
         public IReadOnlyList<MethodEntry> Methods { get; }
+
+        /// <summary>类型或转交别名新增时，使依赖这些事实的本次路径检查重新执行。</summary>
+        internal int SemanticGeneration => this.m_semanticGeneration;
 
         /// <summary>全部源码和托管类型。</summary>
         public IReadOnlyList<TypeEntry> Types
@@ -1821,6 +1833,7 @@ namespace SetterChecker.Core
                 this.m_derivedTypesByBaseId = null;
                 this.m_implementingTypesByInterfaceId = null;
                 this.m_typeGeneration++;
+                this.m_semanticGeneration++;
 
                 this.m_loadedPartsByPath.Add(path, part);
                 return part.Types.Select(type => this.m_typesByManagedLocation[
@@ -2306,6 +2319,10 @@ namespace SetterChecker.Core
                     new HashSet<MethodCatalog.ForwardedTypeKey>(), loadMissing && referringAssemblyPath != null);
                 foreach (var item in resolved.Where(item => item.Value != null))
                 {
+                    if (!this.m_forwardedTargets.ContainsKey(item.Key) && item.Key.TypeId != item.Value!.LogicalId)
+                    {
+                        this.m_semanticGeneration++;
+                    }
                     this.m_forwardedTargets[item.Key] = item.Value!;
                     this.m_logicalAliasesChanged |= item.Key.TypeId != item.Value!.LogicalId;
                 }
