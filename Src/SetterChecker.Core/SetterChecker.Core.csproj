@@ -2,5 +2,6 @@
     <ItemGroup>
         <PackageReference Include="Microsoft.CodeAnalysis.CSharp" />
         <PackageReference Include="Mono.Cecil" />
+        <PackageReference Include="Microsoft.Z3" />
     </ItemGroup>
 </Project>

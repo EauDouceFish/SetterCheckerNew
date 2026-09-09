@@ -260,13 +260,13 @@ namespace SetterChecker.Core.Tests
         [TestMethod]
         public void CoreSourceStaysWithinLineLimit()
         {
-            DirectoryInfo? repository = new(AppContext.BaseDirectory);
+            DirectoryInfo? repository = ReadTestSourceDirectory();
             while (repository != null && !File.Exists(Path.Combine(repository.FullName, "SetterChecker.slnx")))
             {
                 repository = repository.Parent;
             }
 
-            Assert.IsNotNull(repository, "无法从测试输出定位当前解决方案。");
+            Assert.IsNotNull(repository, "无法从编译时的测试源码位置定位当前解决方案。");
             string corePath = Path.Combine(repository.FullName, "Src", "SetterChecker.Core");
             var files = Directory.EnumerateFiles(corePath, "*.cs", SearchOption.AllDirectories)
                 .Where(path => !Path.GetRelativePath(corePath, path)
@@ -278,6 +278,12 @@ namespace SetterChecker.Core.Tests
             Assert.IsTrue(files.Sum(file => file.Lines) <= 13_000,
                 $"Core 实际 {files.Sum(file => file.Lines)} 行，超过 13000 行；"
                 + string.Join("，", files.Select(file => $"{file.Name}: {file.Lines}")));
+        }
+
+        // 使用本次编译的源码位置定位仓库，测试产物可以输出到仓库外。
+        private static DirectoryInfo ReadTestSourceDirectory([System.Runtime.CompilerServices.CallerFilePath] string sourcePath = "")
+        {
+            return new DirectoryInfo(Path.GetDirectoryName(sourcePath)!);
         }
 
         // 检查最小 Unity 工程能够得到完整且区分清楚的材料。

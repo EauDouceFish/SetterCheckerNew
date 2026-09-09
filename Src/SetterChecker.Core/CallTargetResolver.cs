@@ -152,7 +152,7 @@ namespace SetterChecker.Core
                     }
                     IReadOnlyList<(ResolvedMethodDefinition Definition, ResolvedCallTarget Binding)>? targets;
                     bool coversDeclaredReceivers = false;
-                    bool runtimeOperation = false;
+                    bool completesWithoutTarget = false;
                     List<MethodCallInstance?> recursiveInstances = new();
                     try
                     {
@@ -191,8 +191,8 @@ namespace SetterChecker.Core
                                 {
                                     new BehaviorValueReference(behavior.MethodId, argument.ValueId, InstanceId: instance.Id),
                                 }).ToArray();
-                        runtimeOperation = TryResolveReflectionCall(catalog, sources, behavior, instance, call,
-                            definition, receiver, arguments, out targets);
+                        bool runtimeOperation = TryResolveReflectionCall(catalog, sources, behavior, instance, call,
+                            definition, receiver, arguments, out targets, out completesWithoutTarget);
                         if (runtimeOperation)
                         {
                             // 运行时查找产生值事实，反射执行仍产生普通目标和实参绑定。
@@ -273,7 +273,7 @@ namespace SetterChecker.Core
                         }
                     }
                     ResolvedCall resolved = new(behavior.MethodId, call, bindings)
-                    { CallerInstanceId = instance.Id, CoversDeclaredReceivers = coversDeclaredReceivers, CompletesWithoutTarget = runtimeOperation && bindings.Count == 0 };
+                    { CallerInstanceId = instance.Id, CoversDeclaredReceivers = coversDeclaredReceivers, CompletesWithoutTarget = completesWithoutTarget };
                     calls.Add(resolved);
                     sources.BindCall(resolved);
                     resolvedCalls.Add((instance.Id, item.Call.Position));
@@ -313,9 +313,11 @@ namespace SetterChecker.Core
             ValueSourceIndex sources,
             MethodBehavior body, MethodCallInstance instance, BehaviorCall call, ResolvedMethodDefinition declaration,
             IReadOnlyList<BehaviorValueReference> receiver, IReadOnlyList<IReadOnlyList<BehaviorValueReference>> arguments,
-            out IReadOnlyList<(ResolvedMethodDefinition Definition, ResolvedCallTarget Binding)>? targets)
+            out IReadOnlyList<(ResolvedMethodDefinition Definition, ResolvedCallTarget Binding)>? targets,
+            out bool completesWithoutTarget)
         {
             targets = null;
+            completesWithoutTarget = false;
             TypeEntry owner = catalog.TypesById[declaration.Method.TypeId];
             if (owner.FullName is not ("System.Type" or "System.Reflection.MethodBase" or "System.Reflection.MethodInfo"
                 or "System.Reflection.FieldInfo" or "System.Reflection.PropertyInfo")
@@ -331,12 +333,13 @@ namespace SetterChecker.Core
                 {
                     return true;
                 }
-                if (values.Any(value => value.Value.Kind != BehaviorValueKind.Type))
+                if (values.Count == 0 || values.Any(value => value.Value.Kind != BehaviorValueKind.Type))
                 {
                     throw new AnalysisException($"反射类型句柄来源尚未闭合：{body.MethodId} @ {call.Position}");
                 }
                 sources.BindRuntimeValue(resultReference, values);
                 targets = Array.Empty<(ResolvedMethodDefinition, ResolvedCallTarget)>();
+                completesWithoutTarget = true;
                 return true;
             }
             if (owner.FullName == "System.Type" && declaration.Method.Name is "GetMethod" or "GetField" or "GetProperty"
@@ -362,7 +365,7 @@ namespace SetterChecker.Core
                 {
                     return true;
                 }
-                if (types.Any(value => value.Value.Kind != BehaviorValueKind.Type)
+                if (types.Count == 0 || names.Count == 0 || types.Any(value => value.Value.Kind != BehaviorValueKind.Type)
                     || names.Any(value => value.Value.Kind != BehaviorValueKind.Constant || value.Value.Reference == null))
                 {
                     throw new AnalysisException($"反射类型或函数名来源尚未闭合：{body.MethodId} @ {call.Position}");
@@ -464,6 +467,7 @@ namespace SetterChecker.Core
                 }
                 sources.BindRuntimeValue(resultReference, members);
                 targets = Array.Empty<(ResolvedMethodDefinition, ResolvedCallTarget)>();
+                completesWithoutTarget = true;
                 return true;
             }
             if (owner.FullName == "System.Reflection.FieldInfo"
@@ -478,11 +482,13 @@ namespace SetterChecker.Core
                 {
                     return true;
                 }
-                if (members.Any(value => value.Value.Member?.KnownDeclaringTypeId == null))
+                if (members.Count == 0 || members.Any(value => value.Value.Member?.KnownDeclaringTypeId == null))
                 {
                     throw new AnalysisException($"反射字段来源尚未闭合：{body.MethodId} @ {call.Position}");
                 }
                 List<ValueOrigin> reads = new();
+                List<BehaviorWrite> writes = new();
+                int completedMembers = 0;
                 foreach (ValueOrigin member in members)
                 {
                     BehaviorMemberReference reference = member.Value.Member!;
@@ -490,9 +496,13 @@ namespace SetterChecker.Core
                     var field = catalog.GetFields(fieldOwner).Single(field => field.MetadataToken.ToInt32() == reference.ReferenceMetadataToken);
                     if (!field.IsStatic)
                     {
-                        if (objects.All(value => value.Value.Kind == BehaviorValueKind.Constant && value.Value.Reference == null))
+                        if (objects.Count > 0 && objects.All(value => value.Value.Kind == BehaviorValueKind.Constant && value.Value.Reference == null))
                         {
                             continue;
+                        }
+                        if (objects.Any(value => value.Value.Kind == BehaviorValueKind.Constant && value.Value.Reference == null))
+                        {
+                            throw new AnalysisException($"反射字段对象的成功与异常分支尚未闭合：{body.MethodId} @ {call.Position}");
                         }
                         IReadOnlyList<StaticReceiverType> objectTypes = ReadStaticReceiverTypes(catalog, objects, sources);
                         if (objectTypes.Count == 0 || objectTypes.Any(type => type.Definition.Id != fieldOwner.Id
@@ -513,7 +523,7 @@ namespace SetterChecker.Core
                         {
                             throw new AnalysisException($"反射常量或只读字段写入尚未闭合：{field.FullName}");
                         }
-                        sources.AddRuntimeWrite(instance.Id, new BehaviorWrite(BehaviorWriteKind.Field,
+                        writes.Add(new BehaviorWrite(BehaviorWriteKind.Field,
                             field.IsStatic ? null : call.Arguments[0].ValueId, reference, Array.Empty<int>(),
                             call.Arguments[1].ValueId, call.Position)
                         { Point = call.Point });
@@ -528,12 +538,22 @@ namespace SetterChecker.Core
                             ? Array.Empty<int>() : new[] { call.Arguments[0].ValueId }
                         }));
                     }
+                    completedMembers++;
+                }
+                if (completedMembers != 0 && completedMembers != members.Count)
+                {
+                    throw new AnalysisException($"反射字段对象的成功与异常分支尚未闭合：{body.MethodId} @ {call.Position}");
+                }
+                foreach (BehaviorWrite write in writes)
+                {
+                    sources.AddRuntimeWrite(instance.Id, write);
                 }
                 if (arguments.Count == 1)
                 {
                     sources.BindRuntimeValue(resultReference, reads);
                 }
                 targets = Array.Empty<(ResolvedMethodDefinition, ResolvedCallTarget)>();
+                completesWithoutTarget = completedMembers > 0;
                 return true;
             }
             bool propertyCall = owner.FullName == "System.Reflection.PropertyInfo"
@@ -555,7 +575,7 @@ namespace SetterChecker.Core
                         { Method = declaration.Method.Name == "GetValue" ? member.Value.Property?.Getter : member.Value.Property?.Setter }
                     }).ToArray();
                 }
-                if (members.Any(member => member.Value.Kind != BehaviorValueKind.Function || member.Value.Method == null))
+                if (members.Count == 0 || members.Any(member => member.Value.Kind != BehaviorValueKind.Function || member.Value.Method == null))
                 {
                     throw new AnalysisException($"反射调用的函数来源尚未闭合：{body.MethodId} @ {call.Position}");
                 }
@@ -565,7 +585,14 @@ namespace SetterChecker.Core
                 {
                     return true;
                 }
+                if (members.Any(member => member.Value.Method!.HasInstance) && (objects.Count == 0
+                    || objects.Any(value => value.Value.Kind == BehaviorValueKind.Constant && value.Value.Reference == null)
+                        && objects.Any(value => value.Value.Kind != BehaviorValueKind.Constant || value.Value.Reference != null)))
+                {
+                    throw new AnalysisException($"反射调用对象的成功与异常分支尚未闭合：{body.MethodId} @ {call.Position}");
+                }
                 List<(ResolvedMethodDefinition, ResolvedCallTarget)> bindings = new();
+                int resolvedMembers = 0;
                 if (members.Count > 1 && objects.Count > 1
                     && members.Any(member => member.Value.Method!.HasInstance))
                 {
@@ -620,6 +647,7 @@ namespace SetterChecker.Core
                     IReadOnlyList<ResolvedMethodDefinition> candidates = !method.Method.IsStatic
                         ? ResolveVirtualDefinitions(catalog, method, objects, sources, out _)
                         : new[] { method };
+                    resolvedMembers += candidates.Count > 0 ? 1 : 0;
                     foreach (ResolvedMethodDefinition candidate in candidates)
                     {
                         bindings.Add((candidate, new ResolvedCallTarget(candidate.Method.Id, member.Value.Method!,
@@ -627,6 +655,10 @@ namespace SetterChecker.Core
                             suppliedArguments,
                             candidate.DeclaringTypeArguments.Select(type => type.Text).ToArray())));
                     }
+                }
+                if (bindings.Count > 0 && resolvedMembers != members.Count)
+                {
+                    throw new AnalysisException($"反射调用对象的成功与异常分支尚未闭合：{body.MethodId} @ {call.Position}");
                 }
                 targets = bindings;
                 return true;
@@ -2655,15 +2687,19 @@ namespace SetterChecker.Core
         {
             this.m_integerValues.Clear();
             List<(int Instance, HashSet<int> Blocks, HashSet<(int From, int To)> Edges)> changes = new();
+            HashSet<int> reentered = this.m_callsByCallerInstance.Values.SelectMany(calls => calls.Values)
+                .SelectMany(call => call.Targets.Where(target => GetInstance(target.InstanceId).ParentId != call.CallerInstanceId
+                    || GetInstance(target.InstanceId).InvocationPoint != call.Call.Point).Select(target => target.InstanceId)).ToHashSet();
             foreach (IGrouping<string, MethodCallInstance> group in this.Instances.Where(instance => provenSetterRoots?.Contains(instance.RootId) != true)
                          .GroupBy(instance => instance.MethodId))
             {
-                if (!this.m_methods.TryGetValue(group.Key, out MethodBehavior? body) || body.ExceptionHandlers.Count != 0)
+                if (!this.m_methods.TryGetValue(group.Key, out MethodBehavior? body)
+                    || body.BodyKind != MethodBodyKind.Executable || body.ExceptionHandlers.Count != 0)
                 {
                     continue;
                 }
                 BehaviorFlowBlock[] conditionalBlocks = body.Blocks.Where(block => block.ConditionValueId.HasValue).ToArray();
-                Dictionary<int, BehaviorFlowBlock>? blocks = null;
+                IReadOnlyDictionary<int, BehaviorFlowBlock> blocks = ReadValueFlowGraph(body).Blocks;
                 foreach (MethodCallInstance instance in group)
                 {
                     Dictionary<int, bool> conditions = new();
@@ -2686,12 +2722,27 @@ namespace SetterChecker.Core
                             && targetBody.BodyKind == MethodBodyKind.Executable
                             && !targetBody.Returns.Any(result => IsReachable(target.InstanceId, result.Point.BlockId))))
                         .Select(call => call.Call.Point.BlockId).ToHashSet();
-                    if (conditions.Count == 0 && stops.Count == 0)
+                    HashSet<(int From, int To)> impossible = new();
+                    if (conditionalBlocks.Any(block => !conditions.ContainsKey(block.Id) && IsReachable(instance.Id, block.Id)))
+                    {
+                        using IntegerPathProof proof = new(this, reentered);
+                        foreach (BehaviorFlowBlock block in conditionalBlocks.Where(block => !conditions.ContainsKey(block.Id) && IsReachable(instance.Id, block.Id)))
+                        {
+                            foreach (BehaviorFlowEdge edge in block.Successors.Where(edge => edge.TargetBlockId.HasValue))
+                            {
+                                if (proof.IsImpossibleEdge(instance.Id, block, edge.TargetBlockId!.Value))
+                                {
+                                    impossible.Add((block.Id, edge.TargetBlockId.Value));
+                                }
+                            }
+                        }
+                    }
+                    if (conditions.Count == 0 && stops.Count == 0 && impossible.Count == 0)
                     {
                         continue;
                     }
-                    blocks ??= body.Blocks.ToDictionary(block => block.Id);
                     HashSet<(int From, int To)> excluded = new(this.m_excludedEdges.GetValueOrDefault(instance.Id) ?? Enumerable.Empty<(int, int)>());
+                    excluded.UnionWith(impossible);
                     foreach (BehaviorFlowBlock block in body.Blocks)
                     {
                         excluded.UnionWith(block.Successors.Where(edge => edge.TargetBlockId.HasValue && (stops.Contains(block.Id)
@@ -2728,6 +2779,242 @@ namespace SetterChecker.Core
                 this.m_excludedEdges[change.Instance] = change.Edges;
             }
             return changedRoots;
+        }
+
+        // 用现有前驱和参数绑定表达整数条件，只发布完整证明为不可能的边。
+        private sealed class IntegerPathProof : IDisposable
+        {
+            private readonly ValueSourceIndex m_sources;
+            private readonly IReadOnlySet<int> m_reentered;
+            private readonly Microsoft.Z3.Context m_context = new();
+            private readonly Microsoft.Z3.Solver m_solver;
+            private readonly Dictionary<(int Instance, FlowNode Node), Microsoft.Z3.BoolExpr> m_prefixes = new();
+            private readonly HashSet<(int Instance, FlowNode Node)> m_activePrefixes = new();
+            private readonly Dictionary<BehaviorValueReference, Microsoft.Z3.BitVecExpr> m_values = new();
+            private readonly HashSet<BehaviorValueReference> m_activeValues = new();
+            private readonly HashSet<int> m_approvedInstances = new();
+
+            // 每次冻结查询独占公式对象，库内部保持单线程。
+            public IntegerPathProof(ValueSourceIndex sources, IReadOnlySet<int> reentered)
+            {
+                this.m_sources = sources;
+                this.m_reentered = reentered;
+                this.m_solver = this.m_context.MkSolver("QF_BV");
+                using Microsoft.Z3.Params parameters = this.m_context.MkParams();
+                parameters.Add("threads", 1u);
+                this.m_solver.Parameters = parameters;
+            }
+
+            // 不可能证明只用于排除边；有解和未能表达均不能充当修改见证。
+            public bool IsImpossibleEdge(int instanceId, BehaviorFlowBlock block, int target)
+            {
+                try
+                {
+                    MethodBehavior body = this.m_sources.m_methods[this.m_sources.GetInstance(instanceId).MethodId];
+                    Microsoft.Z3.BoolExpr prefix = this.m_context.MkOr(this.m_sources.ReadValueFlowGraph(body).NodesByBlockId[block.Id]
+                        .Select(node => ReadPrefix(instanceId, node)).ToArray());
+                    Microsoft.Z3.BoolExpr formula = (Microsoft.Z3.BoolExpr)this.m_context.MkAnd(prefix, ReadEdge(instanceId, block, target)).Simplify();
+                    if (formula.IsFalse || formula.IsTrue)
+                    {
+                        return formula.IsFalse;
+                    }
+                    this.m_solver.Reset();
+                    this.m_solver.Assert(formula);
+                    return this.m_solver.Check() == Microsoft.Z3.Status.UNSATISFIABLE;
+                }
+                catch (AnalysisException)
+                {
+                    // 缺失关联不能用于排除原始执行边；联合修改见证仍须单独完成。
+                    return false;
+                }
+            }
+
+            // 合并到达同一节点的全部前驱，并联立真实父调用位置的条件。
+            private Microsoft.Z3.BoolExpr ReadPrefix(int instanceId, FlowNode node)
+            {
+                var key = (instanceId, node);
+                if (this.m_prefixes.TryGetValue(key, out Microsoft.Z3.BoolExpr? known))
+                {
+                    return known;
+                }
+                if (!this.m_activePrefixes.Add(key))
+                {
+                    throw new AnalysisException("整数路径的循环次数关联尚未闭合");
+                }
+                try
+                {
+                    MethodCallInstance instance = this.m_sources.GetInstance(instanceId);
+                    MethodBehavior body = this.m_sources.m_methods[instance.MethodId];
+                    if (!this.m_approvedInstances.Contains(instanceId))
+                    {
+                        if (body.ExceptionHandlers.Count != 0 || this.m_reentered.Contains(instanceId))
+                        {
+                            throw new AnalysisException("整数路径的异常或再次调用关联尚未闭合");
+                        }
+                        this.m_approvedInstances.Add(instanceId);
+                    }
+                    ValueFlowGraph graph = this.m_sources.ReadValueFlowGraph(body);
+                    Microsoft.Z3.BoolExpr result;
+                    if (!this.m_sources.IsReachable(instanceId, node.BlockId))
+                    {
+                        result = this.m_context.MkFalse();
+                    }
+                    else if (node.BlockId == -1)
+                    {
+                        if (instance.ParentId == 0)
+                        {
+                            result = this.m_context.MkTrue();
+                        }
+                        else
+                        {
+                            MethodBehavior caller = this.m_sources.m_methods[this.m_sources.GetInstance(instance.ParentId).MethodId];
+                            result = this.m_context.MkOr(this.m_sources.ReadValueFlowGraph(caller).NodesByBlockId[instance.InvocationPoint!.Value.BlockId]
+                                .Select(parent => ReadPrefix(instance.ParentId, parent)).ToArray());
+                        }
+                    }
+                    else
+                    {
+                        result = this.m_context.MkOr((graph.Predecessors.GetValueOrDefault(node) ?? Array.Empty<FlowNode>())
+                            .Where(parent => this.m_sources.m_excludedEdges.GetValueOrDefault(instanceId)?.Contains((parent.BlockId, node.BlockId)) != true)
+                            .Select(parent => this.m_context.MkAnd(ReadPrefix(instanceId, parent), ReadEdge(instanceId, graph.Blocks[parent.BlockId], node.BlockId))).ToArray());
+                    }
+                    this.m_prefixes.Add(key, result);
+                    return result;
+                }
+                finally
+                {
+                    this.m_activePrefixes.Remove(key);
+                }
+            }
+
+            // 按实际跳转方向建立条件，缺失 switch 标签不能视为无条件。
+            private Microsoft.Z3.BoolExpr ReadEdge(int instanceId, BehaviorFlowBlock block, int target)
+            {
+                if (block.Successors.Count <= 1)
+                {
+                    return this.m_context.MkTrue();
+                }
+                if (block.ConditionValueId is not int valueId)
+                {
+                    throw new AnalysisException("整数路径的分支条件尚未读取");
+                }
+                Microsoft.Z3.BitVecExpr value = ReadValue(new(this.m_sources.GetInstance(instanceId).MethodId, valueId, instanceId));
+                Microsoft.Z3.BoolExpr condition = this.m_context.MkNot(this.m_context.MkEq(value, this.m_context.MkBV(0, value.SortSize)));
+                return target == block.JumpTargetBlockId ? condition : this.m_context.MkNot(condition);
+            }
+
+            // 只表达具有唯一真实来源的整数；字段、合流和未知调用不生成自由变量。
+            private Microsoft.Z3.BitVecExpr ReadValue(BehaviorValueReference reference)
+            {
+                if (this.m_values.TryGetValue(reference, out Microsoft.Z3.BitVecExpr? known))
+                {
+                    return known;
+                }
+                if (!this.m_activeValues.Add(reference))
+                {
+                    throw new AnalysisException("整数值的循环赋值尚未闭合");
+                }
+                try
+                {
+                    IReadOnlyList<ValueOrigin> origins = this.m_sources.GetCallOrigins(reference, retainTypeChecks: true);
+                    if (origins.Count != 1 || origins[0].ReturnPath != null)
+                    {
+                        throw new AnalysisException("整数值的分支或返回关联尚未闭合");
+                    }
+                    ValueOrigin origin = origins[0];
+                    Microsoft.Z3.BitVecExpr result;
+                    if (origin.Value.Kind == BehaviorValueKind.Computation)
+                    {
+                        result = ReadOperation(origin);
+                    }
+                    else
+                    {
+                        MethodCallInstance owner = this.m_sources.GetInstance(origin.Reference.InstanceId);
+                        string? type = origin.Value.Kind == BehaviorValueKind.Parameter
+                            ? owner.Substitute(this.m_sources.m_definitions[owner.MethodId].Parameters[origin.Value.ParameterIndex!.Value].TypeIdentity).Text
+                            : origin.Value.Type?.Id;
+                        uint bits = type switch
+                        {
+                            "System.Int32" or "System.UInt32" or "System.Boolean" or "System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16" or "System.Char" => 32,
+                            "System.Int64" or "System.UInt64" => 64,
+                            _ => throw new AnalysisException("整数值的实际类型尚未闭合"),
+                        };
+                        result = origin.Value.Kind switch
+                        {
+                            BehaviorValueKind.Constant => this.m_context.MkBV(origin.Value.Reference!, bits),
+                            BehaviorValueKind.Parameter when !origin.Value.IsManagedReferenceSlot => this.m_context.MkBVConst($"p{origin.Reference.InstanceId}_{origin.Reference.ValueId}_{bits}", bits),
+                            _ => throw new AnalysisException("整数值的存储状态尚未闭合"),
+                        };
+                    }
+                    this.m_values.Add(reference, result);
+                    return result;
+                }
+                finally
+                {
+                    this.m_activeValues.Remove(reference);
+                }
+            }
+
+            // 位宽、有符号比较与普通溢出遵从原指令，不使用无限精度整数替代。
+            private Microsoft.Z3.BitVecExpr ReadOperation(ValueOrigin origin)
+            {
+                string operation = origin.Value.Reference!;
+                if (operation is not ("brtrue" or "brfalse" or "beq" or "ceq" or "bne.un" or "bgt" or "cgt" or "bge" or "blt" or "clt" or "ble"
+                    or "bgt.un" or "cgt.un" or "bge.un" or "blt.un" or "clt.un" or "ble.un" or "add" or "sub" or "mul" or "and" or "or" or "xor"
+                    or "neg" or "not" or "conv.i4" or "conv.u4" or "conv.i8" or "conv.u8"))
+                {
+                    throw new AnalysisException($"整数指令尚未完整表达：{operation}");
+                }
+                Microsoft.Z3.BitVecExpr[] inputs = origin.Value.InputValueIds.Select(id => ReadValue(origin.Reference with { ValueId = id })).ToArray();
+                if (inputs.Length == 0 || inputs.Length > 2 || inputs.Length == 2 && inputs[0].SortSize != inputs[1].SortSize)
+                {
+                    throw new AnalysisException("整数指令的参数位宽尚未闭合");
+                }
+                Microsoft.Z3.BitVecExpr left = inputs[0];
+                Microsoft.Z3.BitVecExpr? right = inputs.Length == 2 ? inputs[1] : null;
+                Microsoft.Z3.BoolExpr? condition = operation switch
+                {
+                    "brtrue" => this.m_context.MkNot(this.m_context.MkEq(left, this.m_context.MkBV(0, left.SortSize))),
+                    "brfalse" => this.m_context.MkEq(left, this.m_context.MkBV(0, left.SortSize)),
+                    "beq" or "ceq" => this.m_context.MkEq(left, right!),
+                    "bne.un" => this.m_context.MkNot(this.m_context.MkEq(left, right!)),
+                    "bgt" or "cgt" => this.m_context.MkBVSGT(left, right!),
+                    "bge" => this.m_context.MkBVSGE(left, right!),
+                    "blt" or "clt" => this.m_context.MkBVSLT(left, right!),
+                    "ble" => this.m_context.MkBVSLE(left, right!),
+                    "bgt.un" or "cgt.un" => this.m_context.MkBVUGT(left, right!),
+                    "bge.un" => this.m_context.MkBVUGE(left, right!),
+                    "blt.un" or "clt.un" => this.m_context.MkBVULT(left, right!),
+                    "ble.un" => this.m_context.MkBVULE(left, right!),
+                    _ => null,
+                };
+                if (condition != null)
+                {
+                    return (Microsoft.Z3.BitVecExpr)this.m_context.MkITE(condition, this.m_context.MkBV(1, 32), this.m_context.MkBV(0, 32));
+                }
+                return operation switch
+                {
+                    "add" => this.m_context.MkBVAdd(left, right!),
+                    "sub" => this.m_context.MkBVSub(left, right!),
+                    "mul" => this.m_context.MkBVMul(left, right!),
+                    "and" => this.m_context.MkBVAND(left, right!),
+                    "or" => this.m_context.MkBVOR(left, right!),
+                    "xor" => this.m_context.MkBVXOR(left, right!),
+                    "neg" => this.m_context.MkBVNeg(left),
+                    "not" => this.m_context.MkBVNot(left),
+                    "conv.i4" or "conv.u4" => left.SortSize == 32 ? left : this.m_context.MkExtract(31, 0, left),
+                    "conv.i8" or "conv.u8" => left.SortSize == 64 ? left : operation == "conv.u8"
+                        ? this.m_context.MkZeroExt(32, left) : this.m_context.MkSignExt(32, left),
+                    _ => throw new AnalysisException($"整数指令尚未完整表达：{operation}"),
+                };
+            }
+
+            // 公式和求解状态不越过当前查询的生命周期。
+            public void Dispose()
+            {
+                this.m_solver.Dispose();
+                this.m_context.Dispose();
+            }
         }
 
         // 路径缩小时撤销受影响入口的派生事实；保留实例编号和已证路径，重新命中才激活子调用。
@@ -2909,6 +3196,10 @@ namespace SetterChecker.Core
                     : origin.Value.Kind == BehaviorValueKind.Computation
                         ? ReadIntegerOperation(origin.Reference.InstanceId, origin.Value, active) : null);
                 active.Remove(origin.Reference);
+                if (values.Count > 1 || values.Contains(null))
+                {
+                    break;
+                }
             }
             var result = values.Count == 1 ? values.Single() : null;
             if (cycles == this.m_integerCycles)
@@ -2927,6 +3218,12 @@ namespace SetterChecker.Core
                 IReadOnlyList<ValueOrigin> arrays = GetCallOrigins(new BehaviorValueReference(methodId, operation.InputValueIds.Single(), instanceId), retainTypeChecks: true);
                 var lengths = arrays.Select(array => ReadArrayLength(array, active)).Distinct().ToArray();
                 return lengths.Length == 1 && lengths[0] is { Value: >= 0 } length ? length : null;
+            }
+            if (operation.Reference is not ("brtrue" or "brfalse" or "beq" or "ceq" or "bne.un"
+                or "bgt" or "cgt" or "bge" or "blt" or "clt" or "ble" or "bgt.un" or "cgt.un" or "bge.un" or "blt.un" or "clt.un" or "ble.un"
+                or "conv.i4" or "conv.u4" or "conv.i8" or "conv.u8" or "add" or "sub" or "mul"))
+            {
+                return null;
             }
             List<(long Value, int Bits)> inputs = new();
             foreach (int valueId in operation.InputValueIds)
@@ -3953,7 +4250,8 @@ namespace SetterChecker.Core
                 }
                 if (GetWrites(current).Any(write => MayWriteStorage(write, kind, memberName, localSlotOnly))
                     || kind == BehaviorWriteKind.Field && body.Values.Any(value => value.Kind == BehaviorValueKind.NewObject)
-                    || (this.m_callsByCallerInstance.GetValueOrDefault(current)?.Count ?? 0) != body.Calls.Count)
+                    || body.Calls.Any(call => IsReachable(current, call.Point.BlockId)
+                        && this.m_callsByCallerInstance.GetValueOrDefault(current)?.ContainsKey(call.Point) != true))
                 {
                     return false;
                 }
@@ -4223,8 +4521,6 @@ namespace SetterChecker.Core
             {
                 BehaviorFlowPoint required = throughPoint.Value;
                 int returnSlot = graph.Assignments[required.BlockId].Single(assignment => assignment.Point == required).TargetValueId;
-                ILookup<FlowNode, FlowNode> successors = graph.Predecessors.SelectMany(item => item.Value.Select(from => (From: from, To: item.Key)))
-                    .ToLookup(edge => edge.From, edge => edge.To);
                 following = new();
                 Queue<FlowNode> forward = new(graph.NodesByBlockId[required.BlockId]);
                 while (forward.TryDequeue(out FlowNode node))
@@ -4233,7 +4529,7 @@ namespace SetterChecker.Core
                     {
                         continue;
                     }
-                    foreach (FlowNode next in successors[node].Where(next =>
+                    foreach (FlowNode next in graph.Successors[node].Where(next =>
                         this.m_excludedEdges.GetValueOrDefault(instanceId)?.Contains((node.BlockId, next.BlockId)) != true
                         && !graph.Assignments[next.BlockId].Any(assignment => assignment.TargetValueId == returnSlot)))
                     {
@@ -4449,7 +4745,7 @@ namespace SetterChecker.Core
                     group => group.Key,
                     group => group.OrderBy(node => node.ContinuationId).ToArray());
 
-            return new ValueFlowGraph(orderedPredecessors, nodesByBlockId,
+            return new ValueFlowGraph(blocks, orderedPredecessors, nodesByBlockId,
                 method.Assignments.ToLookup(item => item.Point.BlockId), method.Writes.ToLookup(item => item.Point.BlockId),
                 method.Calls.ToLookup(item => item.Point.BlockId), method.Values.Where(value => value.Kind is BehaviorValueKind.FieldRead or BehaviorValueKind.Address
                     && value.Member != null && value.InputValueIds.Count == 0).ToLookup(value => value.Point!.Value.BlockId));
@@ -4471,12 +4767,20 @@ namespace SetterChecker.Core
         private readonly record struct FlowSearchPoint(FlowNode Node, int Order);
 
         private sealed record ValueFlowGraph(
+            IReadOnlyDictionary<int, BehaviorFlowBlock> Blocks,
             IReadOnlyDictionary<FlowNode, IReadOnlyList<FlowNode>> Predecessors,
             IReadOnlyDictionary<int, FlowNode[]> NodesByBlockId,
             ILookup<int, BehaviorAssignment> Assignments,
             ILookup<int, BehaviorWrite> Writes,
             ILookup<int, BehaviorCall> Calls,
-            ILookup<int, BehaviorValue> StaticReads);
+            ILookup<int, BehaviorValue> StaticReads)
+        {
+            private ILookup<FlowNode, FlowNode>? m_successors;
+
+            /// <summary>按需建立不随调用环境变化的正向边索引，保留 finally 的独立续接身份。</summary>
+            public ILookup<FlowNode, FlowNode> Successors => this.m_successors ??= this.Predecessors
+                .SelectMany(item => item.Value.Select(from => (From: from, To: item.Key))).ToLookup(edge => edge.From, edge => edge.To);
+        }
     }
 
     /// <summary>保存真实调用函数，以及映射到该函数的接收对象和逐位置实参。</summary>

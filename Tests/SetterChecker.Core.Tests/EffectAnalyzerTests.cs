@@ -2364,6 +2364,83 @@ namespace SetterChecker.Core.Tests
             }
         }
 
+        // 反射操作必须正常返回，后续写入才能作为修改证据。
+        /// <summary>区分空实例调用必抛、合法静态操作和查找为空的正常返回。</summary>
+        [TestMethod]
+        [DataRow("typeof(Data).GetField(\"Value\").SetValue(null, 7)", false)]
+        [DataRow("typeof(Data).GetField(\"Value\").GetValue(null)", false)]
+        [DataRow("typeof(Data).GetMethod(\"Read\").Invoke(null, null)", false)]
+        [DataRow("typeof(Data).GetProperty(\"Property\").GetValue(null)", false)]
+        [DataRow("typeof(Data).GetProperty(\"Property\").SetValue(null, 7)", false)]
+        [DataRow("typeof(Data).GetField(\"Shared\").GetValue(null)", true)]
+        [DataRow("typeof(Data).GetField(\"Shared\").SetValue(null, 7)", true)]
+        [DataRow("typeof(Data).GetMethod(\"StaticRead\").Invoke(null, null)", true)]
+        [DataRow("typeof(Data).GetField(\"Missing\")", true)]
+        public async Task AnalyzeRequiresReflectionToReturnBeforeLaterWrites(string operation, bool completes)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data
+                {
+                    public int Value;
+                    public static int Shared;
+                    public int Property { get => Value; set => Value = value; }
+                    public int Read() => Value;
+                    public static int StaticRead() => Shared;
+                }
+                public static class Calls
+                {
+                    private static int state;
+                    public static void Entry() { OPERATION; state = 1; }
+                }
+                """.Replace("OPERATION", operation));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Methods.Where(method => method.TypeName == "SourceSamples.Calls")
+                .Concat(catalog.Types.Where(type => type.AssemblyPath == project.ExternalAssemblyPath
+                    && type.FullName == "ExternalSamples.Calls").SelectMany(catalog.GetMethods)).ToArray();
+
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            EffectAnalysisResult result = new EffectAnalyzer().Analyze(catalog, roots, calls);
+
+            foreach (MethodEntry root in roots)
+            {
+                Assert.AreEqual(completes ? MethodEffectKind.Setter : MethodEffectKind.Getter,
+                    result.Methods.Single(method => method.MethodId == root.Id).Kind, root.Id);
+            }
+        }
+
+        // 第二次经另一个函数返回递归入口时，不能套用第一次的参数条件。
+        /// <summary>有限间接递归在下一次进入时才写入，源码和 DLL 都必须保留该效果。</summary>
+        [TestMethod]
+        public async Task AnalyzePreservesFiniteIndirectRecursion()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Calls
+                {
+                    private static int state;
+                    public static void Entry() { A(1); }
+                    private static void A(int value)
+                    {
+                        if (value == 2) { state = 1; return; }
+                        B();
+                    }
+                    private static void B() { A(2); }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+
+            EffectAnalysisResult result = new EffectAnalyzer().Analyze(catalog, roots, calls);
+
+            Assert.IsTrue(result.Methods.All(method => method.Kind == MethodEffectKind.Setter));
+        }
+
         // 同一函数经不同查找路径出现时仍只代表一个合法目标。
         /// <summary>重复的类型来源不能导致函数与接收对象的虚假关联错误。</summary>
         [TestMethod]

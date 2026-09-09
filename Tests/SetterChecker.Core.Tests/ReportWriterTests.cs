@@ -218,6 +218,46 @@ namespace SetterChecker.Core.Tests
             Assert.AreEqual(MethodEffectKind.Getter, run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
         }
 
+        // 反射的成功分支不能替同一条件下会抛异常的旧对象分支作证。
+        /// <summary>混合反射接收者或成员尚未关联时，不把后续旧对象写入当成确定事实。</summary>
+        [TestMethod]
+        [DataRow("(flag ? typeof(Data).GetField(\"Shared\") : typeof(Data).GetField(\"Value\")).GetValue(null)")]
+        [DataRow("(flag ? typeof(Data).GetField(\"Value\") : typeof(Data).GetField(\"Shared\")).GetValue(null)")]
+        [DataRow("typeof(Data).GetMethod(\"Read\").Invoke(receiver, null)")]
+        [DataRow("typeof(Data).GetProperty(\"Property\").GetValue(receiver)")]
+        [DataRow("(flag ? typeof(Data).GetMethod(\"StaticRead\") : typeof(Data).GetMethod(\"Read\")).Invoke(null, null)")]
+        [DataRow("(flag ? typeof(Data).GetProperty(\"StaticProperty\") : typeof(Data).GetProperty(\"Property\")).GetValue(null)")]
+        public async Task RunKeepsReflectionCompletionBranchesTogether(string operation)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                public sealed class Data
+                {
+                    public int Value;
+                    public static int Shared;
+                    public int Read() => Value;
+                    public int Property => Value;
+                    public static int StaticRead() => Shared;
+                    public static int StaticProperty => Shared;
+                }
+                public static class Calls
+                {
+                    public static void Entry(bool flag, Data old)
+                    {
+                        var target = flag ? new Data() : old;
+                        var receiver = flag ? new Data() : null;
+                        OPERATION;
+                        target.Value = 1;
+                    }
+                }
+                """.Replace("OPERATION", operation));
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2), reportProgress: current =>
+                Assert.IsNull(current.Annotations.Methods.Single(method => method.Name == "Entry").Actual));
+            Assert.IsFalse(run.Complete);
+            Assert.IsNull(run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+            Assert.IsTrue(run.Calls!.PendingCalls.Any(call => call.Failure?.Contains("成功与异常分支", StringComparison.Ordinal) == true));
+        }
+
         // 返回证据必须来自同一条正常传出对象的路径。
         /// <summary>创建过对象不代表已正常传出，未知调用不能被返回槽或 finally 绕过。</summary>
         [TestMethod]
@@ -319,6 +359,118 @@ namespace SetterChecker.Core.Tests
             AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
             Assert.IsFalse(run.Complete);
             Assert.IsNull(run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+        }
+
+        // 写入必须同时满足沿途全部条件，不能拼接互相矛盾的输入。
+        /// <summary>覆盖整数同值运算、位操作及跨函数传参后的矛盾条件。</summary>
+        [TestMethod]
+        [DataRow("if (x - x != 0) state = 1;", false)]
+        [DataRow("if ((x & 0) != 0) state = 1;", false)]
+        [DataRow("if (x == 1) { if (x == 2) state = 1; }", false)]
+        [DataRow("if (x == 1) Helper(x);", false)]
+        [DataRow("if (x - x == 0) state = 1;", true)]
+        [DataRow("if ((x & 1) != 0) state = 1;", true)]
+        [DataRow("if (x == 1) { if (x != 2) state = 1; }", true)]
+        [DataRow("if (x == 1) { x = 2; if (x == 2) state = 1; }", true)]
+        [DataRow("int old = x; x = 2; if (old == 1 && x == 2) state = 1;", true)]
+        [DataRow("if (x == 1) Helper(x + 1);", true)]
+        [DataRow("if (unchecked(x + 1) < x) state = 1;", true)]
+        [DataRow("if (unchecked((uint)x) > int.MaxValue) state = 1;", true)]
+        [DataRow("long wide = x; if (unchecked(wide + long.MaxValue) < 0) state = 1;", true)]
+        [DataRow("int y = x == 0 ? x : x + 1; if (x == 1 && y == 2) state = 1;", true)]
+        [DataRow("while (x < 2) x++; if (x == 2) state = 1;", true)]
+        [DataRow("try { if (x == 1) state = 1; } finally { }", true)]
+        [DataRow("switch (x) { case 1: state = 1; break; case 2: break; case 3: break; case 4: break; }", true)]
+        public async Task RunRequiresConsistentIntegerConditions(string body, bool setter)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("public static class Calls { private static int state; private static void Helper(int y) { if (y == 2) state = 1; } public static void Entry(int x) { " + body + " } }");
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2), reportProgress: current =>
+            {
+                if (!setter)
+                {
+                    Assert.AreNotEqual(MethodEffectKind.Setter, current.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+                }
+            });
+            Assert.IsTrue(run.Complete);
+            Assert.AreEqual(setter ? MethodEffectKind.Setter : MethodEffectKind.Getter,
+                run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+        }
+
+        // 提前放弃整数求值不能遗漏另一个来源中的原生调用失败。
+        /// <summary>交换未知整数来源后，只有条件前已发生的写入可以独立证明。</summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public async Task RunKeepsFailuresAfterIntegerProofStops(bool reversed, bool writesFirst)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                public static class Calls
+                {
+                    private static int state;
+                    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]
+                    private static extern int Unknown();
+                    private static int Zero() => 0;
+                    public static void Entry(int input, bool flag)
+                    {
+                        FIRST_WRITE
+                        int value = flag ? LEFT : RIGHT;
+                        if (value > 0) state = 1;
+                    }
+                    public static void Independent() { if (Zero() != 0) state = 2; }
+                }
+                """.Replace("FIRST_WRITE", writesFirst ? "state = 3;" : string.Empty)
+                    .Replace("LEFT", reversed ? "Unknown()" : "input").Replace("RIGHT", reversed ? "input" : "Unknown()"));
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            Assert.AreEqual(writesFirst ? MethodEffectKind.Setter : (MethodEffectKind?)null,
+                run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+            Assert.AreEqual(MethodEffectKind.Getter, run.Annotations.Methods.Single(method => method.Name == "Independent").Actual);
+        }
+
+        // 已排除的调用不阻挡存储证明，可达的未知调用和实际写回仍需保留。
+        /// <summary>条件裁剪后的回调来源不受并行度影响，也不丢失字段、引用及反射写回。</summary>
+        [TestMethod]
+        [DataRow("quiet", 1)]
+        [DataRow("quiet", 4)]
+        [DataRow("unknown", 1)]
+        [DataRow("unknown", 4)]
+        [DataRow("field", 4)]
+        [DataRow("reference", 4)]
+        [DataRow("reflection", 4)]
+        public async Task RunReadsCallbacksAfterReachableCallsOnly(string scenario, int jobs)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            string replacement = scenario switch
+            {
+                "field" => "holder.Next = new System.Action(Write);",
+                "reference" => "Replace(ref holder.Next);",
+                "reflection" => "typeof(Holder).GetField(\"Next\").SetValue(holder, new System.Action(Write));",
+                _ => string.Empty,
+            };
+            project.WriteRootSource("""
+                public sealed class Holder { public System.Action Next; }
+                public static class Calls
+                {
+                    private static int state;
+                    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]
+                    private static extern void Unknown();
+                    private static void Quiet() { }
+                    private static void Write() { state = 1; }
+                    private static void Replace(ref System.Action callback) { callback = new System.Action(Write); }
+                    private static void Touch(Holder holder, bool flag) { if (flag) Unknown(); REPLACEMENT }
+                    public static void Entry()
+                    {
+                        var holder = new Holder(); holder.Next = new System.Action(Quiet);
+                        Touch(holder, FLAG); holder.Next();
+                    }
+                }
+                """.Replace("REPLACEMENT", replacement).Replace("FLAG", scenario == "unknown" ? "true" : "false"));
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, jobs));
+            MethodEffectKind? expected = scenario == "unknown" ? null : scenario == "quiet" ? MethodEffectKind.Getter : MethodEffectKind.Setter;
+            Assert.AreEqual(expected, run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
         }
 
         // 相同源码调用在不同上层入口重复出现时，只展示一份问题并保留次数。
