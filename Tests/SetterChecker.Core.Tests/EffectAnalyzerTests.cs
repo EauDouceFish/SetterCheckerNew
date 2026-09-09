@@ -4,6 +4,63 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 只读引用限制的是引用槽，不能据此忽略对象虚函数中的写入。
+        /// <summary>只读与泛型引用参数共用实际类型和虚调用目标。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task AnalyzeTracksReadonlyAndGenericReferenceReceiver(bool generic)
+        {
+            string signature = generic ? "Entry<T>(ref T input) where T : Data" : "Entry(in Data input)";
+            using TestProject project = TestProject.CreateWithCallTargets("namespace Samples; public class Data { public int Value; public virtual void Set() { Value = 1; } } public static class Calls { public static void "
+                + signature + " { input.Set(); } }");
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name == "Entry").ToArray();
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEffect effect in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(MethodEffectKind.Setter, effect.Kind, effect.MethodId);
+            }
+        }
+
+        // 引用参数所指的入口对象与保存该引用的槽都来自调用方，不能因加载形式丢失其归属。
+        /// <summary>根引用参数的字段写入能够提供真实外部修改证据。</summary>
+        [TestMethod]
+        [DataRow("input.Value = 1;", MethodEffectKind.Setter)]
+        [DataRow("if (input != null) input.Value = 1;", MethodEffectKind.Setter)]
+        [DataRow("if (input == null) input.Value = 1;", MethodEffectKind.Getter)]
+        [DataRow("if (input.Value == 0) input.Value = 1;", MethodEffectKind.Setter)]
+        [DataRow("if (input.Value == 0 && input.Value != 0) input.Value = 1;", MethodEffectKind.Getter)]
+        [DataRow("Write(input);", MethodEffectKind.Setter)]
+        [DataRow("var fresh = new Data(); ref Data selected = ref (flag ? ref input : ref fresh); if (flag) selected.Value = 1;", MethodEffectKind.Setter)]
+        [DataRow("var fresh = new Data(); ref Data selected = ref (flag ? ref input : ref fresh); if (!flag) selected.Value = 1;", MethodEffectKind.Getter)]
+        [DataRow("var copy = input; Replace(ref copy); copy.Value = 1;", MethodEffectKind.Getter)]
+        [DataRow("if (input != null) { var copy = input; if (copy == null) copy.Value = 1; }", MethodEffectKind.Getter)]
+        public async Task AnalyzeTracksRootReferenceObjectFieldWrite(string body, MethodEffectKind expected)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public static class Calls
+                {
+                    public static void Entry(ref Data input, bool flag) { BODY }
+                    private static void Write(Data input) { input.Value = 1; }
+                    private static void Replace(ref Data input) { input = new Data(); }
+                }
+                """.Replace("BODY", body));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name == "Entry").ToArray();
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEffect effect in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(expected, effect.Kind, effect.MethodId);
+            }
+        }
+
         // 固定选择值必须在展开调用前排除其他 case，未执行的原生函数不应阻塞入口。
         /// <summary>实际调用参数选择正常分支后，无关原生边界不进入报告。</summary>
         [TestMethod]

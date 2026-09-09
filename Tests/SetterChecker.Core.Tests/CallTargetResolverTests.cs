@@ -6,6 +6,159 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class CallTargetResolverTests
     {
+        // 根引用参数的对象初值进入原别名查询，不能用负编号绕过另一个可能相同的对象。
+        /// <summary>两个根对象的重合尚未证明时仍明确报缺口，不越界或固定旧值。</summary>
+        [TestMethod]
+        [DataRow("other", "两个根参数")]
+        [DataRow("input.Next", "根对象字段路径")]
+        public async Task ResolveAsyncKeepsRootReferenceObjectAliasBoundary(string written, string reason)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public Data Next; public int Value; }
+                public static class Calls
+                {
+                    public static void Entry(ref Data input, Data other)
+                    {
+                        WRITTEN.Value = 0;
+                        if (input.Value > 0) Observe(input.Value);
+                    }
+                    private static void Observe(int value) { }
+                }
+                """.Replace("WRITTEN", written));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEntry root in roots)
+            {
+                ResolvedCall call = calls.Calls.Single(call => call.CallerMethodId == root.Id && call.Call.Target.Name == "Observe");
+                AnalysisException failure = Assert.ThrowsExactly<AnalysisException>(() =>
+                    calls.ValueSources.GetCallOrigins(call.Targets.Single().Arguments[0].Single()));
+                Assert.Contains(reason, failure.Message);
+            }
+        }
+
+        // 复刻 InitPvpConf 的引用参数与多分支循环，首次报告必须能完成，后续库闭合另行验收。
+        /// <summary>读写引用对象字段不应使首轮对象来源查询指数膨胀。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task ResolveAsyncReportsKhenginePvpConfigurationBeforeFollowingLibraries(bool typedLoad)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class XmlNode { public Attributes Attributes; }
+                public sealed class Attributes { public int Count; public XmlAttribute this[int index] => null; }
+                public sealed class XmlAttribute { public string Name, Value; }
+                public sealed class Ids { public void Clear() { } public void Add(uint id) { } }
+                public static class ai
+                {
+                    public enum PlayerType { model, bt, human }
+                    public sealed class StartArgs
+                    {
+                        public int p1_char_id, p2_char_id;
+                        public PlayerType p1_type, p2_type;
+                        public uint main_view_agent_side, p1_general_id, p2_general_id;
+                        public Ids p1_friend_id, p2_friend_id;
+                    }
+                }
+                public sealed class Calls
+                {
+                    public void Entry(XmlNode xmlNode, ref ai.StartArgs args)
+                    {
+                        if (xmlNode.Attributes == null)
+                        {
+                            return;
+                        }
+                        for (int i = 0; i < xmlNode.Attributes.Count; i++)
+                        {
+                            XmlAttribute attr = xmlNode.Attributes[i];
+                            if (attr.Name == "p1_char_id")
+                            {
+                                int.TryParse(attr.Value, out args.p1_char_id);
+                            }
+                            else if (attr.Name == "p2_char_id")
+                            {
+                                int.TryParse(attr.Value, out args.p2_char_id);
+                            }
+                            else if (attr.Name == "p1_type")
+                            {
+                                int type = 2;
+                                int.TryParse(attr.Value, out type);
+                                if (type == 2) args.p1_type = ai.PlayerType.human;
+                                else if (type == 1) args.p1_type = ai.PlayerType.bt;
+                                else if (type == 0) args.p1_type = ai.PlayerType.model;
+                            }
+                            else if (attr.Name == "p2_type")
+                            {
+                                int type = 2;
+                                int.TryParse(attr.Value, out type);
+                                if (type == 2) args.p2_type = ai.PlayerType.human;
+                                else if (type == 1) args.p2_type = ai.PlayerType.bt;
+                                else if (type == 0) args.p2_type = ai.PlayerType.model;
+                            }
+                            else if (attr.Name == "main_view_agent_side")
+                            {
+                                uint.TryParse(attr.Value, out args.main_view_agent_side);
+                            }
+                            else if (attr.Name == "p1_friend_id")
+                            {
+                                uint p1FriendID = 0;
+                                uint.TryParse(attr.Value, out p1FriendID);
+                                args.p1_friend_id.Clear();
+                                args.p1_friend_id.Add(p1FriendID);
+                            }
+                            else if (attr.Name == "p2_friend_id")
+                            {
+                                uint p2FriendID = 0;
+                                uint.TryParse(attr.Value, out p2FriendID);
+                                args.p2_friend_id.Clear();
+                                args.p2_friend_id.Add(p2FriendID);
+                            }
+                            else if (attr.Name == "p1_general_id")
+                            {
+                                uint.TryParse(attr.Value, out args.p1_general_id);
+                            }
+                            else if (attr.Name == "p2_general_id")
+                            {
+                                uint.TryParse(attr.Value, out args.p2_general_id);
+                            }
+                        }
+                    }
+                }
+                """);
+            if (typedLoad)
+            {
+                using Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(project.ExternalAssemblyPath,
+                    new Mono.Cecil.ReaderParameters { InMemory = true });
+                Mono.Cecil.MethodDefinition entry = module.GetType("ExternalSamples.Calls").Methods.Single(method => method.Name == "Entry");
+                Mono.Cecil.Cil.Instruction[] loads = entry.Body.Instructions.Where(instruction => instruction.OpCode == Mono.Cecil.Cil.OpCodes.Ldind_Ref).ToArray();
+                Assert.IsNotEmpty(loads);
+                foreach (Mono.Cecil.Cil.Instruction instruction in loads)
+                {
+                    instruction.OpCode = Mono.Cecil.Cil.OpCodes.Ldobj;
+                    instruction.Operand = ((Mono.Cecil.ByReferenceType)entry.Parameters[1].ParameterType).ElementType;
+                }
+                module.Write(project.ExternalAssemblyPath);
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            using CancellationTokenSource cancellation = new();
+            bool reported = false;
+            await Assert.ThrowsAsync<OperationCanceledException>(() => new CallTargetResolver().ResolveAsync(material, catalog, roots, 2,
+                cancellationToken: cancellation.Token, requireCompleteCalls: false, reportProgress: (calls, effects) =>
+                {
+                    Assert.IsEmpty(effects.Methods);
+                    Assert.HasCount(2, effects.Failures);
+                    Assert.IsNotEmpty(calls.PendingCalls);
+                    reported = true;
+                    cancellation.Cancel();
+                }));
+            Assert.IsTrue(reported);
+        }
+
         // 数组地址快排只能移除不相干存储，不能跳过真正写到字段或局部变量的引用。
         /// <summary>未知数组下标不污染字段与局部值，直接和混合引用仍保留字段写入。</summary>
         [TestMethod]

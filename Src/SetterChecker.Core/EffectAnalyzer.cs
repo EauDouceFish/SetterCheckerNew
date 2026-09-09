@@ -76,9 +76,10 @@ namespace SetterChecker.Core
                         IEnumerable<WriteSubject> mapped = new[] { current.Subject };
                         if (current.Subject.Failure == null && current.Subject.Reference is BehaviorValueReference reference)
                         {
-                            BehaviorValue value = resolution.Behaviors.MethodsById[reference.MethodId].Values[reference.ValueId];
+                            BehaviorValue? value = reference.InstanceId == current.Instance
+                                ? resolution.Behaviors.MethodsById[reference.MethodId].Values[reference.ValueId] : null;
                             IEnumerable<BehaviorValueReference> arguments = reference.InstanceId == current.Instance
-                                ? value.Kind == BehaviorValueKind.Parameter ? item.Target.Arguments[value.ParameterIndex!.Value] : item.Target.Receiver
+                                ? value!.Kind == BehaviorValueKind.Parameter ? item.Target.Arguments[value.ParameterIndex!.Value] : item.Target.Receiver
                                 : new[] { reference };
                             mapped = arguments.SelectMany(argument => ReadWriteSubjects(catalog, resolution, argument, rootId,
                                 pathProof, current.Subject.Witness, pathConditions.Contains(rootId)));
