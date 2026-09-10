@@ -2724,7 +2724,7 @@ namespace SetterChecker.Core.Tests
             CallTargetResolutionResult complete = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, previous: partial);
             Assert.IsEmpty(complete.PendingCalls);
             Assert.IsEmpty(complete.Calls.Where(call => call.Call.Target.Name == "Unknown").ToArray());
-            AnnotationResult annotations = new AnnotationEvaluator().Evaluate(roots, new EffectAnalyzer().Analyze(catalog, roots, complete), complete);
+            AnnotationResult annotations = new AnnotationEvaluator().Evaluate(catalog, roots, new EffectAnalyzer().Analyze(catalog, roots, complete), complete);
             Assert.IsTrue(annotations.Complete);
             Assert.AreEqual(MethodEffectKind.Setter, annotations.Methods.Single(method => method.Id == entry.Id).Actual);
             Assert.IsTrue(annotations.Methods.Single(method => method.Id == warning.Id).WarningPaths.Any(path => path.SequenceEqual(new[] { entry.Id, warning.Id })));

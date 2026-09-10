@@ -120,28 +120,8 @@ namespace SetterChecker.Core
                 jobs);
         }
 
-        // 核对候选文件的完整程序集身份。
-        internal static bool MatchesAssemblyFile(
-            string path,
-            System.Reflection.AssemblyName expected)
-        {
-            return MatchesAssemblyIdentity(
-                System.Reflection.AssemblyName.GetAssemblyName(path),
-                expected);
-        }
-
-        // 核对已读取类型的完整程序集身份。
-        internal static bool MatchesAssemblyIdentity(
-            string actualIdentity,
-            System.Reflection.AssemblyName expected)
-        {
-            return MatchesAssemblyIdentity(
-                new System.Reflection.AssemblyName(actualIdentity),
-                expected);
-        }
-
         // 比较程序集名称、版本、区域和公钥标记。
-        private static bool MatchesAssemblyIdentity(
+        internal static bool MatchesAssemblyIdentity(
             System.Reflection.AssemblyName actual,
             System.Reflection.AssemblyName expected)
         {
@@ -731,6 +711,10 @@ namespace SetterChecker.Core
                 DocumentationId = ReadManagedDocumentationId(method),
                 GenericParameters = ReadGenericParameters(method.GenericParameters),
                 IsFinal = method.IsFinal,
+                HasNoLogTrackExemption = method.CustomAttributes.Concat(method.DeclaringType.CustomAttributes)
+                    .Any(attribute => attribute.AttributeType.FullName == "KH.NoLogTrackAttribute")
+                    && !method.CustomAttributes.Concat(method.DeclaringType.CustomAttributes)
+                        .Any(attribute => attribute.AttributeType.FullName == "KH.LogTrackAttribute"),
             };
         }
 
@@ -858,9 +842,9 @@ namespace SetterChecker.Core
             Cecil.TypeReference type,
             Func<Cecil.TypeReference, string>? namedTypeId = null)
         {
-            if (TryReadPrimitive(type.MetadataType, out string? primitive))
+            if (type.IsPrimitive || type.MetadataType is Cecil.MetadataType.Void or Cecil.MetadataType.String or Cecil.MetadataType.Object)
             {
-                return new TypeIdentityTemplate(primitive!);
+                return new TypeIdentityTemplate(type.FullName);
             }
 
             return type switch
@@ -966,34 +950,6 @@ namespace SetterChecker.Core
                 && int.TryParse(name[(separator + 1)..], out _)
                     ? name[..separator]
                     : name;
-        }
-
-        // 把 Cecil 基础类型统一为不带程序集的稳定名称。
-        private static bool TryReadPrimitive(Cecil.MetadataType type, out string? name)
-        {
-            name = type switch
-            {
-                Cecil.MetadataType.Void => "System.Void",
-                Cecil.MetadataType.Boolean => "System.Boolean",
-                Cecil.MetadataType.Char => "System.Char",
-                Cecil.MetadataType.SByte => "System.SByte",
-                Cecil.MetadataType.Byte => "System.Byte",
-                Cecil.MetadataType.Int16 => "System.Int16",
-                Cecil.MetadataType.UInt16 => "System.UInt16",
-                Cecil.MetadataType.Int32 => "System.Int32",
-                Cecil.MetadataType.UInt32 => "System.UInt32",
-                Cecil.MetadataType.Int64 => "System.Int64",
-                Cecil.MetadataType.UInt64 => "System.UInt64",
-                Cecil.MetadataType.Single => "System.Single",
-                Cecil.MetadataType.Double => "System.Double",
-                Cecil.MetadataType.String => "System.String",
-                Cecil.MetadataType.Object => "System.Object",
-                Cecil.MetadataType.IntPtr => "System.IntPtr",
-                Cecil.MetadataType.UIntPtr => "System.UIntPtr",
-                _ => null,
-            };
-
-            return name != null;
         }
 
         // 生成托管类型包含物理文件的唯一身份。
@@ -1259,6 +1215,8 @@ namespace SetterChecker.Core
         internal string DocumentationId { get; init; } = string.Empty;
 
         internal bool IsFinal { get; init; }
+
+        internal bool HasNoLogTrackExemption { get; init; }
 
         internal IReadOnlyList<GenericParameterRule> GenericParameters { get; init; } = Array.Empty<GenericParameterRule>();
     }
@@ -1890,7 +1848,7 @@ namespace SetterChecker.Core
                         assemblyName,
                         out MethodCatalog.SourceCatalogContext? sourceContext)
                     && (this.m_usesUnityLegacyBinding || MethodCatalog.MatchesAssemblyIdentity(
-                        sourceContext.Material.Compilation.Assembly.Identity.GetDisplayName(),
+                        new System.Reflection.AssemblyName(sourceContext.Material.Compilation.Assembly.Identity.GetDisplayName()),
                         identity)))
                 {
                     if (!this.m_usesUnityLegacyBinding)
@@ -1906,7 +1864,7 @@ namespace SetterChecker.Core
                 string[] candidates = this.m_lookupPathsByAssemblyName.TryGetValue(
                         assemblyName,
                         out IReadOnlyList<string>? knownPaths)
-                    ? knownPaths.Where(path => this.m_usesUnityLegacyBinding || MethodCatalog.MatchesAssemblyFile(path, identity)).ToArray()
+                    ? knownPaths.Where(path => this.m_usesUnityLegacyBinding || MethodCatalog.MatchesAssemblyIdentity(System.Reflection.AssemblyName.GetAssemblyName(path), identity)).ToArray()
                     : Array.Empty<string>();
                 return (sourceContext == null ? candidates : candidates.Append(Path.GetFullPath(sourceContext.Material.AssemblyPath)))
                     .Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).ToArray();

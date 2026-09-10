@@ -1889,7 +1889,7 @@ namespace SetterChecker.Core.Tests
                     add.ReceiverValueId!.Value,
                     list.Id);
                 int entry = behavior.Blocks.Single(block =>
-                    block.Kind == BehaviorFlowBlockKind.Entry).Id;
+                    block.Id == -1).Id;
                 Assert.IsTrue(behavior.Writes.All(write =>
                     CanReachBlock(behavior, entry, write.Point.BlockId)));
             }
@@ -1911,7 +1911,7 @@ namespace SetterChecker.Core.Tests
                 BehaviorWrite body = behavior.Writes.Single(write =>
                     write.Member?.Name == "m_value");
                 int entry = behavior.Blocks.Single(block =>
-                    block.Kind == BehaviorFlowBlockKind.Entry).Id;
+                    block.Id == -1).Id;
 
                 Assert.IsTrue(CanReachBlock(behavior, entry, initializer.Point.BlockId));
                 Assert.IsTrue(CanReachBlock(
@@ -2019,7 +2019,7 @@ namespace SetterChecker.Core.Tests
             {
                 Assert.IsNotEmpty(behavior.Blocks, behavior.MethodId);
                 int entry = behavior.Blocks.Single(block =>
-                    block.Kind == BehaviorFlowBlockKind.Entry).Id;
+                    block.Id == -1).Id;
                 BehaviorReturn returned = behavior.Returns.Single();
                 Assert.IsTrue(CanReachBlock(behavior, entry, returned.Point.BlockId));
                 BehaviorValue field = behavior.Values.Single(value =>

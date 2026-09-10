@@ -355,7 +355,7 @@ namespace SetterChecker.Core
                         handler.FilterStart?.Offset,
                         handler.CatchType == null ? null : ReadTypeReference(handler.CatchType))).ToArray();
                 BehaviorFlowBlock[] instructionBlocks = body.Instructions.Select(instruction =>
-                    new BehaviorFlowBlock(instruction.Offset, BehaviorFlowBlockKind.Block,
+                    new BehaviorFlowBlock(instruction.Offset,
                         reachableOffsets.Contains(instruction.Offset),
                         ReadManagedFlowEdges(instruction, body.CodeSize, handlers),
                         instruction.OpCode.FlowControl == Cil.FlowControl.Cond_Branch && instruction.Operand is Cil.Instruction or Cil.Instruction[]
@@ -364,11 +364,11 @@ namespace SetterChecker.Core
                             : instruction.OpCode == OpCodes.Switch ? instruction.Next?.Offset : null,
                         instruction.Operand is Cil.Instruction[] targets ? targets.Select(target => target.Offset).ToArray() : null)).ToArray();
                 int entryTarget = body.Instructions.Count == 0 ? body.CodeSize : body.Instructions[0].Offset;
-                BehaviorFlowBlock entry = new(-1, BehaviorFlowBlockKind.Entry, true,
-                    new[] { new BehaviorFlowEdge(entryTarget, false, BehaviorFlowBranchSemantics.Regular, Array.Empty<int>()) });
+                BehaviorFlowBlock entry = new(-1, true,
+                    new[] { new BehaviorFlowEdge(entryTarget, BehaviorFlowBranchSemantics.Regular, Array.Empty<int>()) });
                 bool exitReachable = instructionBlocks.Length == 0 || instructionBlocks.Any(block =>
                     block.IsReachable && block.Successors.Any(edge => edge.TargetBlockId == body.CodeSize));
-                BehaviorFlowBlock exit = new(body.CodeSize, BehaviorFlowBlockKind.Exit, exitReachable, Array.Empty<BehaviorFlowEdge>());
+                BehaviorFlowBlock exit = new(body.CodeSize, exitReachable, Array.Empty<BehaviorFlowEdge>());
 
                 return (instructionBlocks.Prepend(entry).Append(exit).ToArray(), handlers);
             }
@@ -381,7 +381,7 @@ namespace SetterChecker.Core
             {
                 // 按真实半开区间计算离开路径，嵌套 finally 从内到外执行。
                 BehaviorFlowEdge Edge(int? target, BehaviorFlowBranchSemantics semantics,
-                    bool conditional = false, bool runsFinally = false)
+                    bool runsFinally = false)
                 {
                     int[] finalizers = runsFinally && target.HasValue
                         ? handlers.Where(handler => handler.Kind == BehaviorExceptionHandlerKind.Finally
@@ -391,7 +391,7 @@ namespace SetterChecker.Core
                             .ThenByDescending(handler => handler.TryStartBlockId)
                             .Select(handler => handler.HandlerStartBlockId).ToArray()
                         : Array.Empty<int>();
-                    return new BehaviorFlowEdge(target, conditional, semantics, finalizers);
+                    return new BehaviorFlowEdge(target, semantics, finalizers);
                 }
 
                 if (instruction.OpCode.Code == Cil.Code.Ret)
@@ -413,12 +413,11 @@ namespace SetterChecker.Core
                         && instruction.Offset >= item.FilterStartBlockId && instruction.Offset < item.HandlerStartBlockId);
                     return new[]
                     {
-                        Edge(handler.HandlerStartBlockId, BehaviorFlowBranchSemantics.Regular, conditional: true),
+                        Edge(handler.HandlerStartBlockId, BehaviorFlowBranchSemantics.Regular),
                         Edge(null, BehaviorFlowBranchSemantics.StructuredExceptionHandling),
                     };
                 }
 
-                bool conditional = instruction.OpCode.FlowControl == Cil.FlowControl.Cond_Branch;
                 IEnumerable<int> targets = instruction.OpCode.FlowControl switch
                 {
                     Cil.FlowControl.Branch => ReadBranchTargets(instruction),
@@ -427,7 +426,7 @@ namespace SetterChecker.Core
                     _ => instruction.Next == null ? Array.Empty<int>() : new[] { instruction.Next.Offset },
                 };
                 return targets.Distinct().Order().Select(target => Edge(target,
-                    BehaviorFlowBranchSemantics.Regular, conditional, instruction.OpCode.Code == Cil.Code.Leave)).ToArray();
+                    BehaviorFlowBranchSemantics.Regular, instruction.OpCode.Code == Cil.Code.Leave)).ToArray();
             }
 
             // 返回当前指令完成后可能继续执行的全部下一条指令。
@@ -553,7 +552,8 @@ namespace SetterChecker.Core
                     or Cil.Code.Ldloc or Cil.Code.Ldloca or Cil.Code.Stloc)
                 {
                     bool argument = code.Code is Cil.Code.Ldarg or Cil.Code.Ldarga or Cil.Code.Starg;
-                    int index = argument ? ReadArgumentIndex(code, operand) : RequireOperand<Cil.VariableDefinition>(instruction).Index;
+                    int index = argument ? RequireOperand<Cecil.ParameterDefinition>(instruction).Index + (this.m_method.IsStatic ? 0 : 1)
+                        : RequireOperand<Cil.VariableDefinition>(instruction).Index;
                     int slotId = argument ? GetArgumentValueId(index) : GetLocalValueId(index);
                     if (code.Code is Cil.Code.Starg or Cil.Code.Stloc)
                     {
@@ -799,19 +799,10 @@ namespace SetterChecker.Core
             // 从 Cecil 指令取得一个类型完全确定的操作数。
             private static T RequireOperand<T>(Cil.Instruction instruction)
             {
-                return RequireOperand<T>(
-                    instruction.OpCode,
-                    instruction.Operand,
-                    instruction.Offset);
-            }
-
-            // 在操作数类型不符合操作码约定时明确停止分析。
-            private static T RequireOperand<T>(OpCode code, object? operand, int offset)
-            {
-                return operand is T value
+                return instruction.Operand is T value
                     ? value
                     : throw new AnalysisException(
-                        $"托管操作数类型错误：@ {offset} {code.Name}，需要 {typeof(T).Name}");
+                        $"托管操作数类型错误：@ {instruction.Offset} {instruction.OpCode.Name}，需要 {typeof(T).Name}");
             }
 
             // 只读取已明确支持的纯运算、转换、间接读取和控制指令。
@@ -1015,16 +1006,6 @@ namespace SetterChecker.Core
                     : BehaviorCallKind.Direct;
             }
 
-            // 把 Cecil 参数定义转换为包含当前对象槽的参数编号。
-            private int ReadArgumentIndex(OpCode code, object? operand)
-            {
-                int index = RequireOperand<Cecil.ParameterDefinition>(
-                    code,
-                    operand,
-                    this.m_currentOffset).Index;
-                return this.m_method.IsStatic ? index : index + 1;
-            }
-
             // 判断一条指令是否把值写入一维数组元素。
             private static bool IsStoreElement(OpCode code)
             {
@@ -1206,19 +1187,6 @@ namespace SetterChecker.Core
         int Order);
 
     /// <summary>
-    /// 区分控制流入口、普通块和出口。
-    /// </summary>
-    public enum BehaviorFlowBlockKind
-    {
-        /// <summary>函数控制流入口。</summary>
-        Entry,
-        /// <summary>包含普通行为的块。</summary>
-        Block,
-        /// <summary>函数控制流出口。</summary>
-        Exit,
-    }
-
-    /// <summary>
     /// 区分控制流边的执行含义。
     /// </summary>
     public enum BehaviorFlowBranchSemantics
@@ -1255,7 +1223,6 @@ namespace SetterChecker.Core
     /// </summary>
     public sealed record BehaviorFlowEdge(
         int? TargetBlockId,
-        bool IsConditional,
         BehaviorFlowBranchSemantics Semantics,
         IReadOnlyList<int> FinallyBlockIds);
 
@@ -1264,7 +1231,6 @@ namespace SetterChecker.Core
     /// </summary>
     public sealed record BehaviorFlowBlock(
         int Id,
-        BehaviorFlowBlockKind Kind,
         bool IsReachable,
         IReadOnlyList<BehaviorFlowEdge> Successors,
         int? ConditionValueId = null, int? JumpTargetBlockId = null,

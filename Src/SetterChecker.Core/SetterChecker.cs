@@ -36,9 +36,9 @@ namespace SetterChecker.Core
             int reportedProofs = -1;
             System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
             // 进度和最终交付共用标签处理与报告数据，未证明项目始终保留失败。
-            AnalysisRun ReadRun()
+            AnalysisRun ReadRun(bool isInProgress = false)
             {
-                AnnotationResult annotations = new AnnotationEvaluator().Evaluate(roots, effects, calls);
+                AnnotationResult annotations = new AnnotationEvaluator().Evaluate(catalog, roots, effects, calls, cancellationToken, deferTracking: isInProgress);
                 return new AnalysisRun(material, catalog, calls, annotations, failure, new Dictionary<string, double>
                 {
                     ["材料（包含编译）"] = material.Elapsed.TotalSeconds,
@@ -47,7 +47,8 @@ namespace SetterChecker.Core
                     ["读取行为、调用、效果与进度记录"] = watch.Elapsed.TotalSeconds - annotations.Elapsed.TotalSeconds,
                     ["其中读取行为"] = calls?.Behaviors.Elapsed.TotalSeconds ?? 0,
                     ["标签检查"] = annotations.Elapsed.TotalSeconds,
-                });
+                })
+                { IsInProgress = isInProgress };
             }
             try
             {
@@ -58,7 +59,7 @@ namespace SetterChecker.Core
                         effects = proofs;
                         if (proofs.Methods.Count != reportedProofs)
                         {
-                            reportProgress?.Invoke(ReadRun() with { IsInProgress = true });
+                            reportProgress?.Invoke(ReadRun(isInProgress: true));
                             reportedProofs = proofs.Methods.Count;
                         }
                     }).ConfigureAwait(false);

@@ -20,15 +20,18 @@ namespace SetterChecker.Core
         internal EffectAnalysisResult AnalyzeAvailable(
             MethodCatalogResult catalog, IReadOnlyList<MethodEntry> roots,
             CallTargetResolutionResult resolution, bool requireCompleteProof, CancellationToken cancellationToken,
-            IReadOnlyDictionary<int, EffectEvidence>? frozenSetters = null)
+            IReadOnlyDictionary<int, EffectEvidence>? frozenSetters = null, IReadOnlySet<string>? exemptMethods = null,
+            IReadOnlySet<string?>? businessAssemblies = null)
         {
             Stopwatch stopwatch = Stopwatch.StartNew();
-            MethodCallInstance[] instances = resolution.ValueSources.Instances.Where(instance => frozenSetters?.ContainsKey(instance.RootId) != true).ToArray();
+            HashSet<int> requestedRoots = roots.Select(root => resolution.ValueSources.RootInstances[root.Id].Id).ToHashSet();
+            MethodCallInstance[] instances = resolution.ValueSources.Instances.Where(instance => requestedRoots.Contains(instance.RootId) && frozenSetters?.ContainsKey(instance.RootId) != true).ToArray();
             Dictionary<int, EffectEvidence> proofs = frozenSetters == null ? new() : new(frozenSetters);
             Dictionary<int, EffectEvidence> boundaries = new();
             HashSet<(int Instance, BehaviorFlowPoint Point, bool EveryPath, bool Conditions)> closedPrefixes = new();
             ILookup<int, (ResolvedCall Call, ResolvedCallTarget Target)> callers = resolution.Calls
-                .Where(call => frozenSetters?.ContainsKey(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId) != true)
+                .Where(call => requestedRoots.Contains(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId)
+                    && frozenSetters?.ContainsKey(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId) != true)
                 .SelectMany(call => call.Targets.Select(target => (Call: call, Target: target))).ToLookup(item => item.Target.InstanceId);
             IReadOnlyDictionary<(int Instance, int Block), string> unsettled = resolution.ValueSources.ReadConditionFailures(instances);
             HashSet<int> unsettledRoots = unsettled.Keys.Select(key => resolution.ValueSources.GetInstance(key.Instance).RootId).ToHashSet();
@@ -46,7 +49,8 @@ namespace SetterChecker.Core
                 while (!proofs.ContainsKey(rootId) && pending.TryDequeue(out var current))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    if (!visited.Add((current.Instance, current.Subject, current.Point)))
+                    if (!visited.Add((current.Instance, current.Subject, current.Point))
+                        || current.Subject.Failure == null && exemptMethods?.Contains(resolution.ValueSources.GetInstance(current.Instance).MethodId) == true)
                     {
                         continue;
                     }
@@ -109,7 +113,8 @@ namespace SetterChecker.Core
                         new EffectEvidence(new[] { instance.MethodId }, -1, string.Empty));
                 }
             }
-            foreach (PendingCall call in resolution.PendingCalls.Where(call => !proofs.ContainsKey(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId)))
+            foreach (PendingCall call in resolution.PendingCalls.Where(call => requestedRoots.Contains(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId)
+                && !proofs.ContainsKey(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId)))
             {
                 Propagate(call.CallerInstanceId, new WriteSubject(null, call.Failure ?? "等待确定调用目标：" + call.Call.Target.Identity.Text),
                     new EffectEvidence(new[] { call.CallerMethodId }, call.Call.Position, string.Empty));
@@ -168,7 +173,7 @@ namespace SetterChecker.Core
                 yield return new WriteSubject(null);
             }
 
-            HashSet<string?> businessAssemblies = roots.Select(method => method.AssemblyPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            businessAssemblies ??= roots.Select(method => method.AssemblyPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
             List<MethodEffect> results = new();
             Dictionary<string, EffectEvidence> failures = new(StringComparer.Ordinal);
             foreach (MethodEntry root in roots.OrderBy(method => method.Id, StringComparer.Ordinal))

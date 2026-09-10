@@ -18,7 +18,8 @@ namespace SetterChecker.Core
             int sourceNlt = methods.Count(method => method.SourceNoLogTrack);
             int detectedNlt = methods.Count(method => method.Decision is "NoLogTrack" or "NLTClass");
             int detectedTrack = methods.Count(method => method.Decision == "ShouldTrack");
-            int unproved = methods.Count(method => method.Actual == null);
+            int conflicts = methods.Count(method => method.Failure == "NoLogTrack 与 LogTrack 冲突");
+            int unproved = methods.Count(method => method.Decision == null) - conflicts;
             var pending = (run.Calls?.PendingCalls ?? Array.Empty<PendingCall>()).GroupBy(call => new
             { call.CallerMethodId, call.Call.Position, call.Failure, Target = call.Call.Target.Identity.Text })
                 .Select(group => new { group.Key.CallerMethodId, group.Key.Position, group.Key.Failure, group.Key.Target, Count = group.Count() }).ToArray();
@@ -27,7 +28,7 @@ namespace SetterChecker.Core
             text.AppendLine($"\nkhengine 总函数数量：{methods.Count} 个");
             text.AppendLine($"NoLogTrack：{detectedNlt}（检测出）/ {sourceNlt}（源码中）");
             text.AppendLine($"ShouldTrack：{detectedTrack}（检测出）/ {methods.Count - sourceNlt}（源码中）");
-            text.AppendLine($"尚未证明：{unproved}；标签冲突：{methods.Count(method => method.Actual != null && method.Decision == null)}；待处理调用：{run.Annotations.PendingCalls}");
+            text.AppendLine($"尚未证明：{unproved}；标签冲突：{conflicts}；待处理调用：{run.Annotations.PendingCalls}");
             text.AppendLine("\n日志豁免不改变真实行为；未知项不计入两种检测结论。待处理调用不为零时，上游告警清单尚不完整。");
             text.AppendLine("补丁仅供预览。手工检查时使用 git -c core.autocrlf=false apply --check preview.patch，避免个人 Git 配置转换源码换行。");
             WriteGroups(text, "源码有 NoLogTrack、真实行为为 Setter（保留人工豁免）", methods.Where(method => method.SourceNoLogTrack && method.Actual == MethodEffectKind.Setter));
@@ -51,9 +52,9 @@ namespace SetterChecker.Core
             foreach (AnnotationMethod method in run.Annotations.Methods.Where(method => method.Failure != null))
             {
                 text.AppendLine($"- {method.Class}.{method.Name}（{method.File}:{method.Line}）：{method.Failure}");
-                if (method.Evidence != null)
+                if ((method.TrackingEvidence ?? method.Evidence) is EffectEvidence evidence)
                 {
-                    text.AppendLine($"  位置：{method.Evidence.Position}；调用过程：" + string.Join(" → ", method.Evidence.MethodPath
+                    text.AppendLine($"  位置：{evidence.Position}；调用过程：" + string.Join(" → ", evidence.MethodPath
                         .Select(id => names.TryGetValue(id, out MethodEntry? entry) ? entry.TypeName + "." + entry.Name : id)));
                 }
             }

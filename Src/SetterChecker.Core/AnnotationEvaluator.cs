@@ -8,11 +8,34 @@ namespace SetterChecker.Core
     {
         // 从真实源码标签和已证明行为生成逐函数决定及最短告警调用过程。
         /// <summary>未知行为和冲突保留失败，依赖函数不进入修改清单。</summary>
-        public AnnotationResult Evaluate(IReadOnlyList<MethodEntry> roots, EffectAnalysisResult effects,
-            CallTargetResolutionResult? calls)
+        public AnnotationResult Evaluate(MethodCatalogResult catalog, IReadOnlyList<MethodEntry> roots, EffectAnalysisResult effects,
+            CallTargetResolutionResult? calls, CancellationToken cancellationToken = default, bool deferTracking = false)
         {
             Stopwatch watch = Stopwatch.StartNew();
             Dictionary<string, MethodEffect> facts = effects.Methods.ToDictionary(method => method.MethodId);
+            Dictionary<string, MethodEffect> tracking = new(facts);
+            IReadOnlyDictionary<string, EffectEvidence> trackingFailures = effects.Failures;
+            HashSet<string> exempt = (calls?.Methods ?? roots).Where(method => method.HasNoLogTrackExemption).Select(method => method.Id).ToHashSet();
+            if (calls != null && exempt.Count != 0)
+            {
+                HashSet<int> affectedRoots = calls.ValueSources.Instances.Where(instance => exempt.Contains(instance.MethodId)).Select(instance => instance.RootId).ToHashSet();
+                MethodEntry[] trackedRoots = roots.Where(method => facts.GetValueOrDefault(method.Id)?.Kind == MethodEffectKind.Setter && !exempt.Contains(method.Id)
+                    && affectedRoots.Contains(calls.ValueSources.RootInstances[method.Id].Id)).ToArray();
+                EffectAnalysisResult remaining = deferTracking
+                    ? new EffectAnalysisResult(Array.Empty<MethodEffect>(), TimeSpan.Zero)
+                    { Failures = trackedRoots.ToDictionary(method => method.Id, method => new EffectEvidence(new[] { method.Id }, -1, "等待完成标签影响检查")) }
+                    : new EffectAnalyzer().AnalyzeAvailable(catalog, trackedRoots, calls, false, cancellationToken, exemptMethods: exempt,
+                        businessAssemblies: roots.Select(method => method.AssemblyPath).ToHashSet(StringComparer.OrdinalIgnoreCase));
+                foreach (MethodEntry method in trackedRoots)
+                {
+                    tracking.Remove(method.Id);
+                }
+                foreach (MethodEffect method in remaining.Methods)
+                {
+                    tracking.Add(method.MethodId, method);
+                }
+                trackingFailures = remaining.Failures;
+            }
             List<AnnotationMethod> methods = new();
             foreach (MethodEntry method in roots.OrderBy(method => method.Id, StringComparer.Ordinal))
             {
@@ -26,17 +49,19 @@ namespace SetterChecker.Core
                     && argument.Value is string text && !string.IsNullOrWhiteSpace(text)) == true;
                 MethodEffectKind? actual = facts.GetValueOrDefault(method.Id)?.Kind;
                 string? failure = log && sourceNlt ? "NoLogTrack 与 LogTrack 冲突"
-                    : actual == null ? effects.Failures.GetValueOrDefault(method.Id)?.Detail ?? "尚未取得真实行为证明" : null;
+                    : actual == null ? effects.Failures.GetValueOrDefault(method.Id)?.Detail ?? "尚未取得真实行为证明"
+                    : !sourceNlt && !log ? trackingFailures.GetValueOrDefault(method.Id)?.Detail : null;
                 string? decision = failure != null ? null : nltClass ? "NLTClass" : sourceNlt ? "NoLogTrack"
-                    : log || actual == MethodEffectKind.Setter ? "ShouldTrack" : "NoLogTrack";
+                    : log || tracking.GetValueOrDefault(method.Id)?.Kind == MethodEffectKind.Setter ? "ShouldTrack" : "NoLogTrack";
                 methods.Add(new AnnotationMethod(method.Id, method.TypeName, method.Name, method.SourcePath!, method.Line,
                     sourceNlt, actual, decision, failure,
                     failure == null && actual == MethodEffectKind.Setter && nlt != null && !reason && !nltClass,
                     failure == null && actual == MethodEffectKind.Setter && (reason || nltClass),
-                    method.IsReportable && failure == null && !sourceNlt && !log && actual == MethodEffectKind.Getter,
+                    method.IsReportable && failure == null && !sourceNlt && !log && decision == "NoLogTrack",
                     facts.GetValueOrDefault(method.Id)?.Evidence ?? effects.Failures.GetValueOrDefault(method.Id))
                 {
                     SourceMethod = method,
+                    TrackingEvidence = sourceNlt ? null : tracking.GetValueOrDefault(method.Id)?.Evidence ?? trackingFailures.GetValueOrDefault(method.Id),
                 });
             }
 
@@ -89,6 +114,9 @@ namespace SetterChecker.Core
 
         /// <summary>每个上层可报告函数到该告警的最短调用过程。</summary>
         public List<string[]> WarningPaths { get; } = new();
+
+        /// <summary>可信标签生效后仍需追踪或尚未证明的独立依据。</summary>
+        public EffectEvidence? TrackingEvidence { get; init; }
     }
 
     /// <summary>保存统一报告输入和标签阶段耗时。</summary>
