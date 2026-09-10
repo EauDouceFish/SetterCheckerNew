@@ -2179,6 +2179,7 @@ namespace SetterChecker.Core
         private readonly Dictionary<int, List<BehaviorWrite>> m_runtimeWrites = new();
         private readonly Dictionary<int, Dictionary<BehaviorFlowPoint, ResolvedCall>> m_callsByCallerInstance = new();
         private readonly Dictionary<string, MethodCallInstance> m_instancesByKey = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, int> m_methodKeyIds = new(StringComparer.Ordinal);
         private readonly Dictionary<int, MethodCallInstance> m_instances = new();
         private readonly Dictionary<string, MethodCallInstance> m_rootInstances = new(StringComparer.Ordinal);
         private readonly Dictionary<(string Method, bool Conditions), RecursiveDependencies> m_recursiveDependencies = new();
@@ -2218,8 +2219,8 @@ namespace SetterChecker.Core
             BehaviorFlowPoint? invocationPoint = null)
         {
             string bindingKey = binding == null ? string.Empty
-                : ReadReferenceKey(binding.Receiver) + "|"
-                    + string.Join("|", binding.Arguments.Select(ReadReferenceKey));
+                : ReadReferenceKey(binding.Receiver, this.m_methodKeyIds) + "|"
+                    + string.Join("|", binding.Arguments.Select(argument => ReadReferenceKey(argument, this.m_methodKeyIds)));
             string key = methodId + "\n" + string.Join("\n", typeArguments) + "\n|\n"
                 + string.Join("\n", methodArguments) + $"\nP:{parentId}\n"
                 + $"C:{invocationPoint?.BlockId}:{invocationPoint?.Order}\n{bindingKey}";
@@ -2490,7 +2491,7 @@ namespace SetterChecker.Core
                         ? $"{origin.Value.Kind}:{origin.Value.Type?.Id}:{origin.Value.Reference}"
                         : origin.Value.Kind == BehaviorValueKind.Type
                             ? $"{origin.Value.Kind}:{this.m_catalog.ResolveTypeDefinition(origin.Value.Type!).Id}:{origin.Value.Type!.Identity.Text}"
-                        : ReadReferenceKey(new[] { origin.Reference })));
+                        : ReadReferenceKey(new[] { origin.Reference }, this.m_methodKeyIds)));
                 }
             }
             return result;
@@ -2509,12 +2510,22 @@ namespace SetterChecker.Core
             }
         }
 
-        // 把逐位置值引用编码成调用实例键的一部分。
-        internal static string ReadReferenceKey(IEnumerable<BehaviorValueReference> references)
+        // 内部调用键可用无损函数编号，跨环境的类型身份仍保留完整函数名。
+        internal static string ReadReferenceKey(IEnumerable<BehaviorValueReference> references, Dictionary<string, int>? methodIds = null)
         {
             return string.Concat(references.Select(reference =>
             {
-                string key = $"{reference.MethodId}:{reference.ValueId}:{reference.InstanceId}";
+                string method = reference.MethodId;
+                if (methodIds != null)
+                {
+                    if (!methodIds.TryGetValue(method, out int id))
+                    {
+                        id = methodIds.Count;
+                        methodIds.Add(method, id);
+                    }
+                    method = id.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                }
+                string key = $"{method}:{reference.ValueId}:{reference.InstanceId}";
 
                 return $"{key.Length}:{key}";
             }));
@@ -4019,7 +4030,8 @@ namespace SetterChecker.Core
                 Dictionary<FlowSearchPoint, ReachingWrite<BehaviorValueReference>?> trace = new();
                 IReadOnlyList<BehaviorValueReference> reaching = this.m_sources.ReadStoredValuesAtPoint(instance, kind, member, locations, readPoint,
                     receiverId, reference, readInitial, throughPoint: throughPoint, returnedPath: returnedPath, trace: trace);
-                if (reaching.Count == 1 && this.m_sources.ReadOrigins(reaching[0], retainTypeChecks: true, retainSlots: true)
+                if (reaching.Count == 1 && reaching[0] != s_previousStorageValue
+                    && this.m_sources.ReadOrigins(reaching[0], retainTypeChecks: true, retainSlots: true)
                         is [{ Value.Kind: BehaviorValueKind.Constant or BehaviorValueKind.Computation or BehaviorValueKind.NewObject or BehaviorValueKind.NewArray or BehaviorValueKind.Function }]
                     && trace.Values.All(write => write == null || write.ReplacesPrevious
                         && write.Source?.Selection == null

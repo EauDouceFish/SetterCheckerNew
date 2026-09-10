@@ -4,6 +4,63 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 子函数从未改写字段的出口返回时，读取调用者原值而非内部续查标记。
+        /// <summary>数值字段与返回条件关联，未写入分支保留原存储内容。</summary>
+        [TestMethod]
+        [DataRow(1, MethodEffectKind.Setter)]
+        [DataRow(2, MethodEffectKind.Getter)]
+        public async Task AnalyzeReadsPreviousNumericStorageOnUnwrittenReturn(int expectedValue, MethodEffectKind expected)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Holder { public int Value; }
+                public static class Calls
+                {
+                    private static int state;
+                    private static int Change(Holder holder, bool flag)
+                    {
+                        if (flag) { holder.Value = 2; return 1; }
+                        return 0;
+                    }
+                    public static void Entry(bool flag)
+                    {
+                        var holder = new Holder { Value = 1 };
+                        int result = Change(holder, flag);
+                        if (result == 0 && holder.Value == EXPECTED) state = 1;
+                    }
+                }
+                """.Replace("EXPECTED", expectedValue.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+            using (Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(project.ExternalAssemblyPath,
+                new Mono.Cecil.ReaderParameters { InMemory = true }))
+            {
+                Mono.Cecil.MethodDefinition change = module.GetType("ExternalSamples.Calls").Methods.Single(method => method.Name == "Change");
+                change.Body.Instructions.Clear();
+                change.Body.Variables.Clear();
+                Mono.Cecil.Cil.ILProcessor writer = change.Body.GetILProcessor();
+                Mono.Cecil.Cil.Instruction unchanged = writer.Create(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_1);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Brfalse, unchanged);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_2);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Stfld, module.GetType("ExternalSamples.Holder").Fields.Single());
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                writer.Append(unchanged);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                module.Write(project.ExternalAssemblyPath);
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEffect effect in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(expected, effect.Kind, effect.MethodId);
+            }
+        }
+
         // 静态候选与内部对象字段的选择不能混为已经发生的静态修改。
         /// <summary>只有实际选中的字段为静态状态时才取得 Setter 证据。</summary>
         [TestMethod]
