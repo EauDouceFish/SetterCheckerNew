@@ -129,7 +129,7 @@ namespace SetterChecker.Core
                     EffectEvidence evidence = new(new[] { instance.MethodId }, write.Position, write.Member?.Name ?? write.Kind.ToString());
                     foreach (WriteSubject subject in write.ReceiverValueId == null ? ReadStaticWriteSubjects(instance, write)
                                  : ReadWriteSubjects(catalog, resolution, new BehaviorValueReference(instance.MethodId, write.ReceiverValueId.Value, instance.Id), instance.RootId,
-                                     pathProof, (new BehaviorValueReference(instance.MethodId, write.ReceiverValueId.Value, instance.Id), write.Point), pathConditions.Contains(instance.RootId)))
+                                     pathProof, (new BehaviorValueReference(instance.MethodId, write.ReceiverValueId.Value, instance.Id), write.Point, write), pathConditions.Contains(instance.RootId)))
                     {
                         Propagate(instance.Id, subject, evidence, write.Point);
                     }
@@ -139,12 +139,12 @@ namespace SetterChecker.Core
             // 静态写入没有接收对象，但仍必须满足写入之前的引用及转换条件。
             IEnumerable<WriteSubject> ReadStaticWriteSubjects(MethodCallInstance instance, BehaviorWrite write)
             {
-                if (pathConditions.Contains(instance.RootId))
+                if (pathConditions.Contains(instance.RootId) || write.Selection != null)
                 {
                     string? failure = null;
                     try
                     {
-                        var selected = pathProof.ReadSelectedOriginsAtPoint(instance.RootId, Array.Empty<ValueOrigin>(), instance.Id, write.Point, null);
+                        var selected = pathProof.ReadSelectedOriginsAtPoint(instance.RootId, Array.Empty<ValueOrigin>(), instance.Id, write.Point, null, write: write);
                         if (!selected.Possible)
                         {
                             if (selected.Complete)
@@ -275,7 +275,7 @@ namespace SetterChecker.Core
         // 将写入目标还原为当前函数的参数、接收对象或静态存储。
         private static IEnumerable<WriteSubject> ReadWriteSubjects(
             MethodCatalogResult catalog, CallTargetResolutionResult resolution, BehaviorValueReference reference, int instanceId,
-            ValueSourceIndex.IntegerPathProof pathProof, (BehaviorValueReference Receiver, BehaviorFlowPoint Point)? witness, bool hasPathConditions)
+            ValueSourceIndex.IntegerPathProof pathProof, (BehaviorValueReference Receiver, BehaviorFlowPoint Point, BehaviorWrite Write)? witness, bool hasPathConditions)
         {
             Queue<BehaviorValueReference> pending = new(new[] { reference });
             HashSet<BehaviorValueReference> visited = new();
@@ -292,13 +292,13 @@ namespace SetterChecker.Core
                 try
                 {
                     origins = resolution.ValueSources.GetRelativeOrigins(current, instanceId, retainTypeChecks: true);
-                    if (witness.HasValue && (hasPathConditions && origins.Any(origin => origin.Value.Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance
+                    if (witness.HasValue && (witness.Value.Write.Selection != null || hasPathConditions && origins.Any(origin => origin.Value.Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance
                             && !origin.Value.IsManagedReferenceSlot)
                         || origins.Any(origin => origin.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray or BehaviorValueKind.Local or BehaviorValueKind.Constant)
                             && origins.Any(origin => origin.Value.Kind is not (BehaviorValueKind.NewObject or BehaviorValueKind.NewArray or BehaviorValueKind.Local or BehaviorValueKind.Constant))))
                     {
                         var selected = pathProof.ReadSelectedOriginsAtPoint(instanceId, origins,
-                            witness.Value.Receiver.InstanceId, witness.Value.Point, witness.Value.Receiver);
+                            witness.Value.Receiver.InstanceId, witness.Value.Point, witness.Value.Receiver, write: witness.Value.Write);
                         origins = selected.Origins;
                         complete &= selected.Complete;
                     }
@@ -362,7 +362,7 @@ namespace SetterChecker.Core
         }
 
         private readonly record struct WriteSubject(BehaviorValueReference? Reference, string? Failure = null,
-            (BehaviorValueReference Receiver, BehaviorFlowPoint Point)? Witness = null);
+            (BehaviorValueReference Receiver, BehaviorFlowPoint Point, BehaviorWrite Write)? Witness = null);
     }
 
     /// <summary>函数自身的真实行为，与日志豁免无关。</summary>

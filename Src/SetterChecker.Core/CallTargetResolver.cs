@@ -512,6 +512,7 @@ namespace SetterChecker.Core
                 }
                 List<ValueOrigin> reads = new();
                 List<BehaviorWrite> writes = new();
+                bool selectsField = members.Select(member => member.Value.Member).Distinct().Skip(1).Any();
                 int completedMembers = 0;
                 foreach (ValueOrigin member in members)
                 {
@@ -550,7 +551,7 @@ namespace SetterChecker.Core
                         writes.Add(new BehaviorWrite(BehaviorWriteKind.Field,
                             field.IsStatic ? null : call.Arguments[0].ValueId, reference, Array.Empty<int>(),
                             call.Arguments[1].ValueId, call.Position)
-                        { Point = call.Point });
+                        { Point = call.Point, Selection = selectsField ? (receiver.Single(), member) : null });
                     }
                     else
                     {
@@ -769,7 +770,8 @@ namespace SetterChecker.Core
                         }
 
                         result.Add((target, new ResolvedCallTarget(target.Method.Id, reference,
-                            actualReceiver, actualArguments, target.DeclaringTypeArguments.Select(type => type.Text).ToArray())));
+                            actualReceiver, actualArguments, target.DeclaringTypeArguments.Select(type => type.Text).ToArray())
+                        { TargetSelections = new[] { (receiver, origin), (boundFunction, function) } }));
                     }
                 }
             }
@@ -2161,6 +2163,7 @@ namespace SetterChecker.Core
         private readonly Dictionary<int, HashSet<(int From, int To)>> m_excludedEdges = new();
         private readonly HashSet<int> m_inactiveInstances = new();
         private readonly Dictionary<BehaviorValueReference, (long Value, int Bits)?> m_integerValues = new();
+        private IntegerPathProof? m_activeIntegerProof;
         private readonly Dictionary<string, (long Value, int Bits)?> m_initializedArrayLengths = new(StringComparer.Ordinal);
         private readonly Dictionary<string, (bool Independent, ValueSourceIndex? Values)> m_initializations = new(StringComparer.Ordinal);
         private long m_integerCycles;
@@ -2615,13 +2618,12 @@ namespace SetterChecker.Core
                 throw new AnalysisException($"数组来源尚未闭合：{reference.MethodId} @ {point.BlockId}");
             }
             ValueOrigin array = arrays[0];
-            IReadOnlyList<ValueOrigin> lengths = GetCallOrigins(array.Reference with { ValueId = array.Value.InputValueIds.Single() });
-            if (lengths.Any(length => length.Value.Kind == BehaviorValueKind.CallResult))
+            string? length = ReadConstantInteger(array.Reference with { ValueId = array.Value.InputValueIds.Single() });
+            if (length == null)
             {
                 return null;
             }
-            if (lengths.Count != 1 || lengths[0].Value.Kind != BehaviorValueKind.Constant
-                || !int.TryParse(lengths[0].Value.Reference, out int count) || count < 0)
+            if (!int.TryParse(length, System.Globalization.CultureInfo.InvariantCulture, out int count) || count < 0)
             {
                 throw new AnalysisException($"数组长度尚未闭合：{reference.MethodId} @ {point.BlockId}");
             }
@@ -2632,7 +2634,8 @@ namespace SetterChecker.Core
                 {
                     BehaviorValueReference subscript = reference with { ValueId = --this.m_nextRuntimeValueId };
                     BindRuntimeValue(subscript, new[] { new ValueOrigin(subscript, new BehaviorValue(subscript.ValueId,
-                        BehaviorValueKind.Constant, index.ToString(System.Globalization.CultureInfo.InvariantCulture), null, Array.Empty<int>())) });
+                        BehaviorValueKind.Constant, index.ToString(System.Globalization.CultureInfo.InvariantCulture), null, Array.Empty<int>())
+                    { Type = new(new("System.Int32"), new("System.Int32"), Array.Empty<TypeIdentityTemplate>(), null, null, null) }) });
                     read = reference with { ValueId = --this.m_nextRuntimeValueId };
                     BindRuntimeValue(read, new[] { new ValueOrigin(read, new BehaviorValue(read.ValueId,
                         BehaviorValueKind.ArrayElementRead, null, null, new[] { reference.ValueId, subscript.ValueId }) { Point = point }) });
@@ -2907,7 +2910,8 @@ namespace SetterChecker.Core
                         proof.ClearQuery();
                         foreach (BehaviorFlowBlock block in conditionalBlocks.Where(block => !conditions.ContainsKey(block.Id) && IsReachable(instance.Id, block.Id)))
                         {
-                            foreach (BehaviorFlowEdge edge in block.Successors.Where(edge => edge.TargetBlockId.HasValue))
+                            foreach (BehaviorFlowEdge edge in block.Successors.Where(edge => edge.TargetBlockId.HasValue
+                                && this.m_excludedEdges.GetValueOrDefault(instance.Id)?.Contains((block.Id, edge.TargetBlockId.Value)) != true))
                             {
                                 if (proof.IsImpossibleEdge(instance.Id, block, edge.TargetBlockId!.Value))
                                 {
@@ -3042,9 +3046,18 @@ namespace SetterChecker.Core
             {
                 try
                 {
+                    if (this.m_readObjectIdentity == null)
+                    {
+                        InitializeObjectChoice(0, Array.Empty<ValueOrigin>());
+                    }
+                    Microsoft.Z3.BoolExpr edge = SimplifyCondition(ReadEdge(instanceId, block, target));
+                    if (edge.IsFalse)
+                    {
+                        return true;
+                    }
                     Microsoft.Z3.BoolExpr prefix = MergeConditions(ReadGraph(instanceId).NodesByBlockId[block.Id]
                         .Select(node => ReadPrefix(instanceId, node)));
-                    Microsoft.Z3.BoolExpr formula = SimplifyCondition(JoinConditions(prefix, ReadEdge(instanceId, block, target)));
+                    Microsoft.Z3.BoolExpr formula = SimplifyCondition(JoinConditions(prefix, edge));
                     if (formula.IsFalse || formula.IsTrue)
                     {
                         return formula.IsFalse;
@@ -3142,7 +3155,8 @@ namespace SetterChecker.Core
                 {
                     ResolvedCall call = this.m_sources.m_callsByCallerInstance.GetValueOrDefault(instanceId)?.GetValueOrDefault(point)
                         ?? throw new AnalysisException($"当前位置之前的调用尚未完成绑定：{this.m_sources.GetInstance(instanceId).MethodId}，{point}");
-                    if (!call.CompletesWithoutTarget && (call.Targets.Count == 0 || call.Targets.Count > 1 && call.Targets.Any(target => target.DispatchTypes == null)))
+                    if (!call.CompletesWithoutTarget && (call.Targets.Count == 0 || call.Targets.Count > 1
+                        && call.Targets.Any(target => target.DispatchTypes == null && target.TargetSelections.Count == 0)))
                     {
                         throw new AnalysisException("调用正常完成的实际目标选择尚未闭合");
                     }
@@ -3329,6 +3343,10 @@ namespace SetterChecker.Core
                 {
                     throw new AnalysisException("整数值的循环赋值尚未闭合");
                 }
+                IntegerPathProof? previous = this.m_sources.m_activeIntegerProof;
+                this.m_sources.m_activeIntegerProof = this;
+                bool insideOrigins = this.m_sources.m_activeOriginQueries.Count != 0;
+                long originCycles = this.m_sources.m_originCycles;
                 try
                 {
                     SelectedValue result;
@@ -3343,7 +3361,7 @@ namespace SetterChecker.Core
                         && runtime.Any(origin => origin.Selection.HasValue))
                     {
                         result = ReadRuntimeChoice(runtime, origin => origin.Value.Kind == BehaviorValueKind.FieldRead
-                            ? ReadFieldValueChoice(reference, origin.Value, readNullness)
+                            ? ReadStorageValueChoice(reference, origin.Value, readNullness)
                             : readNullness ? ReadNullness(origin) : throw new AnalysisException("运行时数值结果尚未进入统一选择读取"));
                     }
                     else if (this.m_sources.m_runtimeValues.TryGetValue(reference, out runtime) && runtime.Any(origin => origin.ReturnPath != null))
@@ -3362,36 +3380,19 @@ namespace SetterChecker.Core
                             }
                             string? operation = raw.Reference == "ldobj"
                                 ? this.m_sources.GetInstance(reference.InstanceId).Substitute(raw.Type!).Id : raw.Reference;
-                            if (raw.Reference == "ldobj" && operation != null
-                                && CallTargetResolver.ReadAssignableType(this.m_sources.m_catalog, operation, out _) is { IsEnum: true } enumType)
-                            {
-                                operation = this.m_sources.m_catalog.GetFields(enumType).Single(field => !field.IsStatic).FieldType.FullName;
-                            }
-                            uint bits = operation switch
-                            {
-                                "ldind.i1" or "ldind.u1" or "System.SByte" or "System.Byte" or "System.Boolean" => 8,
-                                "ldind.i2" or "ldind.u2" or "System.Int16" or "System.UInt16" or "System.Char" => 16,
-                                "ldind.i4" or "ldind.u4" or "System.Int32" or "System.UInt32" => 32,
-                                "ldind.i8" or "System.Int64" or "System.UInt64" => 64,
-                                _ => throw new AnalysisException($"间接整数加载的位宽尚未闭合：{operation}"),
-                            };
-                            if (loaded.Expression.SortSize < bits)
-                            {
-                                throw new AnalysisException("间接加载超出已证明的存储宽度");
-                            }
-                            Microsoft.Z3.BitVecExpr number = loaded.Expression.SortSize == bits ? loaded.Expression
-                                : this.m_context.MkExtract(bits - 1, 0, loaded.Expression);
-                            if (bits < 32)
-                            {
-                                number = operation is "ldind.i1" or "ldind.i2" or "System.SByte" or "System.Int16"
-                                    ? this.m_context.MkSignExt(32 - bits, number) : this.m_context.MkZeroExt(32 - bits, number);
-                            }
-                            return loaded with { Expression = number };
+                            return ReadIntegerLoad(loaded, operation);
                         });
                     }
                     else if (raw?.Kind == BehaviorValueKind.SlotRead)
                     {
-                        result = ReadStoredChoice(reference, raw, readInput);
+                        BehaviorValue slot = this.m_sources.m_methods[reference.MethodId].Values[raw.InputValueIds.Single()];
+                        result = ReadStoredChoice(reference, raw, input =>
+                        {
+                            SelectedValue loaded = readInput(input);
+                            string? type = slot.Type != null ? this.m_sources.GetInstance(reference.InstanceId).Substitute(slot.Type).Id
+                                : slot.Kind == BehaviorValueKind.Parameter ? this.m_sources.ReadParameterType(new ValueOrigin(reference, slot)).Text : null;
+                            return readNullness || slot.IsManagedReferenceSlot || type == null ? loaded : ReadIntegerLoad(loaded, type);
+                        });
                     }
                     else if (raw?.Kind == BehaviorValueKind.Merge)
                     {
@@ -3399,11 +3400,14 @@ namespace SetterChecker.Core
                     }
                     else if (raw?.Kind == BehaviorValueKind.CallResult)
                     {
-                        result = ReadReturnedChoice(reference, readInput);
+                        result = ReadReturnedChoice(reference, input => readNullness ? readInput(input)
+                            : ReadIntegerLoad(readInput(input), this.m_sources.GetInstance(input.InstanceId)
+                                .Substitute(new TypeIdentityTemplate(this.m_sources.m_definitions[input.MethodId].ReturnTypeId)).Text));
                     }
-                    else if (raw?.Kind == BehaviorValueKind.FieldRead && raw.InputValueIds.Count == 1 && this.m_readObjectIdentity != null)
+                    else if (raw?.Kind == BehaviorValueKind.FieldRead && (!readNullness || this.m_readObjectIdentity != null || raw.InputValueIds.Count == 0)
+                        || raw?.Kind == BehaviorValueKind.ArrayElementRead && !readNullness)
                     {
-                        result = ReadFieldValueChoice(reference, raw, readNullness);
+                        result = ReadStorageValueChoice(reference, raw, readNullness);
                     }
                     else if (raw?.Kind == BehaviorValueKind.Parameter
                         && this.m_sources.GetInstance(reference.InstanceId).Binding is ResolvedCallTarget binding)
@@ -3413,7 +3417,8 @@ namespace SetterChecker.Core
                         {
                             throw new AnalysisException("整数实参的目标选择尚未闭合");
                         }
-                        result = readInput(arguments[0]);
+                        result = readNullness ? readInput(arguments[0])
+                            : ReadIntegerLoad(readInput(arguments[0]), this.m_sources.ReadParameterType(new ValueOrigin(reference, raw)).Text);
                     }
                     else
                     {
@@ -3433,7 +3438,7 @@ namespace SetterChecker.Core
                         }
                         else
                         {
-                            string? type = ReadOriginType(origin);
+                            string? type = ReadIntegerType(ReadOriginType(origin));
                             uint bits = type switch
                             {
                                 "System.Int32" or "System.UInt32" or "System.Boolean" or "System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16" or "System.Char" => 32,
@@ -3446,14 +3451,43 @@ namespace SetterChecker.Core
                                 BehaviorValueKind.Parameter when !origin.Value.IsManagedReferenceSlot => this.m_context.MkBVConst($"p{origin.Reference.InstanceId}_{origin.Reference.ValueId}_{bits}", bits),
                                 _ => throw new AnalysisException("整数值的存储状态尚未闭合"),
                             }, this.m_context.MkTrue());
+                            if (origin.Value.Kind == BehaviorValueKind.Parameter)
+                            {
+                                result = result with { Condition = ReadIntegerDomain(result.Expression, type) };
+                            }
                         }
+                    }
+                    if (insideOrigins && originCycles != this.m_sources.m_originCycles)
+                    {
+                        throw new AnalysisException("数值依赖的来源循环仍在求解");
                     }
                     this.m_values.Add(key, result);
                     return result;
                 }
                 finally
                 {
+                    this.m_sources.m_activeIntegerProof = previous;
                     this.m_activeValues.Remove(key);
+                }
+            }
+
+            // 下标只接收完整且无条件的常量，不从某个可行解或被筛选的返回路径取值。
+            internal string? ReadConstantInteger(BehaviorValueReference reference)
+            {
+                try
+                {
+                    SelectedValue value = ReadValue(reference);
+                    if (this.m_witnessHasExcludedPaths || this.m_selectedReturnCondition != null
+                        || !value.Condition.Simplify().IsTrue || value.Expression.Simplify() is not Microsoft.Z3.BitVecNum number)
+                    {
+                        return null;
+                    }
+                    long index = number.SortSize == 32 ? unchecked((int)number.UInt) : unchecked((long)number.UInt64);
+                    return index.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                }
+                catch (AnalysisException)
+                {
+                    return null;
                 }
             }
 
@@ -3474,8 +3508,8 @@ namespace SetterChecker.Core
                 }));
             }
 
-            // 字段数值与写入接收对象使用同一次选择，再共用实际赋值倒查。
-            private SelectedValue ReadFieldValueChoice(BehaviorValueReference reference, BehaviorValue value, bool readNullness)
+            // 字段和数组数值与接收对象使用同一次选择，再共用实际赋值倒查。
+            private SelectedValue ReadStorageValueChoice(BehaviorValueReference reference, BehaviorValue value, bool readNullness)
             {
                 if (value.InputValueIds.Count == 0)
                 {
@@ -3485,15 +3519,25 @@ namespace SetterChecker.Core
                     {
                         throw new AnalysisException("静态字段空值查询的引用类型尚未闭合");
                     }
-                    return ReadStaticFieldChoice(reference, value, stored => stored != reference ? ReadValue(stored, readNullness)
-                        : ReadInputField(input, type is "System.Int64" or "System.UInt64" ? 64u : 32u, readNullness));
+                    return ReadStaticFieldChoice(reference, value, stored => stored != reference
+                        ? readNullness ? ReadValue(stored, true) : ReadIntegerLoad(ReadValue(stored), type)
+                        : ReadInputField(input, !readNullness && ReadIntegerType(type) is "System.Int64" or "System.UInt64" ? 64u : 32u, readNullness));
                 }
+                bool array = value.Kind == BehaviorValueKind.ArrayElementRead;
+                BehaviorWriteKind kind = array ? BehaviorWriteKind.ArrayElement : BehaviorWriteKind.Field;
                 BehaviorValueReference receiver = reference with { ValueId = value.InputValueIds[0] };
-                SelectedValue selected = this.m_readObjectIdentity!(receiver);
-                return ReadChoices(this.m_sources.GetCallOrigins(receiver).Select(origin =>
+                IReadOnlyList<ValueOrigin> receivers = this.m_sources.GetCallOrigins(receiver);
+                if (this.m_readObjectIdentity == null && receivers.Count != 1)
                 {
-                    Microsoft.Z3.BoolExpr guard = JoinConditions(selected.Condition,
-                        this.m_context.MkEq(selected.Expression, this.m_readObjectLabel!(origin.Reference).Expression));
+                    throw new AnalysisException("存储数值的多个接收对象尚未进入同次选择查询");
+                }
+                SelectedValue? selected = receivers is [{ ReturnPath: null, Value.Kind: BehaviorValueKind.NewObject or BehaviorValueKind.NewArray }]
+                    ? null : this.m_readObjectIdentity?.Invoke(receiver);
+                return ReadChoices(receivers.Select(origin =>
+                {
+                    SelectedValue identity = selected ?? ReadNullness(origin);
+                    Microsoft.Z3.BoolExpr guard = JoinConditions(identity.Condition, this.m_context.MkEq(identity.Expression,
+                        selected.HasValue ? this.m_readObjectLabel!(origin.Reference).Expression : this.m_context.MkBV(1, 32)));
                     return (Guard: guard, Value: (Func<SelectedValue>)(() =>
                     {
                         if (origin.ReturnPath != null)
@@ -3501,19 +3545,21 @@ namespace SetterChecker.Core
                             throw new AnalysisException("字段数值的返回接收对象选择尚未闭合");
                         }
                         IReadOnlyList<StorageLocation> locations = this.m_sources.ReadStorageLocations(reference, value.Member,
-                            value.InputValueIds[0], Array.Empty<int>(), new[] { origin })
+                            value.InputValueIds[0], array ? value.InputValueIds.Skip(1).ToArray() : Array.Empty<int>(), new[] { origin })
                             ?? throw new AnalysisException("字段数值的接收对象身份尚未闭合");
                         ValueOrigin input = new(reference, value);
-                        string? type = ReadOriginType(input);
+                        string? type = !array ? ReadOriginType(input) : value.Type != null
+                            ? this.m_sources.GetInstance(reference.InstanceId).Substitute(value.Type).Id : value.Reference?.Replace("ldelem.", "ldind.", StringComparison.Ordinal);
                         if (readNullness && (type == null || !CallTargetResolver.IsReferenceType(this.m_sources.m_catalog, type, this.m_sources)))
                         {
                             throw new AnalysisException("字段空值查询的引用类型尚未闭合");
                         }
-                        uint bits = type is "System.Int64" or "System.UInt64" ? 64u : 32u;
-                        return ReadStorageChoice(reference, this.m_sources.GetInstance(reference.InstanceId), value.Point!.Value, BehaviorWriteKind.Field, value.Member, locations, value.InputValueIds[0],
-                            () => this.m_sources.ReadStorageValuesBeforeInvocation(this.m_sources.GetInstance(reference.InstanceId), BehaviorWriteKind.Field,
+                        uint bits = !array && !readNullness && ReadIntegerType(type) is "System.Int64" or "System.UInt64" ? 64u : 32u;
+                        return ReadStorageChoice(reference, this.m_sources.GetInstance(reference.InstanceId), value.Point!.Value, kind, value.Member, locations, value.InputValueIds[0],
+                            () => this.m_sources.ReadStorageValuesBeforeInvocation(this.m_sources.GetInstance(reference.InstanceId), kind,
                                 value.Member, locations, reference),
-                            stored => stored != reference ? ReadValue(stored, readNullness) : ReadInputField(input, bits, readNullness, new[] { origin }), guard);
+                            stored => stored != reference ? readNullness ? ReadValue(stored, true) : ReadIntegerLoad(ReadValue(stored), type)
+                                : array ? throw new AnalysisException("数组元素的入口数值尚未闭合") : ReadInputField(input, bits, readNullness, new[] { origin }), guard);
                     }));
                 }));
             }
@@ -3590,9 +3636,11 @@ namespace SetterChecker.Core
                 {
                     throw new AnalysisException("子实例与实际父调用目标尚未对应");
                 }
+                Microsoft.Z3.BoolExpr selection = MergeConditions(bindings.Select(binding => binding.TargetSelections.Count == 0
+                    ? this.m_context.MkTrue() : this.m_context.MkAnd(binding.TargetSelections.Select(choice => ReadSelection(choice)).ToArray())));
                 if (bindings.All(binding => binding.DispatchTypes == null))
                 {
-                    return this.m_context.MkTrue();
+                    return selection;
                 }
                 ResolvedCallTarget binding = bindings[0];
                 string? failure = bindings.Select(target => target.DispatchFailure).FirstOrDefault(value => value != null);
@@ -3605,12 +3653,24 @@ namespace SetterChecker.Core
                     this.m_context.MkNot(this.m_context.MkEq(nonNull.Expression, this.m_context.MkBV(0, 32))));
                 if (call.CoversDeclaredReceivers && call.Targets.All(target => target.InstanceId == instance.Id))
                 {
-                    return validReceiver;
+                    return JoinConditions(selection, validReceiver);
                 }
                 Microsoft.Z3.BoolExpr matches = ReadTypeSelection(binding.Receiver[0], origin => bindings.SelectMany(target => target.DispatchTypes!).Distinct()
                     .Where(type => CallTargetResolver.IsInputTypeAllowed(this.m_sources.m_catalog, this.m_sources, origin, type))
                     .Select(type => type.Text).ToArray());
-                return JoinConditions(matches, validReceiver);
+                return JoinConditions(selection, JoinConditions(matches, validReceiver));
+            }
+
+            // 调用目标和动态字段写入共用实际对象或成员的选择条件。
+            private Microsoft.Z3.BoolExpr ReadSelection((BehaviorValueReference Input, ValueOrigin Selected) choice, bool invert = false)
+            {
+                if (this.m_readObjectIdentity == null || this.m_readRuntimeLabel == null)
+                {
+                    throw new AnalysisException("动态目标尚未进入同次对象选择查询");
+                }
+                SelectedValue selected = this.m_readObjectIdentity(choice.Input);
+                Microsoft.Z3.BoolExpr matches = this.m_context.MkEq(selected.Expression, this.m_readRuntimeLabel(choice.Selected).Expression);
+                return JoinConditions(selected.Condition, invert ? this.m_context.MkNot(matches) : matches);
             }
 
             // 转换和动态调用按同一对象选择与实际类型范围建立条件。
@@ -3747,8 +3807,10 @@ namespace SetterChecker.Core
                 }
                 (TypeEntry type, _) = this.m_sources.ReadMemberType(origin.Value.Member, this.m_sources.GetInstance(origin.Reference.InstanceId));
                 var field = this.m_sources.m_catalog.GetFields(type).Single(value => value.Name == origin.Value.Member.Name);
+                string? integerType = readNullness ? null : ReadIntegerType(locations[0].ValueType);
                 if (!field.IsPublic || field.IsStatic != isStatic || field.IsInitOnly || field.IsLiteral
-                    || !readNullness && locations[0].ValueType is not ("System.Boolean" or "System.Int32" or "System.UInt32" or "System.Int64" or "System.UInt64"))
+                    || !readNullness && integerType is not ("System.Boolean" or "System.Char" or "System.Byte" or "System.SByte"
+                        or "System.Int16" or "System.UInt16" or "System.Int32" or "System.UInt32" or "System.Int64" or "System.UInt64"))
                 {
                     throw new AnalysisException("字段初始值的可输入范围尚未闭合");
                 }
@@ -3763,11 +3825,59 @@ namespace SetterChecker.Core
                 {
                     valid = JoinConditions(valid, this.m_context.MkOr(this.m_context.MkEq(value, this.m_context.MkBV(0, bits)), this.m_context.MkEq(value, this.m_context.MkBV(1, bits))));
                 }
-                else if (locations[0].ValueType == "System.Boolean")
+                else
                 {
-                    valid = JoinConditions(valid, this.m_context.MkBVULE(value, this.m_context.MkBV(255, bits)));
+                    valid = JoinConditions(valid, ReadIntegerDomain(value, integerType));
                 }
                 return new SelectedValue(value, valid);
+            }
+
+            // 枚举算术按真实非静态存储字段读取底层类型，不限制为枚举名称清单。
+            private string? ReadIntegerType(string? type)
+            {
+                return type != null && CallTargetResolver.ReadAssignableType(this.m_sources.m_catalog, type, out _) is { IsEnum: true } enumeration
+                    ? this.m_sources.m_catalog.GetFields(enumeration).Single(field => !field.IsStatic).FieldType.FullName : type;
+            }
+
+            // 字段、参数、返回值和间接加载共用实际存储宽度的截窄与扩展。
+            private SelectedValue ReadIntegerLoad(SelectedValue loaded, string? operation)
+            {
+                operation = operation?.StartsWith("ldind.", StringComparison.Ordinal) == true ? operation : ReadIntegerType(operation);
+                uint bits = operation switch
+                {
+                    "ldind.i1" or "ldind.u1" or "System.SByte" or "System.Byte" or "System.Boolean" => 8,
+                    "ldind.i2" or "ldind.u2" or "System.Int16" or "System.UInt16" or "System.Char" => 16,
+                    "ldind.i4" or "ldind.u4" or "System.Int32" or "System.UInt32" => 32,
+                    "ldind.i8" or "System.Int64" or "System.UInt64" => 64,
+                    _ => throw new AnalysisException($"整数加载的位宽尚未闭合：{operation}"),
+                };
+                if (loaded.Expression.SortSize < bits)
+                {
+                    throw new AnalysisException("整数加载超出已证明的存储宽度");
+                }
+                Microsoft.Z3.BitVecExpr number = loaded.Expression.SortSize == bits ? loaded.Expression
+                    : this.m_context.MkExtract(bits - 1, 0, loaded.Expression);
+                if (bits < 32)
+                {
+                    number = operation is "ldind.i1" or "ldind.i2" or "System.SByte" or "System.Int16"
+                        ? this.m_context.MkSignExt(32 - bits, number) : this.m_context.MkZeroExt(32 - bits, number);
+                }
+                return loaded with { Expression = number };
+            }
+
+            // 小整数在计算栈上扩展到三十二位，入口仍只能取实际存储宽度允许的值。
+            private Microsoft.Z3.BoolExpr ReadIntegerDomain(Microsoft.Z3.BitVecExpr value, string? type)
+            {
+                uint width = type switch
+                {
+                    "System.Boolean" or "System.Byte" or "System.SByte" => 8,
+                    "System.Char" or "System.Int16" or "System.UInt16" => 16,
+                    _ => value.SortSize,
+                };
+                Microsoft.Z3.BitVecExpr stored = this.m_context.MkExtract(width - 1, 0, value);
+                Microsoft.Z3.BitVecExpr extended = type is "System.SByte" or "System.Int16"
+                    ? this.m_context.MkSignExt(value.SortSize - width, stored) : this.m_context.MkZeroExt(value.SortSize - width, stored);
+                return this.m_context.MkEq(value, extended);
             }
 
             // 整数和对象来源共用实际入边；值的解释由当前读取用途提供。
@@ -3788,7 +3898,8 @@ namespace SetterChecker.Core
                 Func<BehaviorValueReference, SelectedValue> readValue)
             {
                 ResolvedCall? call = this.m_sources.m_resultCalls.GetValueOrDefault((reference.MethodId, reference.ValueId, reference.InstanceId));
-                if (call == null || call.Targets.Count == 0 || call.Targets.Count > 1 && call.Targets.Any(target => target.DispatchTypes == null))
+                if (call == null || call.Targets.Count == 0 || call.Targets.Count > 1
+                    && call.Targets.Any(target => target.DispatchTypes == null && target.TargetSelections.Count == 0))
                 {
                     throw new AnalysisException("返回值的实际调用目标尚未闭合");
                 }
@@ -3906,8 +4017,17 @@ namespace SetterChecker.Core
             {
                 ValueFlowGraph graph = ReadGraph(instance.Id);
                 Dictionary<FlowSearchPoint, ReachingWrite<BehaviorValueReference>?> trace = new();
-                this.m_sources.ReadStoredValuesAtPoint(instance, kind, member, locations, readPoint,
+                IReadOnlyList<BehaviorValueReference> reaching = this.m_sources.ReadStoredValuesAtPoint(instance, kind, member, locations, readPoint,
                     receiverId, reference, readInitial, throughPoint: throughPoint, returnedPath: returnedPath, trace: trace);
+                if (reaching.Count == 1 && this.m_sources.ReadOrigins(reaching[0], retainTypeChecks: true, retainSlots: true)
+                        is [{ Value.Kind: BehaviorValueKind.Constant or BehaviorValueKind.Computation or BehaviorValueKind.NewObject or BehaviorValueKind.NewArray or BehaviorValueKind.Function }]
+                    && trace.Values.All(write => write == null || write.ReplacesPrevious
+                        && write.Source?.Selection == null
+                        && this.m_sources.m_callsByCallerInstance.GetValueOrDefault(instance.Id)?.ContainsKey(write.Point) != true))
+                {
+                    SelectedValue value = readValue(reaching[0]);
+                    return value with { Condition = JoinConditions(selection ?? this.m_context.MkTrue(), value.Condition) };
+                }
                 Dictionary<FlowSearchPoint, SelectedValue> known = new();
                 HashSet<FlowSearchPoint> active = new();
 
@@ -3940,7 +4060,7 @@ namespace SetterChecker.Core
                         if (write != null)
                         {
                             ResolvedCall? call = this.m_sources.m_callsByCallerInstance.GetValueOrDefault(instance.Id)?.GetValueOrDefault(write.Point);
-                            if (call != null)
+                            if (call != null && !call.CompletesWithoutTarget)
                             {
                                 if (call.Targets.Count == 0)
                                 {
@@ -3968,33 +4088,47 @@ namespace SetterChecker.Core
                                                 }))));
                                 }));
                             }
-                            if (!write.ReplacesPrevious || write.Values.Count != 1)
+                            // 成员选择只包住本次赋值；未选中时继续读取同一位置之前的值。
+                            SelectedValue ReadAssignedValue()
                             {
-                                BehaviorWrite[] declared = this.m_sources.GetWrites(instance.Id, write.Point.BlockId)
-                                    .Where(item => item.Point == write.Point).ToArray();
-                                if (write.Values.Count != 1 || declared.Length != 1 || declared[0].ReceiverValueId is not int writeReceiver
-                                    || this.m_readObjectIdentity == null || this.m_readObjectLabel == null)
+                                if (!write.ReplacesPrevious || write.Values.Count != 1)
                                 {
-                                    throw new AnalysisException("存储赋值的别名选择尚未闭合");
-                                }
-                                BehaviorValueReference address = new(instance.MethodId, writeReceiver, instance.Id);
-                                SelectedValue selected = this.m_readObjectIdentity(address);
-                                Microsoft.Z3.BoolExpr matches = MergeConditions(this.m_sources.GetCallOrigins(address).Select(origin =>
-                                {
-                                    IReadOnlyList<StorageLocation> assigned = this.m_sources.ReadStorageLocations(write.Values[0], declared[0].Member,
-                                        writeReceiver, declared[0].IndexValueIds, new[] { origin })
-                                        ?? throw new AnalysisException("间接写入的实际存储选择尚未闭合");
-                                    return assigned.Any(actual => locations.Any(expected => this.m_sources.StorageLocationsMatch(actual, expected)))
-                                        ? this.m_context.MkEq(selected.Expression, this.m_readObjectLabel(origin.Reference).Expression) : this.m_context.MkFalse();
-                                }));
-                                return ReadChoices(new[]
-                                {
+                                    BehaviorWrite[] declared = this.m_sources.GetWrites(instance.Id, write.Point.BlockId)
+                                        .Where(item => item.Point == write.Point && (write.Source == null || item == write.Source)).ToArray();
+                                    if (write.Values.Count != 1 || declared.Length != 1 || declared[0].ReceiverValueId is not int writeReceiver
+                                        || this.m_readObjectIdentity == null || this.m_readObjectLabel == null)
+                                    {
+                                        throw new AnalysisException("存储赋值的别名选择尚未闭合");
+                                    }
+                                    BehaviorValueReference address = new(instance.MethodId, writeReceiver, instance.Id);
+                                    SelectedValue selected = this.m_readObjectIdentity(address);
+                                    Microsoft.Z3.BoolExpr matches = MergeConditions(this.m_sources.GetCallOrigins(address).Select(origin =>
+                                    {
+                                        IReadOnlyList<StorageLocation> assigned = this.m_sources.ReadStorageLocations(write.Values[0], declared[0].Member,
+                                            writeReceiver, declared[0].IndexValueIds, new[] { origin })
+                                            ?? throw new AnalysisException("间接写入的实际存储选择尚未闭合");
+                                        return assigned.Any(actual => locations.Any(expected => this.m_sources.StorageLocationsMatch(actual, expected)))
+                                            ? this.m_context.MkEq(selected.Expression, this.m_readObjectLabel(origin.Reference).Expression) : this.m_context.MkFalse();
+                                    }));
+                                    return ReadChoices(new[]
+                                    {
                                     (Guard: JoinConditions(selected.Condition, matches), Value: (Func<SelectedValue>)(() => readValue(write.Values[0]))),
                                     (Guard: JoinConditions(selected.Condition, this.m_context.MkNot(matches)),
                                         Value: (Func<SelectedValue>)(() => ReadAt(new FlowSearchPoint(point.Node, write.Point.Order)))),
                                 });
+                                }
+                                return readValue(write.Values[0]);
                             }
-                            return readValue(write.Values[0]);
+                            if (write.Source?.Selection is { } choice)
+                            {
+                                Microsoft.Z3.BoolExpr selected = ReadSelection(choice);
+                                return ReadChoices(new[]
+                                {
+                                    (Guard: selected, Value: (Func<SelectedValue>)ReadAssignedValue),
+                                    (Guard: ReadSelection(choice, invert: true), Value: (Func<SelectedValue>)(() => ReadAt(new FlowSearchPoint(point.Node, write.Point.Order)))),
+                                });
+                            }
+                            return ReadAssignedValue();
                         }
                         if (point.Node.BlockId == -1)
                         {
@@ -4024,15 +4158,10 @@ namespace SetterChecker.Core
                         Value: (Func<SelectedValue>)(() => ReadAt(new FlowSearchPoint(node, readPoint.Order))))));
             }
 
-            // 候选序号仅表示来源选择，绝不把它解释成对象地址或不别名证明。
-            internal (IReadOnlyList<ValueOrigin> Origins, bool Complete, bool Possible) ReadSelectedOriginsAtPoint(int stopAtInstance,
-                IReadOnlyList<ValueOrigin> origins, int instanceId, BehaviorFlowPoint point, BehaviorValueReference? receiver,
-                BehaviorFlowPoint? throughPoint = null, (BehaviorMemberReference? Member, StorageLocation Location, ReturnedValuePath? Path)? storage = null,
-                bool normalReturn = false)
+            // 分支排除和修改证明共用对象选择，不另建一套调用或存储解释。
+            private (Dictionary<BehaviorValueReference, int> Labels, Func<BehaviorValueReference, bool, SelectedValue> ReadOrigin) InitializeObjectChoice(
+                int stopAtInstance, IReadOnlyList<ValueOrigin> origins)
             {
-                ClearQuery();
-                this.m_buildWriteWitness = true;
-                this.m_checkNormalReturn = normalReturn;
                 Dictionary<BehaviorValueReference, int> labels = new();
                 Dictionary<BehaviorMemberReference, int> runtimeLabels = new();
                 int nextLabel = 0;
@@ -4219,6 +4348,23 @@ namespace SetterChecker.Core
                 this.m_readObjectIdentity = reference => ReadOrigin(reference, true);
                 this.m_readObjectLabel = ReadLeaf;
                 this.m_readRuntimeLabel = ReadRuntimeLeaf;
+                return (labels, ReadOrigin);
+            }
+
+            // 候选序号仅表示来源选择，绝不把它解释成对象地址或不别名证明。
+            internal (IReadOnlyList<ValueOrigin> Origins, bool Complete, bool Possible) ReadSelectedOriginsAtPoint(int stopAtInstance,
+                IReadOnlyList<ValueOrigin> origins, int instanceId, BehaviorFlowPoint point, BehaviorValueReference? receiver,
+                BehaviorFlowPoint? throughPoint = null, (BehaviorMemberReference? Member, StorageLocation Location, ReturnedValuePath? Path)? storage = null,
+                bool normalReturn = false, BehaviorWrite? write = null)
+            {
+                ClearQuery();
+                this.m_buildWriteWitness = true;
+                this.m_checkNormalReturn = normalReturn;
+                var choices = InitializeObjectChoice(stopAtInstance, origins);
+                Dictionary<BehaviorValueReference, int> labels = choices.Labels;
+                // 保持当前查询的来源与身份读取入口一致。
+                SelectedValue ReadOrigin(BehaviorValueReference current, bool identity = false) => choices.ReadOrigin(current, identity);
+                Microsoft.Z3.BoolExpr writeSelection = write?.Selection is { } choice ? ReadSelection(choice) : this.m_context.MkTrue();
                 if (throughPoint.HasValue && throughPoint.Value != point)
                 {
                     this.m_selectedReturnCondition = MergeConditions(ReadGraph(instanceId).NodesByBlockId[throughPoint.Value.BlockId]
@@ -4231,9 +4377,10 @@ namespace SetterChecker.Core
                 {
                     SelectedValue container = ReadOrigin(receiver!.Value, true);
                     storageSelection = JoinConditions(container.Condition,
-                        this.m_context.MkEq(container.Expression, ReadLeaf(storage.Value.Location.Receiver!.Value).Expression));
+                        this.m_context.MkEq(container.Expression, this.m_readObjectLabel!(storage.Value.Location.Receiver!.Value).Expression));
                     prefix = JoinConditions(prefix, storageSelection);
                 }
+                prefix = JoinConditions(prefix, writeSelection);
                 if (SimplifyCondition(prefix).IsFalse)
                 {
                     return (Array.Empty<ValueOrigin>(), this.m_witnessBackEdges.Count == 0 && !this.m_witnessHasExcludedPaths, false);
@@ -4358,6 +4505,16 @@ namespace SetterChecker.Core
                 string operation = origin.Value.Reference!;
                 if (operation == "ldlen")
                 {
+                    if (this.m_sources.GetCallOrigins(origin.Reference with { ValueId = origin.Value.InputValueIds.Single() }, retainTypeChecks: true)
+                        is [{ ReturnPath: null, Value.Kind: BehaviorValueKind.NewArray } array])
+                    {
+                        SelectedValue size = ReadValue(array.Reference with { ValueId = array.Value.InputValueIds.Single() });
+                        return size with
+                        {
+                            Condition = JoinConditions(size.Condition,
+                            this.m_context.MkBVSGE(size.Expression, this.m_context.MkBV(0, size.Expression.SortSize)))
+                        };
+                    }
                     var length = this.m_sources.ReadInteger(origin.Reference, new())
                         ?? throw new AnalysisException("数组实际长度的分支选择尚未闭合");
                     return new SelectedValue(this.m_context.MkBV(length.Value, (uint)length.Bits), this.m_context.MkTrue());
@@ -4585,15 +4742,28 @@ namespace SetterChecker.Core
                 .OrderBy(site => site.Point.BlockId).ThenBy(site => site.Point.Order).ThenBy(site => site.Reference.ValueId).ToArray();
         }
 
+        // 下标和数组长度共用实际加载后的确定整数，嵌套查询借用当前环境。
+        private string? ReadConstantInteger(BehaviorValueReference reference)
+        {
+            if (ReadInteger(reference, new()) is { } constant)
+            {
+                return constant.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+            using IntegerPathProof? proof = this.m_activeIntegerProof == null ? CreatePathProof() : null;
+            return (this.m_activeIntegerProof ?? proof)!.ReadConstantInteger(reference);
+        }
+
         // 读取一致的整数值，保留装箱与类型检查，避免把对象误当成数值。
         private (long Value, int Bits)? ReadInteger(BehaviorValueReference reference, HashSet<BehaviorValueReference> active)
         {
-            if (this.m_integerValues.TryGetValue(reference, out var known))
+            bool cache = this.m_activeOriginQueries.Count == 0;
+            if (cache && this.m_integerValues.TryGetValue(reference, out var known))
             {
                 return known;
             }
             long cycles = this.m_integerCycles;
-            IReadOnlyList<ValueOrigin> origins = GetCallOrigins(reference, retainTypeChecks: true);
+            long originCycles = this.m_originCycles;
+            IReadOnlyList<ValueOrigin> origins = ReadOrigins(reference, retainTypeChecks: true, retainSlots: true);
             if (origins.Count == 0)
             {
                 return null;
@@ -4618,8 +4788,8 @@ namespace SetterChecker.Core
                     break;
                 }
             }
-            var result = values.Count == 1 ? values.Single() : null;
-            if (cycles == this.m_integerCycles)
+            var result = values.Count == 1 && (cache || originCycles == this.m_originCycles) ? values.Single() : null;
+            if (cache && cycles == this.m_integerCycles)
             {
                 this.m_integerValues[reference] = result;
             }
@@ -5495,7 +5665,7 @@ namespace SetterChecker.Core
                             || readReceiverId >= 0 && HasSameReceiverSnapshot(
                                 method,
                                 write.ReceiverValueId,
-                                readReceiverId));
+                            readReceiverId), write);
                     }
                 }
 
@@ -5915,13 +6085,13 @@ namespace SetterChecker.Core
             List<string> indexValues = new();
             foreach (int index in indices)
             {
-                IReadOnlyList<ValueOrigin> origins = GetCallOrigins(reference with { ValueId = index });
-                if (origins.Count != 1 || origins[0].Value.Kind != BehaviorValueKind.Constant)
+                string? value = ReadConstantInteger(reference with { ValueId = index });
+                if (value == null)
                 {
                     return null;
                 }
 
-                indexValues.Add(origins[0].Value.Reference!);
+                indexValues.Add(value);
             }
 
             return receivers.Select(origin => new StorageLocation(origin.Reference, definitionId, memberId,
@@ -6048,7 +6218,7 @@ namespace SetterChecker.Core
         private sealed record ReachingWrite<T>(
             IReadOnlyList<T> Values,
             BehaviorFlowPoint Point,
-            bool ReplacesPrevious)
+            bool ReplacesPrevious, BehaviorWrite? Source = null)
             where T : notnull;
 
         // 同一未重新赋值的接收变量在写入和读取处必然指向同一对象。
@@ -6182,7 +6352,7 @@ namespace SetterChecker.Core
                     {
                         result.Add(value);
                     }
-                    if (!write.ReplacesPrevious)
+                    if (!write.ReplacesPrevious || write.Source?.Selection != null)
                     {
                         pending.Enqueue((new FlowSearchPoint(current.Node, write.Point.Order), through));
                     }
@@ -6427,6 +6597,9 @@ namespace SetterChecker.Core
 
         /// <summary>本调用点中实际选择此实现的接收类型。</summary>
         internal IReadOnlyList<TypeIdentityTemplate>? DispatchTypes { get; init; }
+
+        // 保存实际被调用的对象和绑定函数选择，沿子函数入口条件核对。
+        internal IReadOnlyList<(BehaviorValueReference Input, ValueOrigin Selected)> TargetSelections { get; init; } = Array.Empty<(BehaviorValueReference, ValueOrigin)>();
 
         /// <summary>接收类型集合中仍未闭合的证明。</summary>
         internal string? DispatchFailure { get; init; }

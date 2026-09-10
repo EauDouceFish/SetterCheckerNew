@@ -699,7 +699,8 @@ namespace SetterChecker.Core
                     this.m_stack.Push(AddValue(
                         BehaviorValueKind.ArrayElementRead,
                         code.Name,
-                        new[] { arrayValueId, indexValueId }));
+                        new[] { arrayValueId, indexValueId },
+                        type: operand is Cecil.TypeReference elementType ? ReadTypeReference(elementType) : null));
 
                     return;
                 }
@@ -1456,6 +1457,9 @@ namespace SetterChecker.Core
     {
         /// <summary>写入发生的执行位置。</summary>
         public required BehaviorFlowPoint Point { get; init; }
+
+        // 动态选出的写入仍须满足原成员选择，不将多个候选同时覆盖。
+        internal (BehaviorValueReference Input, ValueOrigin Selected)? Selection { get; init; }
     }
 
     /// <summary>

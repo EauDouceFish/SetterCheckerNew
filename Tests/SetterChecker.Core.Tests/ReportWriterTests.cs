@@ -57,7 +57,8 @@ namespace SetterChecker.Core.Tests
             AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2), reportProgress: current =>
                 Assert.AreNotEqual(MethodEffectKind.Setter, current.Annotations.Methods.Single(method => method.Name == "Entry").Actual));
             Assert.IsTrue(run.Complete);
-            Assert.AreEqual(MethodEffectKind.Getter, run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+            Assert.AreEqual(MethodEffectKind.Getter, run.Annotations.Methods.Single(method => method.Name == "Entry").Actual,
+                JsonSerializer.Serialize(run.Annotations));
         }
 
         // 第二个条件的接收对象也可能由第一个条件选择，必须按依赖先后确定目标。
@@ -123,7 +124,7 @@ namespace SetterChecker.Core.Tests
                     Assert.AreNotEqual(MethodEffectKind.Setter, current.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
                 }
             });
-            Assert.IsTrue(run.Complete);
+            Assert.IsTrue(run.Complete, run.Failure + JsonSerializer.Serialize(run.Annotations));
             Assert.AreEqual(setter ? MethodEffectKind.Setter : MethodEffectKind.Getter, run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
         }
 
@@ -589,7 +590,8 @@ namespace SetterChecker.Core.Tests
                 """.Replace("REPLACEMENT", replacement).Replace("FLAG", scenario == "unknown" ? "true" : "false"));
             AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, jobs));
             MethodEffectKind? expected = scenario == "unknown" ? null : scenario == "quiet" ? MethodEffectKind.Getter : MethodEffectKind.Setter;
-            Assert.AreEqual(expected, run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+            Assert.AreEqual(expected, run.Annotations.Methods.Single(method => method.Name == "Entry").Actual,
+                run.Failure + JsonSerializer.Serialize(run.Annotations));
         }
 
         // 相同源码调用在不同上层入口重复出现时，只展示一份问题并保留次数。

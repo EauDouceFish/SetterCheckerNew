@@ -402,6 +402,7 @@ namespace SetterChecker.Core.Tests
         [DataRow("always")]
         [DataRow("conditional")]
         [DataRow("finally")]
+        [DataRow("reflection")]
         public async Task ResolveAsyncReadsOnlyWritesAfterLastDefiniteOverwrite(string overwrite)
         {
             using TestProject project = TestProject.CreateWithCallTargets("""
@@ -430,6 +431,7 @@ namespace SetterChecker.Core.Tests
                 "always" => "holder.Callback = new Action(After);",
                 "conditional" => "if (flag) holder.Callback = new Action(After);",
                 "finally" => "try { } finally { holder.Callback = new Action(After); }",
+                "reflection" => "typeof(Holder).GetField(\"Callback\").SetValue(holder, new Action(After));",
                 _ => string.Empty,
             }));
             MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
