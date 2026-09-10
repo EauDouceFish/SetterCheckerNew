@@ -78,7 +78,6 @@ namespace SetterChecker.Core
                     {
                         behaviors.Add(body.MethodId, body);
                     }
-                    sources.MarkChangedMethods(batch.Methods.Select(body => body.MethodId).ToHashSet(StringComparer.Ordinal));
                     readingTime += batch.Elapsed;
                     foreach (MethodCallInstance instance in pending)
                     {
@@ -2178,6 +2177,7 @@ namespace SetterChecker.Core
         private int m_nextRuntimeValueId = -1;
         private readonly Dictionary<int, List<BehaviorWrite>> m_runtimeWrites = new();
         private readonly Dictionary<int, Dictionary<BehaviorFlowPoint, ResolvedCall>> m_callsByCallerInstance = new();
+        private readonly HashSet<(int Caller, int Block, int Target)> m_reentries = new();
         private readonly Dictionary<string, MethodCallInstance> m_instancesByKey = new(StringComparer.Ordinal);
         private readonly Dictionary<string, int> m_methodKeyIds = new(StringComparer.Ordinal);
         private readonly Dictionary<int, MethodCallInstance> m_instances = new();
@@ -2847,13 +2847,9 @@ namespace SetterChecker.Core
             }
         }
 
-        // 新读出的共享函数体会影响所有使用它的活跃入口。
+        // 恢复分析时重新检查使用已保存函数体的活跃入口。
         internal void MarkChangedMethods(IReadOnlySet<string> methods)
         {
-            if (methods.Count == 0)
-            {
-                return;
-            }
             this.m_changedRoots.UnionWith(this.Instances.Where(instance => methods.Contains(instance.MethodId)).Select(instance => instance.RootId));
         }
 
@@ -2879,6 +2875,13 @@ namespace SetterChecker.Core
         // 只使用前一轮独立证明的路径读条件，整批计算完才发布新路径，避免条件证明自己。
         internal HashSet<int> RefineReachability(IReadOnlySet<int>? provenSetterRoots = null, IReadOnlySet<int>? requestedRoots = null)
         {
+            this.m_integerValues.Clear();
+            HashSet<int> withoutReentry = ExcludeUnreachableReentries(provenSetterRoots, requestedRoots);
+            if (withoutReentry.Count != 0)
+            {
+                this.m_changedRoots.UnionWith(requestedRoots ?? this.m_rootInstances.Values.Select(instance => instance.Id).ToHashSet());
+                return withoutReentry;
+            }
             this.m_integerValues.Clear();
             List<(int Instance, HashSet<int> Blocks, HashSet<(int From, int To)> Edges)> changes = new();
             using IntegerPathProof proof = CreatePathProof();
@@ -2975,13 +2978,91 @@ namespace SetterChecker.Core
             return changedRoots;
         }
 
-        // 同一份调用绑定识别再次入口，供路径排除与写入来源查询共用。
-        internal IntegerPathProof CreatePathProof()
+        // 只有首次执行到不了全部再入位置时，才撤销该根尚未发生的递归调用。
+        private HashSet<int> ExcludeUnreachableReentries(IReadOnlySet<int>? frozenRoots, IReadOnlySet<int>? requestedRoots)
         {
-            HashSet<int> reentered = this.m_callsByCallerInstance.Values.SelectMany(calls => calls.Values)
-                .SelectMany(call => call.Targets.Where(target => GetInstance(target.InstanceId).ParentId != call.CallerInstanceId
-                    || GetInstance(target.InstanceId).InvocationPoint != call.Call.Point).Select(target => target.InstanceId)).ToHashSet();
-            return new IntegerPathProof(this, reentered);
+            HashSet<int> changed = new();
+            if (this.m_reentries.Count == 0)
+            {
+                return changed;
+            }
+            using IntegerPathProof proof = CreatePathProof(firstInvocationOnly: true);
+            foreach (var group in this.m_reentries.GroupBy(call => GetInstance(call.Caller).RootId)
+                .Where(group => frozenRoots?.Contains(group.Key) != true && (requestedRoots == null || requestedRoots.Contains(group.Key))))
+            {
+                proof.ClearQuery();
+                if (!HasCompleteCalls(group.Key) || !group.All(call => proof.IsImpossibleBlock(call.Caller, call.Block)))
+                {
+                    continue;
+                }
+                foreach (var call in group)
+                {
+                    if (!this.m_unreachableBlocks.TryGetValue(call.Caller, out HashSet<int>? blocks))
+                    {
+                        blocks = new();
+                        this.m_unreachableBlocks.Add(call.Caller, blocks);
+                    }
+                    blocks.Add(call.Block);
+                }
+                changed.Add(group.Key);
+            }
+            return changed;
+        }
+
+        // 再入排除前确认没有尚未发现的调用、原生回调或隐式初始化路径。
+        private bool HasCompleteCalls(int rootId)
+        {
+            Queue<int> pending = new(new[] { rootId });
+            HashSet<int> visited = new();
+            try
+            {
+                while (pending.TryDequeue(out int instanceId))
+                {
+                    if (!visited.Add(instanceId))
+                    {
+                        continue;
+                    }
+                    if (!this.m_methods.TryGetValue(GetInstance(instanceId).MethodId, out MethodBehavior? body)
+                        || body.BodyKind != MethodBodyKind.Executable || body.ExceptionHandlers.Count != 0)
+                    {
+                        return false;
+                    }
+                    foreach (BehaviorMemberReference member in ReadValueFlowGraph(body).StaticReads.SelectMany(group => group)
+                        .Where(value => IsReachable(instanceId, value.Point!.Value.BlockId)).Select(value => value.Member!)
+                        .Concat(GetWrites(instanceId).Where(write => write.Kind == BehaviorWriteKind.Field && write.ReceiverValueId == null).Select(write => write.Member!)))
+                    {
+                        RequireStaticFieldInitialization(instanceId, member);
+                    }
+                    foreach (BehaviorCall call in body.Calls.Where(call => IsReachable(instanceId, call.Point.BlockId)))
+                    {
+                        if (this.m_callsByCallerInstance.GetValueOrDefault(instanceId)?.GetValueOrDefault(call.Point) is not ResolvedCall resolved)
+                        {
+                            return false;
+                        }
+                        RequireRuntimeInitialization(resolved);
+                        foreach (ResolvedCallTarget target in resolved.Targets)
+                        {
+                            RequireIndependentInitialization(target.InstanceId);
+                            if (!this.m_methods.TryGetValue(target.MethodId, out MethodBehavior? targetBody)
+                                || targetBody.BodyKind != MethodBodyKind.RuntimeImplementation || !IsRuntimeDelegateCreation(resolved, target))
+                            {
+                                pending.Enqueue(target.InstanceId);
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
+            catch (AnalysisException)
+            {
+                return false;
+            }
+        }
+
+        // 复制当前调用表中再次入口的编号，不为每个整数读取重扫全部调用。
+        internal IntegerPathProof CreatePathProof(bool firstInvocationOnly = false)
+        {
+            return new IntegerPathProof(this, this.m_reentries.Select(call => call.Target).ToHashSet(), firstInvocationOnly);
         }
 
         // 用现有前驱和参数绑定表达条件，不把未表达关系当作自由输入。
@@ -2989,6 +3070,7 @@ namespace SetterChecker.Core
         {
             private readonly ValueSourceIndex m_sources;
             private readonly IReadOnlySet<int> m_reentered;
+            private readonly bool m_firstInvocationOnly;
             private readonly Microsoft.Z3.Context m_context = new();
             private readonly Microsoft.Z3.Solver m_solver;
             private readonly Dictionary<(int Instance, FlowNode Node), Microsoft.Z3.BoolExpr> m_prefixes = new();
@@ -3011,10 +3093,11 @@ namespace SetterChecker.Core
             private readonly Dictionary<string, (Microsoft.Z3.BitVecExpr Value, Microsoft.Z3.BoolExpr IsNull, HashSet<string> Types)> m_typeInputs = new(StringComparer.Ordinal);
 
             // 同一冻结批次共用公式环境，库内部保持单线程。
-            public IntegerPathProof(ValueSourceIndex sources, IReadOnlySet<int> reentered)
+            public IntegerPathProof(ValueSourceIndex sources, IReadOnlySet<int> reentered, bool firstInvocationOnly)
             {
                 this.m_sources = sources;
                 this.m_reentered = reentered;
+                this.m_firstInvocationOnly = firstInvocationOnly;
                 this.m_solver = this.m_context.MkSolver("QF_BV");
                 using Microsoft.Z3.Params parameters = this.m_context.MkParams();
                 parameters.Add("threads", 1u);
@@ -3050,6 +3133,27 @@ namespace SetterChecker.Core
             {
                 return body.Values.Any(value => value.Kind == BehaviorValueKind.Conversion && value.Reference is "castclass" or "isinst")
                     || body.Blocks.Any(block => block.ConditionValueId.HasValue);
+            }
+
+            // 仅证明原图中的整块不可达，不借截断循环或暂定剪枝证明自身。
+            internal bool IsImpossibleBlock(int instanceId, int blockId)
+            {
+                try
+                {
+                    if (this.m_readObjectIdentity == null)
+                    {
+                        InitializeObjectChoice(0, Array.Empty<ValueOrigin>());
+                    }
+                    Microsoft.Z3.BoolExpr prefix = SimplifyCondition(MergeConditions(ReadGraph(instanceId).NodesByBlockId[blockId]
+                        .Select(node => ReadPrefix(instanceId, node))));
+                    this.m_solver.Reset();
+                    this.m_solver.Assert(prefix);
+                    return this.m_solver.Check() == Microsoft.Z3.Status.UNSATISFIABLE;
+                }
+                catch (AnalysisException)
+                {
+                    return false;
+                }
             }
 
             // 不可能证明只用于排除边；有解和未能表达均不能充当修改见证。
@@ -3249,7 +3353,7 @@ namespace SetterChecker.Core
                 {
                     if (body.BodyKind != MethodBodyKind.Executable
                         || body.ExceptionHandlers.Any(handler => !this.m_buildWriteWitness || handler.Kind != BehaviorExceptionHandlerKind.Finally)
-                        || !this.m_buildWriteWitness && this.m_reentered.Contains(instanceId))
+                        || !this.m_buildWriteWitness && !this.m_firstInvocationOnly && this.m_reentered.Contains(instanceId))
                     {
                         throw new AnalysisException("整数路径的函数体、异常或再次调用关联尚未闭合");
                     }
@@ -3966,6 +4070,10 @@ namespace SetterChecker.Core
                     Microsoft.Z3.BoolExpr condition = this.m_context.MkTrue();
                     for (ReturnedValuePath? path = origin.ReturnPath; path != null; path = path.Previous)
                     {
+                        if (this.m_firstInvocationOnly && this.m_reentered.Contains(path.InstanceId))
+                        {
+                            throw new AnalysisException("首次入口不能借用再入函数的返回观察值");
+                        }
                         condition = JoinConditions(condition, JoinConditions(ReadExecutionBefore(path.InstanceId, path.ReturnPoint),
                             MergeConditions(ReadGraph(path.InstanceId).NodesByBlockId[path.ReturnPoint.BlockId].Select(node => ReadPrefix(path.InstanceId, node)))));
                         condition = JoinConditions(condition, MergeConditions(ReadGraph(path.InstanceId).NodesByBlockId[path.ValuePoint.BlockId]
@@ -3978,6 +4086,10 @@ namespace SetterChecker.Core
             // 已绑定尚未读体的目标仍是证明缺口，不能解释成没有返回出口。
             private MethodBehavior ReadTargetBody(ResolvedCallTarget target)
             {
+                if (this.m_firstInvocationOnly && this.m_reentered.Contains(target.InstanceId))
+                {
+                    throw new AnalysisException("首次入口不能借用再入函数的返回值");
+                }
                 return this.m_sources.m_methods.TryGetValue(target.MethodId, out MethodBehavior? body) && body.BodyKind == MethodBodyKind.Executable
                     ? body : throw new AnalysisException("调用目标的可执行函数体尚未读取完成：" + target.MethodId);
             }
@@ -4026,6 +4138,13 @@ namespace SetterChecker.Core
                 Func<IReadOnlyList<BehaviorValueReference>> readInitial, Func<BehaviorValueReference, SelectedValue> readValue,
                 Microsoft.Z3.BoolExpr? selection = null, ReturnedValuePath? returnedPath = null, BehaviorFlowPoint? throughPoint = null)
             {
+                for (ReturnedValuePath? path = returnedPath; this.m_firstInvocationOnly && path != null; path = path.Previous)
+                {
+                    if (this.m_reentered.Contains(path.InstanceId))
+                    {
+                        throw new AnalysisException("首次入口不能借用再入函数返回后的存储");
+                    }
+                }
                 ValueFlowGraph graph = ReadGraph(instance.Id);
                 Dictionary<FlowSearchPoint, ReachingWrite<BehaviorValueReference>?> trace = new();
                 IReadOnlyList<BehaviorValueReference> reaching = this.m_sources.ReadStoredValuesAtPoint(instance, kind, member, locations, readPoint,
@@ -4607,6 +4726,7 @@ namespace SetterChecker.Core
         {
             this.m_changedRoots.UnionWith(roots);
             HashSet<int> instances = this.m_instances.Values.Where(instance => roots.Contains(instance.RootId)).Select(instance => instance.Id).ToHashSet();
+            this.m_reentries.RemoveWhere(call => instances.Contains(call.Caller));
             this.m_inactiveInstances.UnionWith(instances.Except(roots));
             foreach (int id in instances)
             {
@@ -5087,6 +5207,8 @@ namespace SetterChecker.Core
             }
 
             calls.Add(call.Call.Point, call);
+            this.m_reentries.UnionWith(call.Targets.Where(target => GetInstance(target.InstanceId).ParentId != call.CallerInstanceId
+                || GetInstance(target.InstanceId).InvocationPoint != call.Call.Point).Select(target => (call.CallerInstanceId, call.Call.Point.BlockId, target.InstanceId)));
             this.m_changedRoots.Add(GetInstance(call.CallerInstanceId).RootId);
             if (call.Call.ResultValueId is int resultId)
             {

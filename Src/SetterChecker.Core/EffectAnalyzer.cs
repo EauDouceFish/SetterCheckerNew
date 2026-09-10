@@ -28,6 +28,7 @@ namespace SetterChecker.Core
             Dictionary<int, EffectEvidence> boundaries = new();
             HashSet<(int Instance, BehaviorFlowPoint Point, bool EveryPath, bool Conditions)> closedPrefixes = new();
             ILookup<int, (ResolvedCall Call, ResolvedCallTarget Target)> callers = resolution.Calls
+                .Where(call => frozenSetters?.ContainsKey(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId) != true)
                 .SelectMany(call => call.Targets.Select(target => (Call: call, Target: target))).ToLookup(item => item.Target.InstanceId);
             IReadOnlyDictionary<(int Instance, int Block), string> unsettled = resolution.ValueSources.ReadConditionFailures(instances);
             HashSet<int> unsettledRoots = unsettled.Keys.Select(key => resolution.ValueSources.GetInstance(key.Instance).RootId).ToHashSet();

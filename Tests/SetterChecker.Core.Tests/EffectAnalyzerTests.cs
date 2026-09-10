@@ -4,6 +4,75 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 一个根排除递归回边后，另一个根的同名递归仍不能借用它的返回证明。
+        /// <summary>延迟条件先形成回边，再触发入口重查；只允许真实返回的根证明后序写入。</summary>
+        [TestMethod]
+        [DataRow(1, "normal")]
+        [DataRow(4, "normal")]
+        [DataRow(1, "native")]
+        [DataRow(4, "native")]
+        [DataRow(1, "changing")]
+        [DataRow(4, "changing")]
+        public async Task AnalyzeSeparatesRecursiveEntriesAfterDelayedPruning(int jobs, string form)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Calls
+                {
+                    private static int state;
+                    public static void First() { BEFORE if (Read(Gate())) state = 1; }
+                    public static void Second() { if (Read(true)) state = 2; }
+                    public static void Third() { if (Gate()) Unknown(); }
+                    private static bool Gate() => Gate2();
+                    private static bool Gate2() => Gate3();
+                    private static bool Gate3() => false;
+                    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]
+                    private static extern void Unknown();
+                    private static bool Read(bool again) { BODY }
+                }
+                """.Replace("BEFORE", form == "native" ? "Unknown();" : string.Empty).Replace("BODY", form switch
+            {
+                "changing" => "if (again) return Read(!again); return Read(true);",
+                _ => "if (again) return Read(again); return true;",
+            }));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, jobs));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, jobs);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name is "First" or "Second" or "Third").ToArray();
+            HashSet<string> firstRoots = roots.Where(root => root.Name == "First").Select(root => root.Id).ToHashSet();
+            HashSet<string> observed = new();
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, requireCompleteCalls: false,
+                reportProgress: (snapshot, _) =>
+                {
+                    foreach (string root in firstRoots)
+                    {
+                        HashSet<int> children = snapshot.Calls.Where(call => call.CallerMethodId == root)
+                            .SelectMany(call => call.Targets).Select(target => target.InstanceId).ToHashSet();
+                        if (snapshot.Calls.Any(call => children.Contains(call.CallerInstanceId)
+                            && call.Targets.Any(target => target.InstanceId == call.CallerInstanceId)))
+                        {
+                            observed.Add(root);
+                        }
+                    }
+                });
+            CollectionAssert.AreEquivalent(firstRoots.ToArray(), observed.ToArray());
+            foreach (MethodEntry root in roots)
+            {
+                if (root.Name == "Third")
+                {
+                    Assert.AreEqual(MethodEffectKind.Getter, new EffectAnalyzer().Analyze(catalog, new[] { root }, calls).Methods.Single().Kind);
+                }
+                else if (root.Name == "First" && form == "normal")
+                {
+                    Assert.AreEqual(MethodEffectKind.Setter, new EffectAnalyzer().Analyze(catalog, new[] { root }, calls).Methods.Single().Kind);
+                }
+                else
+                {
+                    Assert.Throws<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls));
+                }
+            }
+        }
+
         // 子函数从未改写字段的出口返回时，读取调用者原值而非内部续查标记。
         /// <summary>数值字段与返回条件关联，未写入分支保留原存储内容。</summary>
         [TestMethod]
