@@ -6,6 +6,81 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class ReportWriterTests
     {
+        // 编辑器连续发起验证时整轮排队，排队文本仍属于发起请求的时刻。
+        /// <summary>同一工具实例的两轮工作不叠加并行额度，也不读取后续修改的文本字典。</summary>
+        [TestMethod]
+        public async Task RunQueuesWholeRequestsAndCapturesTextBeforeWaiting()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("public static class Calls { public static int Read() => 1; }");
+            SetterChecker checker = new();
+            MaterialRequest request = new(project.AssemblyDefinitionPath, 2);
+            TaskCompletionSource ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            using ManualResetEventSlim release = new();
+            Task<AnalysisRun> first = Task.Run(() => checker.AnalyzeAsync(request, progress: message =>
+            {
+                if (message.StartsWith("材料读取完成", StringComparison.Ordinal))
+                {
+                    ready.SetResult();
+                    Assert.IsTrue(release.Wait(TimeSpan.FromSeconds(30)), "测试未释放第一轮分析");
+                }
+            }));
+            Task<AnalysisRun>? second = null;
+            try
+            {
+                await ready.Task.WaitAsync(TimeSpan.FromSeconds(30));
+                string source = Directory.GetFiles(Path.GetDirectoryName(project.AssemblyDefinitionPath)!, "*.cs").Single();
+                Dictionary<string, string> texts = new() { [source] = "public static class Calls { public static int Read() => 2; }" };
+                int started = 0;
+                second = checker.AnalyzeAsync(request with { SourceTexts = texts }, progress: _ => Interlocked.Exchange(ref started, 1));
+                bool overlapped = Volatile.Read(ref started) != 0;
+                texts[source] = "public static class Calls { private static int state; public static int Read() => ++state; }";
+                release.Set();
+                AnalysisRun[] runs = await Task.WhenAll(first, second);
+                Assert.IsFalse(overlapped, "第二轮在第一轮目录和行为分析结束前开始工作");
+                Assert.IsTrue(runs.All(run => run.Complete));
+                Assert.AreEqual("public static class Calls { public static int Read() => 2; }",
+                    runs[1].Material.SourceAssemblies.Single().Compilation.SyntaxTrees.Single().GetText().ToString());
+                Assert.AreEqual(MethodEffectKind.Getter, runs[1].Annotations.Methods.Single(method => method.Name == "Read").Actual);
+            }
+            finally
+            {
+                release.Set();
+                await first;
+                if (second != null)
+                {
+                    await second;
+                }
+            }
+        }
+
+        // 报告必须区分实际编译、会话复用和磁盘复用，不能用命中缓存的耗时冒充冷启动。
+        /// <summary>总入口复用材料上下文，报告保留每份程序集的真实工作来源。</summary>
+        [TestMethod]
+        public async Task RunReportsCompilationReuseSeparately()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            using TestProject cache = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("public static class Calls { public static int Read() => 1; }");
+            MaterialRequest request = new(project.AssemblyDefinitionPath, 2) { CacheDirectory = cache.RootPath };
+            SetterChecker checker = new();
+            foreach (CompilationOrigin expected in new[] { CompilationOrigin.Built, CompilationOrigin.Session, CompilationOrigin.DiskCache })
+            {
+                if (expected == CompilationOrigin.DiskCache)
+                {
+                    checker = new SetterChecker();
+                }
+                AnalysisRun run = await checker.AnalyzeAsync(request);
+                Assert.IsTrue(run.Complete, run.Failure);
+                string output = Path.Combine(cache.RootPath, "reports");
+                new ReportWriter().Write(run, output);
+                using JsonDocument report = JsonDocument.Parse(File.ReadAllText(Path.Combine(output, "report.json")));
+                JsonElement assembly = report.RootElement.GetProperty("Compilation").EnumerateArray().Single();
+                Assert.AreEqual(expected.ToString(), assembly.GetProperty("Origin").GetString());
+                Assert.AreEqual(1, assembly.GetProperty("SourceFiles").GetInt32());
+            }
+        }
+
         // 原生边界是否影响结论按每个入口分别展示，不把已绑定调用从报告中隐藏。
         /// <summary>文本与 JSON 同时保留运行时入口、外部库入口和延期依据。</summary>
         [TestMethod]
@@ -962,16 +1037,14 @@ namespace SetterChecker.Core.Tests
         [TestMethod]
         public async Task RunKeepsSetterButFailsCompletionForUnreadDependency()
         {
-            using TestProject project = TestProject.CreateWithCallTargets("namespace Samples; public static class Library { public static int Bad() => 0; }");
+            using TestProject project = TestProject.CreateWithCallTargets("namespace Samples; public static class Library { public static int Bad() => 0; private static int Known() => 0; }");
             using (Mono.Cecil.AssemblyDefinition assembly = Mono.Cecil.AssemblyDefinition.ReadAssembly(project.ExternalAssemblyPath,
                        new Mono.Cecil.ReaderParameters { InMemory = true }))
             {
                 Mono.Cecil.Cil.ILProcessor il = assembly.MainModule.Types.Single(type => type.Name == "Library").Methods.Single(method => method.Name == "Bad").Body.GetILProcessor();
                 il.Body.Instructions.Clear();
-                il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
-                il.Emit(Mono.Cecil.Cil.OpCodes.Localloc);
-                il.Emit(Mono.Cecil.Cil.OpCodes.Pop);
-                il.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_0);
+                il.Emit(Mono.Cecil.Cil.OpCodes.Ldftn, il.Body.Method.DeclaringType.Methods.Single(method => method.Name == "Known"));
+                il.Emit(Mono.Cecil.Cil.OpCodes.Calli, new Mono.Cecil.CallSite(assembly.MainModule.TypeSystem.Int32));
                 il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
                 assembly.Write(project.ExternalAssemblyPath);
             }
@@ -985,10 +1058,10 @@ namespace SetterChecker.Core.Tests
             using JsonDocument json = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "report.json")));
             Assert.IsFalse(json.RootElement.GetProperty("Complete").GetBoolean());
             Assert.AreEqual(1, json.RootElement.GetProperty("UnreadBodies").GetArrayLength());
-            Assert.Contains("localloc", json.RootElement.GetProperty("UnreadBodies")[0].GetProperty("Failure").GetString()!);
+            Assert.Contains("calli", json.RootElement.GetProperty("UnreadBodies")[0].GetProperty("Failure").GetString()!);
         }
 
-        // String.Replace 的 localloc 读取失败不能抹去同批其它根的独立证明。
+        // 尚未支持的函数指针调用不能抹去同批其它根的独立证明。
         /// <summary>逐方法保存原始失败，调用方仍为未证明，独立 Getter/Setter 正常进入报告。</summary>
         [TestMethod]
         [DataRow(1)]
@@ -1003,7 +1076,8 @@ namespace SetterChecker.Core.Tests
                     public int Read() => 1;
                     public void Write() { state++; }
                     public int Trouble(int size) => Unsupported(size);
-                    private unsafe int Unsupported(int size) { byte* data = stackalloc byte[size]; return data[0]; }
+                    private unsafe int Unsupported(int size) { delegate*<int, int> target = &Known; return target(size); }
+                    private static int Known(int value) => value;
                 }
                 """);
             File.AppendAllLines(project.RootResponsePath, new[] { "-unsafe+" }, new System.Text.UTF8Encoding(false));
@@ -1014,7 +1088,7 @@ namespace SetterChecker.Core.Tests
             foreach (AnnotationMethod failed in run.Annotations.Methods.Where(method => method.Name is "Trouble" or "Unsupported"))
             {
                 Assert.IsNull(failed.Actual);
-                Assert.Contains("localloc", failed.Failure!);
+                Assert.Contains("calli", failed.Failure!);
                 Assert.IsNotNull(failed.Evidence);
             }
         }

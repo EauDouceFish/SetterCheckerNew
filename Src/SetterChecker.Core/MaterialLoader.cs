@@ -6,6 +6,7 @@ using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
 using System.Runtime.Loader;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -22,143 +23,260 @@ namespace SetterChecker.Core
     /// </summary>
     public sealed class MaterialLoader
     {
+        private readonly SemaphoreSlim m_requests = new(1);
+        private IReadOnlyDictionary<string, CachedCompilation> m_compilations = new Dictionary<string, CachedCompilation>();
+
         // 按当前 Unity 编译参数建立后续模块唯一使用的材料集合。
         /// <summary>
-        /// 读取源码程序集、外部编译文件和分析器文件。
+        /// 读取当前编译上下文；取消使整轮快照失效，重试应重新调用本方法。
         /// </summary>
         public async Task<MaterialSet> LoadAsync(
             MaterialRequest request,
             CancellationToken cancellationToken = default)
         {
-            Stopwatch stopwatch = Stopwatch.StartNew();
-
-            ValidateRequest(request);
-            string assemblyDefinitionPath = Path.GetFullPath(request.AssemblyDefinitionPath);
-            string projectRoot = FindProjectRoot(assemblyDefinitionPath);
-            string reportRoot = FindReportRoot(assemblyDefinitionPath, projectRoot);
-            string assemblyName = ReadAssemblyDefinition(assemblyDefinitionPath).Name;
-            string responsePath = FindRootResponse(projectRoot, assemblyName);
-            IReadOnlyList<CompilerResponse> responses = ReadResponseClosure(
-                projectRoot,
-                responsePath);
-            IReadOnlyDictionary<string, SyntaxTree> trees = await ParseSourcesAsync(
-                responses,
-                request.Jobs,
-                cancellationToken).ConfigureAwait(false);
-            IReadOnlyDictionary<string, ISourceGenerator[]> generatorsByAnalyzerSet =
-                LoadGeneratorSets(responses);
-            HashSet<string> sourceReferencePaths = responses.SelectMany(response => response.SourceReferences)
-                .Select(reference => reference.ReferencePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            Dictionary<CompilerReference, PortableExecutableReference> metadataReferences =
-                CreateMetadataReferences(responses, sourceReferencePaths, request.Jobs, cancellationToken);
-            ILookup<string, CompilerReference> sourceConsumers = responses.SelectMany(response => response.SourceReferences).Distinct()
-                .Join(responses.SelectMany(response => response.References).Distinct(), source => source.ReferencePath, reference => reference.Path,
-                    (source, reference) => (source.AssemblyName, Reference: reference), StringComparer.OrdinalIgnoreCase)
-                .ToLookup(item => item.AssemblyName, item => item.Reference, StringComparer.Ordinal);
-            Dictionary<string, SourceAssemblyMaterial> builtAssemblies = new(StringComparer.Ordinal);
-            List<CompilerResponse> remaining = responses.ToList();
-            List<Task<SourceAssemblyMaterial>> running = new();
-            Stopwatch compilationWatch = Stopwatch.StartNew();
+            request = request with { SourceTexts = request.SourceTexts.ToDictionary(pair => Path.GetFullPath(pair.Key), pair => pair.Value, StringComparer.OrdinalIgnoreCase) };
+            await this.m_requests.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                while (remaining.Count != 0 || running.Count != 0)
+                // 核对本次实际输入，只有内容一致才复用同会话的编译上下文。
+                Stopwatch stopwatch = Stopwatch.StartNew();
+
+                ValidateRequest(request);
+                string assemblyDefinitionPath = Path.GetFullPath(request.AssemblyDefinitionPath);
+                string projectRoot = FindProjectRoot(assemblyDefinitionPath);
+                string? cacheDirectory = request.CacheDirectory == null ? null : Path.GetFullPath(request.CacheDirectory);
+                if (cacheDirectory != null && IsUnderDirectory(cacheDirectory, projectRoot))
                 {
-                    if (running.Any(task => task.IsFaulted || task.IsCanceled))
+                    throw new AnalysisException($"编译缓存不能写入只读游戏工程：{cacheDirectory}");
+                }
+                string reportRoot = FindReportRoot(assemblyDefinitionPath, projectRoot);
+                IReadOnlySet<string> editorOnlyAssemblies = ReadEditorOnlyReportAssemblies(reportRoot);
+                string assemblyName = ReadAssemblyDefinition(assemblyDefinitionPath).Name;
+                string responsePath = FindRootResponse(projectRoot, assemblyName);
+                IReadOnlyList<CompilerResponse> responses = ReadResponseClosure(
+                    projectRoot,
+                    responsePath,
+                    request.SourceTexts);
+                IReadOnlyDictionary<string, SyntaxTree> trees = await ParseSourcesAsync(
+                    responses,
+                    this.m_compilations,
+                    request.SourceTexts,
+                    request.Jobs,
+                    cancellationToken).ConfigureAwait(false);
+                IReadOnlyDictionary<string, ISourceGenerator[]> generatorsByAnalyzerSet =
+                    LoadGeneratorSets(responses);
+                Dictionary<CompilerReference, (MetadataReference Reference, string Key)> metadataReferences =
+                    CreateMetadataReferences(responses, request.Jobs, cancellationToken);
+                ILookup<string, CompilerReference> sourceConsumers = responses.SelectMany(response => response.References)
+                    .Where(reference => reference.SourceAssemblyName != null).Distinct()
+                    .ToLookup(reference => reference.SourceAssemblyName!, StringComparer.Ordinal);
+                Dictionary<string, CachedCompilation> builtAssemblies = new(StringComparer.Ordinal);
+                List<CompilerResponse> remaining = responses.ToList();
+                List<Task<CachedCompilation>> running = new();
+                Stopwatch compilationWatch = Stopwatch.StartNew();
+                try
+                {
+                    while (remaining.Count != 0 || running.Count != 0)
                     {
-                        await Task.WhenAll(running).ConfigureAwait(false);
-                    }
-                    CompilerResponse[] ready = remaining.Where(response => response.SourceReferences
-                        .All(reference => builtAssemblies.ContainsKey(reference.AssemblyName)))
-                        .Take(request.Jobs - running.Count).ToArray();
-                    if (ready.Length == 0 && running.Count == 0)
-                    {
-                        throw new AnalysisException("源码程序集存在循环依赖，不能使用旧参考拆开编译："
-                            + string.Join("; ", remaining.Select(response => response.AssemblyName)));
-                    }
-
-                    foreach (CompilerResponse response in ready)
-                    {
-                        PortableExecutableReference[] references = response.References.Select(reference => metadataReferences[reference]).ToArray();
-                        remaining.Remove(response);
-                        running.Add(Task.Run(() =>
+                        if (running.Any(task => task.IsFaulted || task.IsCanceled))
                         {
-                            SourceAssemblyMaterial source = BuildSourceAssembly(response, reportRoot,
-                                trees, references, generatorsByAnalyzerSet[string.Join('\0', response.AnalyzerPaths)], cancellationToken);
-                            using MemoryStream image = new();
-                            EmitResult result = source.Compilation.Emit(image, options: response.EmitOptions, cancellationToken: cancellationToken);
-                            if (!result.Success)
-                            {
-                                throw new AnalysisException($"当前源码编译失败：{source.Name} => "
-                                    + string.Join("; ", result.Diagnostics.Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error)));
-                            }
+                            await Task.WhenAll(running).ConfigureAwait(false);
+                        }
+                        CompilerResponse[] ready = remaining.Where(response => response.References
+                            .All(reference => reference.SourceAssemblyName == null || builtAssemblies.ContainsKey(reference.SourceAssemblyName)))
+                            .Take(request.Jobs - running.Count).ToArray();
+                        if (ready.Length == 0 && running.Count == 0)
+                        {
+                            throw new AnalysisException("源码程序集存在循环依赖，不能使用旧参考拆开编译："
+                                + string.Join("; ", remaining.Select(response => response.AssemblyName)));
+                        }
 
-                            return source with { AssemblyImage = image.ToArray() };
-                        }, cancellationToken));
+                        foreach (CompilerResponse response in ready)
+                        {
+                            MetadataReference[] references = response.References.Select(reference => metadataReferences[reference].Reference).ToArray();
+                            string[] referenceInputs = response.References.Select(reference => metadataReferences[reference].Key).ToArray();
+                            remaining.Remove(response);
+                            running.Add(Task.Run(() =>
+                            {
+                                CSharpCompilation compilation = BuildCompilation(response,
+                                    trees, references, generatorsByAnalyzerSet[string.Join('\0', response.AnalyzerPaths)], cancellationToken);
+                                string key = ReadCompilationKey(response, compilation, referenceInputs);
+                                if (this.m_compilations.TryGetValue(response.AssemblyName, out CachedCompilation? previous) && previous.Key == key)
+                                {
+                                    compilation = previous.Material.Compilation;
+                                }
+                                string? cachePath = cacheDirectory == null ? null : Path.Combine(cacheDirectory, key + ".pe");
+                                byte[]? previousImage = previous?.Key == key && previous.Material.Output.IsValueCreated ? previous.Material.AssemblyImage : null;
+                                Lazy<CompiledAssembly> output = new(() =>
+                                {
+                                    Stopwatch emitWatch = Stopwatch.StartNew();
+                                    if (previousImage != null)
+                                    {
+                                        return new CompiledAssembly(previousImage, CompilationOrigin.Session, emitWatch.Elapsed);
+                                    }
+                                    if (cachePath != null && File.Exists(cachePath))
+                                    {
+                                        return new CompiledAssembly(ReadCompilation(cachePath, key), CompilationOrigin.DiskCache, emitWatch.Elapsed);
+                                    }
+                                    using MemoryStream image = new();
+                                    EmitResult result = compilation.Emit(image, options: response.EmitOptions, cancellationToken: cancellationToken);
+                                    if (!result.Success)
+                                    {
+                                        throw new AnalysisException($"当前源码编译失败：{response.AssemblyName} => "
+                                            + string.Join("; ", result.Diagnostics.Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error)));
+                                    }
+                                    byte[] bytes = image.ToArray();
+                                    cancellationToken.ThrowIfCancellationRequested();
+                                    if (cachePath != null)
+                                    {
+                                        SaveCompilation(cachePath, key, bytes);
+                                    }
+                                    return new CompiledAssembly(bytes, CompilationOrigin.Built, emitWatch.Elapsed);
+                                });
+                                string[] reportPaths = editorOnlyAssemblies.Contains(response.AssemblyName) ? Array.Empty<string>()
+                                    : response.SourcePaths.Where(path => IsUnderDirectory(path, reportRoot)).ToArray();
+                                SourceAssemblyMaterial source = new(response.AssemblyName, reportPaths.Length > 0, compilation,
+                                    response.SourcePaths, reportPaths, response.OutputPath, output);
+                                if (source.IsReportAssembly)
+                                {
+                                    _ = source.AssemblyImage;
+                                }
+                                return new CachedCompilation(key, source);
+                            }, cancellationToken));
+                        }
+                        Task<CachedCompilation> completed = await Task.WhenAny(running).ConfigureAwait(false);
+                        if (!completed.IsCompletedSuccessfully)
+                        {
+                            await Task.WhenAll(running).ConfigureAwait(false);
+                        }
+                        CachedCompilation compiled = await completed.ConfigureAwait(false);
+                        SourceAssemblyMaterial finished = compiled.Material;
+                        running.Remove(completed);
+                        builtAssemblies.Add(finished.Name, compiled);
+                        foreach (CompilerReference reference in sourceConsumers[finished.Name])
+                        {
+                            metadataReferences.Add(reference, (finished.Compilation.ToMetadataReference(
+                                reference.Properties.Aliases, reference.Properties.EmbedInteropTypes), compiled.Key));
+                        }
                     }
-                    Task<SourceAssemblyMaterial> completed = await Task.WhenAny(running).ConfigureAwait(false);
-                    if (!completed.IsCompletedSuccessfully)
-                    {
-                        await Task.WhenAll(running).ConfigureAwait(false);
-                    }
-                    SourceAssemblyMaterial finished = await completed.ConfigureAwait(false);
-                    running.Remove(completed);
-                    builtAssemblies.Add(finished.Name, finished);
-                    foreach (CompilerReference reference in sourceConsumers[finished.Name].Distinct())
-                    {
-                        metadataReferences.Add(reference, MetadataReference.CreateFromImage(finished.AssemblyImage,
-                            reference.Properties, filePath: finished.AssemblyPath));
-                    }
+                }
+                finally
+                {
+                    // 正常结束时队列为空；失败时只收拢其他任务，原始异常仍由主流程抛出。
+                    await ((Task)Task.WhenAll(running)).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+                }
+                compilationWatch.Stop();
+                SourceAssemblyMaterial[] sourceAssemblies = builtAssemblies.Values.Select(compiled => compiled.Material)
+                    .OrderBy(assembly => assembly.Name, StringComparer.Ordinal).ToArray();
+                string[] externalAssemblyPaths = responses
+                    .SelectMany(response => response.References)
+                    .Where(reference => reference.SourceAssemblyName == null)
+                    .Select(reference => reference.Path)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Order(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                ExternalMaterialResolution external = await ResolveExternalAssembliesAsync(
+                    projectRoot,
+                    externalAssemblyPaths,
+                    sourceAssemblies.Select(source => source.Name).ToHashSet(StringComparer.OrdinalIgnoreCase),
+                    responses.Single(response => string.Equals(
+                        response.AssemblyName,
+                        assemblyName,
+                        StringComparison.Ordinal)),
+                    request.Jobs,
+                    cancellationToken).ConfigureAwait(false);
+                string[] analyzerPaths = responses
+                    .SelectMany(response => response.AnalyzerPaths)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Order(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+
+                stopwatch.Stop();
+                cancellationToken.ThrowIfCancellationRequested();
+                this.m_compilations = builtAssemblies;
+
+                return new MaterialSet(
+                    projectRoot,
+                    sourceAssemblies,
+                    external.Assemblies,
+                    external.LookupPaths,
+                    analyzerPaths,
+                    stopwatch.Elapsed)
+                {
+                    CompilationElapsed = compilationWatch.Elapsed,
+                    AssemblyRedirects = external.AssemblyRedirects,
+                    UsesUnityLegacyBinding = external.UsesUnityLegacyBinding,
+                    ExplicitRuntimeAssemblyPaths = external.ExplicitRuntimeAssemblyPaths,
+                };
+            }
+            finally
+            {
+                this.m_requests.Release();
+            }
+        }
+
+        // 核对输入身份和实际内容，拒绝损坏或被放错位置的编译产物。
+        private static byte[] ReadCompilation(string path, string key)
+        {
+            using FileStream cached = new(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+            byte[] stored = new byte[cached.Length];
+            cached.ReadExactly(stored);
+            if (stored.Length < 128 || !Convert.FromHexString(key).AsSpan().SequenceEqual(stored.AsSpan(0, 64))
+                || !SHA512.HashData(stored.AsSpan(128)).AsSpan().SequenceEqual(stored.AsSpan(64, 64)))
+            {
+                throw new AnalysisException($"编译缓存内容损坏：{path}");
+            }
+            return stored[128..];
+        }
+
+        // 先写完整内容再原子发布；并发发布只接受已通过同一身份核验的完整产物。
+        private static void SaveCompilation(string path, string key, byte[] image)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            string temporaryPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                using (FileStream stream = new(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    stream.Write(Convert.FromHexString(key));
+                    stream.Write(SHA512.HashData(image));
+                    stream.Write(image);
+                    stream.Flush(flushToDisk: true);
+                }
+                try
+                {
+                    File.Move(temporaryPath, path);
+                }
+                catch (IOException) when (File.Exists(path))
+                {
+                    ReadCompilation(path, key);
                 }
             }
             finally
             {
-                // 正常结束时队列为空；失败时只收拢其他任务，原始异常仍由主流程抛出。
-                await ((Task)Task.WhenAll(running)).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+                File.Delete(temporaryPath);
             }
-            compilationWatch.Stop();
-            IReadOnlySet<string> editorOnlyAssemblies = ReadEditorOnlyReportAssemblies(reportRoot);
-            SourceAssemblyMaterial[] sourceAssemblies = builtAssemblies.Values
-                .Select(source => editorOnlyAssemblies.Contains(source.Name)
-                    ? source with { IsReportAssembly = false, ReportSourcePaths = Array.Empty<string>() } : source)
-                .OrderBy(assembly => assembly.Name, StringComparer.Ordinal).ToArray();
-            string[] externalAssemblyPaths = responses
-                .SelectMany(response => response.References)
-                .Select(reference => reference.Path)
-                .Where(path => !sourceReferencePaths.Contains(path))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Order(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            ExternalMaterialResolution external = await ResolveExternalAssembliesAsync(
-                projectRoot,
-                externalAssemblyPaths,
-                sourceAssemblies.Select(source => source.Name).ToHashSet(StringComparer.OrdinalIgnoreCase),
-                responses.Single(response => string.Equals(
-                    response.AssemblyName,
-                    assemblyName,
-                    StringComparison.Ordinal)),
-                request.Jobs,
-                cancellationToken).ConfigureAwait(false);
-            string[] analyzerPaths = responses
-                .SelectMany(response => response.AnalyzerPaths)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Order(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
+        }
 
-            stopwatch.Stop();
-
-            return new MaterialSet(
-                projectRoot,
-                sourceAssemblies,
-                external.Assemblies,
-                external.LookupPaths,
-                analyzerPaths,
-                stopwatch.Elapsed)
+        // 按实际编译器、展开参数、生成后的源码和引用内容建立编译产物身份。
+        private static string ReadCompilationKey(CompilerResponse response, CSharpCompilation compilation, IEnumerable<string> referenceInputs)
+        {
+            using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA512);
+            IEnumerable<string> inputs = new[] { typeof(MaterialLoader).Module.ModuleVersionId.ToString(), typeof(CSharpCompilation).Module.ModuleVersionId.ToString(), response.AssemblyName, response.OutputPath }
+                .Concat(response.Arguments).Concat(referenceInputs)
+                .Append(compilation.Assembly.Identity.GetDisplayName(fullKey: true))
+                .Append(response.CompilationOptions.GeneralDiagnosticOption.ToString())
+                .Concat(response.CompilationOptions.SpecificDiagnosticOptions.OrderBy(pair => pair.Key, StringComparer.Ordinal).SelectMany(pair => new[] { pair.Key, pair.Value.ToString() }))
+                .Concat(compilation.SyntaxTrees.SelectMany(tree => new[] { tree.FilePath, tree.GetText().ToString() }));
+            foreach (string input in inputs)
             {
-                CompilationElapsed = compilationWatch.Elapsed,
-                AssemblyRedirects = external.AssemblyRedirects,
-                UsesUnityLegacyBinding = external.UsesUnityLegacyBinding,
-                ExplicitRuntimeAssemblyPaths = external.ExplicitRuntimeAssemblyPaths,
-            };
+                byte[] bytes = Encoding.UTF8.GetBytes(input);
+                byte[] length = new byte[sizeof(int)];
+                System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(length, bytes.Length);
+                hash.AppendData(length);
+                hash.AppendData(bytes);
+            }
+            return Convert.ToHexString(hash.GetHashAndReset());
         }
 
         // 只排除 asmdef 明确声明仅用于编辑器的报告程序集，不删除分析材料。
@@ -909,12 +1027,13 @@ namespace SetterChecker.Core
         // 当前构建的全部源码都可能提供接口实现或回调；引用关系只认本次构建声明的产物。
         private static IReadOnlyList<CompilerResponse> ReadResponseClosure(
             string projectRoot,
-            string rootResponsePath)
+            string rootResponsePath,
+            IReadOnlyDictionary<string, string> sourceTexts)
         {
             IReadOnlyDictionary<string, string> outputs = ReadBuildOutputs(projectRoot, rootResponsePath);
             return outputs.Values.Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).Select(path =>
             {
-                CompilerResponse response = ReadResponse(projectRoot, Path.GetFileNameWithoutExtension(path), path, outputs);
+                CompilerResponse response = ReadResponse(projectRoot, Path.GetFileNameWithoutExtension(path), path, outputs, sourceTexts);
                 if (!outputs.TryGetValue(response.OutputPath, out string? owner)
                     || !string.Equals(owner, path, StringComparison.OrdinalIgnoreCase))
                 {
@@ -952,22 +1071,31 @@ namespace SetterChecker.Core
             string projectRoot,
             string assemblyName,
             string responsePath,
-            IReadOnlyDictionary<string, string> buildOutputs)
+            IReadOnlyDictionary<string, string> buildOutputs,
+            IReadOnlyDictionary<string, string> sourceTexts)
         {
+            string[] expandedArguments = ReadResponseArguments(projectRoot, responsePath, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
             CSharpCommandLineArguments arguments = CSharpCommandLineParser.Default.Parse(
                 new[] { $"@{responsePath}" },
                 projectRoot,
                 sdkDirectory: null);
             RequireNoErrors(arguments.Errors, $"无法读取 Unity 编译响应文件 {responsePath}");
+            if (!expandedArguments.SequenceEqual(ReadResponseArguments(projectRoot, responsePath, new HashSet<string>(StringComparer.OrdinalIgnoreCase)), StringComparer.Ordinal))
+            {
+                throw new AnalysisException($"编译响应文件在读取期间发生变化：{responsePath}");
+            }
 
             string[] sourcePaths = arguments.SourceFiles
                 .Select(source => ResolvePath(projectRoot, source.Path))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
             CompilerReference[] references = arguments.MetadataReferences
-                .Select(reference => new CompilerReference(
-                    ResolvePath(projectRoot, reference.Reference),
-                    reference.Properties))
+                .Select(reference =>
+                {
+                    string path = ResolvePath(projectRoot, reference.Reference);
+                    return new CompilerReference(path, reference.Properties,
+                        buildOutputs.TryGetValue(path, out string? sourceResponse) ? Path.GetFileNameWithoutExtension(sourceResponse) : null);
+                })
                 .ToArray();
             string[] analyzerPaths = arguments.AnalyzerReferences
                 .Select(reference => ResolvePath(projectRoot, reference.FilePath))
@@ -980,16 +1108,10 @@ namespace SetterChecker.Core
                 .Order(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
-            RequireFiles(sourcePaths, "源码", responsePath);
-            RequireFiles(references.Select(reference => reference.Path), "外部编译文件", responsePath);
+            RequireFiles(sourcePaths.Where(path => !sourceTexts.ContainsKey(path)), "源码", responsePath);
+            RequireFiles(references.Where(reference => reference.SourceAssemblyName == null).Select(reference => reference.Path), "外部编译文件", responsePath);
             RequireFiles(analyzerPaths, "分析器", responsePath);
             RequireFiles(additionalFilePaths, "附加文件", responsePath);
-
-            SourceReference[] sourceReferences = references
-                .Where(reference => buildOutputs.ContainsKey(reference.Path))
-                .Select(reference => new SourceReference(Path.GetFileNameWithoutExtension(buildOutputs[reference.Path]),
-                    reference.Path))
-                .ToArray();
 
             return new CompilerResponse(
                 assemblyName,
@@ -1002,7 +1124,30 @@ namespace SetterChecker.Core
                 references,
                 analyzerPaths,
                 additionalFilePaths,
-                sourceReferences);
+                expandedArguments);
+        }
+
+        // 展开参数只用于缓存核验，实际编译语义始终由 Roslyn 读取原始响应文件决定。
+        private static string[] ReadResponseArguments(string projectRoot, string path, HashSet<string> active)
+        {
+            if (!active.Add(path))
+            {
+                throw new AnalysisException($"编译响应文件循环引用：{path}");
+            }
+            string[] arguments = File.ReadLines(path).SelectMany(line => CommandLineParser.SplitCommandLineIntoArguments(line, removeHashComments: true))
+                .SelectMany(argument =>
+                {
+                    if (!argument.StartsWith('@'))
+                    {
+                        return new[] { argument };
+                    }
+                    // 此选项只复用 Roslyn 的单文件路径解码；不读取配置、不按文件列表或程序集名解释路径。
+                    CSharpCommandLineArguments nested = CSharpCommandLineParser.Default.Parse(new[] { "/out:ResponsePath.dll", "/appconfig:" + argument[1..] }, projectRoot, sdkDirectory: null);
+                    RequireNoErrors(nested.Errors, $"无法读取响应文件路径：{argument}");
+                    return ReadResponseArguments(projectRoot, nested.AppConfigPath!, active);
+                }).ToArray();
+            active.Remove(path);
+            return arguments;
         }
 
         // 验证 Unity 声明参与编译的文件确实存在。
@@ -1023,6 +1168,8 @@ namespace SetterChecker.Core
         // 并行读取并解析全部源码文件。
         private static async Task<IReadOnlyDictionary<string, SyntaxTree>> ParseSourcesAsync(
             IReadOnlyList<CompilerResponse> responses,
+            IReadOnlyDictionary<string, CachedCompilation> previous,
+            IReadOnlyDictionary<string, string> sourceTexts,
             int jobs,
             CancellationToken cancellationToken)
         {
@@ -1031,66 +1178,75 @@ namespace SetterChecker.Core
                     new SourceInput(response.AssemblyName, path, response.ParseOptions)))
                 .ToArray();
             ConcurrentDictionary<string, SyntaxTree> trees = new(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, SyntaxTree> oldTrees = previous.Values.SelectMany(previousAssembly => previousAssembly.Material.Compilation.SyntaxTrees
+                .Select(tree => (Key: SourceKey(previousAssembly.Material.Name, tree.FilePath), Tree: tree))).ToDictionary(item => item.Key, item => item.Tree, StringComparer.OrdinalIgnoreCase);
+            HashSet<string> paths = inputs.Select(input => input.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            string? unknownPath = sourceTexts.Keys.FirstOrDefault(path => !paths.Contains(path));
+            if (unknownPath != null)
+            {
+                throw new AnalysisException($"编辑器文本不属于当前编译输入：{unknownPath}");
+            }
 
             await Parallel.ForEachAsync(
-                inputs,
+                inputs.GroupBy(input => input.Path, StringComparer.OrdinalIgnoreCase),
                 new ParallelOptions
                 {
                     CancellationToken = cancellationToken,
                     MaxDegreeOfParallelism = jobs,
                 },
-                async (input, token) =>
+                async (group, token) =>
                 {
-                    string text = await File.ReadAllTextAsync(input.Path, token).ConfigureAwait(false);
-                    string key = SourceKey(input.AssemblyName, input.Path);
-
-                    trees[key] = CSharpSyntaxTree.ParseText(
-                        text,
-                        input.ParseOptions,
-                        input.Path,
-                        cancellationToken: token);
+                    string text = sourceTexts.TryGetValue(group.Key, out string? editedText)
+                        ? editedText : await File.ReadAllTextAsync(group.Key, token).ConfigureAwait(false);
+                    foreach (SourceInput input in group)
+                    {
+                        string key = SourceKey(input.AssemblyName, input.Path);
+                        oldTrees.TryGetValue(key, out SyntaxTree? oldTree);
+                        trees[key] = oldTree != null && oldTree.Options.Equals(input.ParseOptions) && oldTree.GetText(token).ToString() == text
+                            ? oldTree : CSharpSyntaxTree.ParseText(text, input.ParseOptions, input.Path, cancellationToken: token);
+                    }
                 }).ConfigureAwait(false);
 
             return trees;
         }
 
         // 并行建立可由多个源码程序集安全共用的不可变元数据参考。
-        private static Dictionary<CompilerReference, PortableExecutableReference>
+        private static Dictionary<CompilerReference, (MetadataReference Reference, string Key)>
             CreateMetadataReferences(
             IReadOnlyList<CompilerResponse> responses,
-            IReadOnlySet<string> sourceReferencePaths,
             int jobs,
             CancellationToken cancellationToken)
         {
             CompilerReference[] inputs = responses
                 .SelectMany(response => response.References)
-                .Where(reference => !sourceReferencePaths.Contains(reference.Path))
+                .Where(reference => reference.SourceAssemblyName == null)
                 .Distinct()
                 .ToArray();
-            PortableExecutableReference[] references = new PortableExecutableReference[inputs.Length];
-
-            Parallel.For(
-                0,
-                inputs.Length,
+            ConcurrentDictionary<CompilerReference, (MetadataReference Reference, string Key)> references = new();
+            Parallel.ForEach(
+                inputs.GroupBy(input => input.Path, StringComparer.OrdinalIgnoreCase),
                 new ParallelOptions
                 {
                     CancellationToken = cancellationToken,
                     MaxDegreeOfParallelism = jobs,
                 },
-                index => references[index] = MetadataReference.CreateFromFile(
-                    inputs[index].Path,
-                    inputs[index].Properties));
-
-            return Enumerable.Range(0, inputs.Length)
-                .ToDictionary(index => inputs[index], index => references[index]);
+                group =>
+                {
+                    byte[] image = File.ReadAllBytes(group.Key);
+                    string key = Convert.ToHexString(SHA512.HashData(image));
+                    foreach (CompilerReference reference in group)
+                    {
+                        references[reference] = (MetadataReference.CreateFromImage(image, reference.Properties, filePath: reference.Path), key);
+                    }
+                });
+            return new Dictionary<CompilerReference, (MetadataReference Reference, string Key)>(references);
         }
 
         // 用已解析源码和原始编译选项建立程序集编译内容。
-        private static SourceAssemblyMaterial BuildSourceAssembly(
+        private static CSharpCompilation BuildCompilation(
             CompilerResponse response,
-            string reportRoot,
             IReadOnlyDictionary<string, SyntaxTree> trees,
-            IReadOnlyList<PortableExecutableReference> references,
+            IReadOnlyList<MetadataReference> references,
             IReadOnlyList<ISourceGenerator> generators,
             CancellationToken cancellationToken)
         {
@@ -1122,18 +1278,7 @@ namespace SetterChecker.Core
                 compilation = (CSharpCompilation)generatedCompilation;
             }
 
-            string[] reportSourcePaths = response.SourcePaths
-                .Where(path => IsUnderDirectory(path, reportRoot))
-                .ToArray();
-
-            return new SourceAssemblyMaterial(
-                response.AssemblyName,
-                reportSourcePaths.Length > 0,
-                compilation,
-                response.SourcePaths,
-                reportSourcePaths,
-                response.OutputPath,
-                Array.Empty<byte>());
+            return compilation;
         }
 
         // 编译响应和源码生成共用错误诊断检查，保留原错误内容。
@@ -1206,11 +1351,8 @@ namespace SetterChecker.Core
 
         private sealed record CompilerReference(
             string Path,
-            MetadataReferenceProperties Properties);
-
-        private sealed record SourceReference(
-            string AssemblyName,
-            string ReferencePath);
+            MetadataReferenceProperties Properties,
+            string? SourceAssemblyName);
 
         private sealed record SourceInput(
             string AssemblyName,
@@ -1227,7 +1369,9 @@ namespace SetterChecker.Core
             IReadOnlyList<CompilerReference> References,
             IReadOnlyList<string> AnalyzerPaths,
             IReadOnlyList<string> AdditionalFilePaths,
-            IReadOnlyList<SourceReference> SourceReferences);
+            IReadOnlyList<string> Arguments);
+
+        private sealed record CachedCompilation(string Key, SourceAssemblyMaterial Material);
 
         private sealed class DiskAdditionalText : AdditionalText
         {

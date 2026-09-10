@@ -19,10 +19,10 @@ namespace SetterChecker.Cli
 
             try
             {
-                (string projectPath, int jobs, string output) = ParseArguments(arguments);
+                (MaterialRequest request, string output) = ParseArguments(arguments);
                 Stopwatch stopwatch = Stopwatch.StartNew();
                 AnalysisRun run = await new SetterChecker.Core.SetterChecker()
-                        .AnalyzeAsync(new MaterialRequest(projectPath, jobs), progress: Console.Error.WriteLine,
+                        .AnalyzeAsync(request, progress: Console.Error.WriteLine,
                             reportProgress: current => new ReportWriter().Write(current, output));
                 new ReportWriter().Write(run, output);
                 stopwatch.Stop();
@@ -44,11 +44,12 @@ namespace SetterChecker.Cli
         }
 
         // 解析项目路径和全程序共用的最大并行数。
-        private static (string ProjectPath, int Jobs, string Output) ParseArguments(string[] arguments)
+        private static (MaterialRequest Request, string Output) ParseArguments(string[] arguments)
         {
             string? projectPath = null;
             int jobs = 4;
             string output = Path.Combine(Environment.CurrentDirectory, "reports");
+            string? cache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SetterChecker", "Compilation");
 
             for (int index = 0; index < arguments.Length; index++)
             {
@@ -70,6 +71,11 @@ namespace SetterChecker.Cli
                     output = ReadValue(arguments, ref index, "--output");
                     continue;
                 }
+                if (argument is "--cache" or "--no-cache")
+                {
+                    cache = argument == "--cache" ? ReadValue(arguments, ref index, argument) : null;
+                    continue;
+                }
 
                 if (argument is "-j" or "--jobs")
                 {
@@ -88,7 +94,8 @@ namespace SetterChecker.Cli
                 throw new AnalysisException($"不支持的参数：{argument}");
             }
 
-            return (projectPath ?? throw new AnalysisException("缺少 --project 项目路径。"), jobs, output);
+            return (new MaterialRequest(projectPath ?? throw new AnalysisException("缺少 --project 项目路径。"), jobs)
+            { CacheDirectory = cache }, output);
         }
 
         // 读取必须紧跟在参数名后的值。

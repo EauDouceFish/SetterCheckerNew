@@ -150,6 +150,20 @@ namespace SetterChecker.Core.Tests
             return Create(includeDependency: false);
         }
 
+        // 分开直接调用的源码依赖与完全无关的构建节点。
+        public static TestProject CreateWithDirectDependencyAndUnrelatedSource()
+        {
+            TestProject project = Create();
+            project.WriteRootSource("public static class Caller { public static void Entry() => DependencyType.Change(); }");
+            File.WriteAllText(Path.Combine(project.RootPath, "Packages", "dependency", "Dependency.cs"),
+                "public static class DependencyType { public static int Count; public static void Change() { Count++; } }", new System.Text.UTF8Encoding(false));
+            string unrelated = Path.Combine(project.RootPath, "Unrelated.cs");
+            File.WriteAllText(unrelated, "public sealed class Unrelated { }", new System.Text.UTF8Encoding(false));
+            WriteResponse(project.RootPath, Path.Combine(Path.GetDirectoryName(project.RootResponsePath)!, "Unrelated.rsp"), "Unrelated",
+                unrelated, new[] { project.ExternalAssemblyPath }, Array.Empty<string>());
+            return project;
+        }
+
         // 复刻 Assets 实现 khengine 接口但 khengine 不引用 Assets 程序集的构建关系。
         public static TestProject CreateWithIncomingImplementation(bool sharedContract = false, bool precompiledContract = false)
         {
@@ -1244,10 +1258,10 @@ namespace SetterChecker.Core.Tests
         /// <summary>
         /// 复刻参考库的集合遍历器签名映射到运行库的写法。
         /// </summary>
-        public static TestProject CreateWithForwardedMethodSignature(bool includeFieldCollision = false)
+        public static TestProject CreateWithForwardedMethodSignature(bool includeFieldCollision = false, bool includeReflectedFields = false)
         {
             TestProject project = Create(includeDependency: false);
-            const string definition = """
+            string definition = """
                 namespace ForwardedSignature
                 {
                     public class Value { }
@@ -1265,6 +1279,11 @@ namespace SetterChecker.Core.Tests
                     }
                 }
                 """;
+            if (includeReflectedFields)
+            {
+                definition = definition.Replace("public class Value { }", "public class Value { public int Number; }")
+                    .Replace("public struct Enumerator", "public T Current; public struct Enumerator");
+            }
             WriteAssembly(project.ForwardTargetPath, "SignatureImplementation", definition);
             WriteAssembly(project.ExternalReferencePath, "SignatureFacade", definition);
             File.Delete(project.ExternalAssemblyPath);
@@ -1323,7 +1342,19 @@ namespace SetterChecker.Core.Tests
                         bag.Accept(value);
                     }
                 }
-                """, project.ExternalReferencePath);
+                """ + (includeReflectedFields ? """
+                public static class ReflectedFields
+                {
+                    public static void Set(ForwardedSignature.Bag<ForwardedSignature.Value> bag, ForwardedSignature.Value value)
+                    { typeof(ForwardedSignature.Bag<ForwardedSignature.Value>).GetField("Current").SetValue(bag, value); }
+                    public static void Read(ForwardedSignature.Value value)
+                    {
+                        var bag = new ForwardedSignature.Bag<ForwardedSignature.Value>();
+                        bag.Current = value;
+                        ((ForwardedSignature.Value)typeof(ForwardedSignature.Bag<ForwardedSignature.Value>).GetField("Current").GetValue(bag)).Number = 1;
+                    }
+                }
+                """ : string.Empty), project.ExternalReferencePath);
             File.Delete(project.ExternalReferencePath);
             WriteAssembly(project.ExternalReferencePath, "SignatureFacade", """
                 using System.Runtime.CompilerServices;
@@ -1741,8 +1772,9 @@ namespace SetterChecker.Core.Tests
                 throw new InvalidOperationException(string.Join("; ", emitted.Diagnostics));
             }
 
+            byte[] bytes = image.ToArray();
             SourceAssemblyMaterial additional = new("AlternateSource", false, compilation, new[] { sourcePath },
-                Array.Empty<string>(), Path.Combine(this.RootPath, "AlternateSource.dll"), image.ToArray());
+                Array.Empty<string>(), Path.Combine(this.RootPath, "AlternateSource.dll"), new(() => new(bytes, CompilationOrigin.Built, TimeSpan.Zero)));
             Dictionary<string, string> redirects = new(material.AssemblyRedirects, StringComparer.OrdinalIgnoreCase);
             if (shareRuntime)
             {

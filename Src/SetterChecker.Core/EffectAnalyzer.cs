@@ -33,7 +33,11 @@ namespace SetterChecker.Core
                 .Where(call => requestedRoots.Contains(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId)
                     && frozenSetters?.ContainsKey(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId) != true)
                 .SelectMany(call => call.Targets.Select(target => (Call: call, Target: target))).ToLookup(item => item.Target.InstanceId);
-            IReadOnlyDictionary<(int Instance, int Block), string> unsettled = resolution.ValueSources.ReadConditionFailures(instances);
+            HashSet<int> readOnlyRoots = requestedRoots.Except(proofs.Keys)
+                .Except(resolution.PendingCalls.Select(call => resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId))
+                .Where(root => resolution.ValueSources.HasOnlyReads(root) == true).ToHashSet();
+            IReadOnlyDictionary<(int Instance, int Block), string> unsettled = resolution.ValueSources.ReadConditionFailures(
+                instances.Where(instance => !readOnlyRoots.Contains(instance.RootId)));
             HashSet<int> unsettledRoots = unsettled.Keys.Select(key => resolution.ValueSources.GetInstance(key.Instance).RootId).ToHashSet();
             using ValueSourceIndex.IntegerPathProof pathProof = resolution.ValueSources.CreatePathProof();
             HashSet<string> conditionalMethods = resolution.Behaviors.Methods.Where(ValueSourceIndex.IntegerPathProof.HasPathConditions)
@@ -164,7 +168,7 @@ namespace SetterChecker.Core
                             {
                                 yield break;
                             }
-                            failure = pathProof.MemoryFailure ?? "尚有未闭合执行路径，未取得静态写入见证";
+                            failure = pathProof.ExecutionFailure ?? "尚有未闭合执行路径，未取得静态写入见证";
                         }
                     }
                     else
@@ -191,11 +195,10 @@ namespace SetterChecker.Core
             {
                 int instanceId = resolution.ValueSources.RootInstances[root.Id].Id;
                 EffectEvidence? proof = proofs.GetValueOrDefault(instanceId);
-                bool? readOnlyClosure = null;
                 foreach (BehaviorReturn returned in resolution.Behaviors.MethodsById[root.Id].Returns.Where(value => value.ValueId.HasValue && proof == null
                              && !unsettledRoots.Contains(instanceId)
                              && resolution.ValueSources.IsReachable(instanceId, value.Point.BlockId)
-                             && !(readOnlyClosure ??= resolution.ValueSources.HasOnlyReads(instanceId) == true)))
+                             && !readOnlyRoots.Contains(instanceId)))
                 {
                     IReadOnlyList<(BehaviorValueReference Reference, BehaviorFlowPoint Point)> sites;
                     try
@@ -228,7 +231,8 @@ namespace SetterChecker.Core
                                     var selected = pathProof.ReadSelectedOriginsAtPoint(instanceId, returnedOrigins, instanceId, returned.Point, current, site.Point, normalReturn: true);
                                     if (!selected.Complete)
                                     {
-                                        boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Point.BlockId, "单次经过循环不能排除其它迭代返回新对象"));
+                                        boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Point.BlockId,
+                                            pathProof.ExecutionFailure ?? "单次经过循环不能排除其它迭代返回新对象"));
                                     }
                                     returnedOrigins = selected.Origins;
                                 }
@@ -334,51 +338,61 @@ namespace SetterChecker.Core
                 }
                 foreach (ValueOrigin origin in origins)
                 {
-                    switch (origin.Value.Kind)
+                    WriteSubject? subject = null;
+                    try
                     {
-                        case BehaviorValueKind.CurrentInstance:
-                        case BehaviorValueKind.Parameter:
-                            publishedSubject = true;
-                            yield return new WriteSubject(origin.Reference, Witness: witness);
-                            break;
-                        case BehaviorValueKind.FieldRead when origin.Value.InputValueIds.Count == 0:
-                        case BehaviorValueKind.Address when origin.Value.Member != null && origin.Value.InputValueIds.Count == 0:
-                            publishedSubject = true;
-                            yield return new WriteSubject(null, Witness: witness);
-                            break;
-                        case BehaviorValueKind.Address when origin.Value.Reference?.StartsWith("argument:", StringComparison.Ordinal) == true
-                            || origin.Value.Reference?.StartsWith("local:", StringComparison.Ordinal) == true:
-                            break;
-                        case BehaviorValueKind.Conversion when origin.Value.Reference == "box"
-                            && !query.ThroughReference && !CallTargetResolver.IsReferenceType(catalog, origin.Value.Type!.Id, resolution.ValueSources):
-                            break;
-                        case BehaviorValueKind.Conversion:
-                        case BehaviorValueKind.FieldRead:
-                        case BehaviorValueKind.ArrayElementRead:
-                        case BehaviorValueKind.Address:
-                            foreach (int input in origin.Value.InputValueIds.Take(1))
-                            {
-                                bool throughReference = query.ThroughReference || origin.Value.Kind == BehaviorValueKind.FieldRead
-                                    && CallTargetResolver.IsReferenceType(catalog, resolution.ValueSources.GetInstance(origin.Reference.InstanceId)
-                                        .Substitute(catalog.ReadResolvedFieldType(origin.Value.Member!)).Text, resolution.ValueSources);
-                                pending.Enqueue((origin.Reference with { ValueId = input }, throughReference));
-                            }
-                            break;
-                        case BehaviorValueKind.NewObject:
-                        case BehaviorValueKind.NewArray:
-                        case BehaviorValueKind.Local:
-                        case BehaviorValueKind.Constant:
-                            break;
-                        default:
-                            publishedSubject = true;
-                            yield return new WriteSubject(origin.Reference, "被写对象来源尚未闭合", witness);
-                            break;
+                        switch (origin.Value.Kind)
+                        {
+                            case BehaviorValueKind.CurrentInstance:
+                            case BehaviorValueKind.Parameter:
+                                subject = new WriteSubject(origin.Reference, Witness: witness);
+                                break;
+                            case BehaviorValueKind.FieldRead when origin.Value.InputValueIds.Count == 0:
+                            case BehaviorValueKind.Address when origin.Value.Member != null && origin.Value.InputValueIds.Count == 0:
+                                subject = new WriteSubject(null, Witness: witness);
+                                break;
+                            case BehaviorValueKind.Address when !query.ThroughReference && (origin.Value.Reference?.StartsWith("argument:", StringComparison.Ordinal) == true
+                                || origin.Value.Reference?.StartsWith("local:", StringComparison.Ordinal) == true):
+                                break;
+                            case BehaviorValueKind.Conversion when origin.Value.Reference == "box"
+                                && !query.ThroughReference && !CallTargetResolver.IsReferenceType(catalog, origin.Value.Type!.Id, resolution.ValueSources):
+                                break;
+                            case BehaviorValueKind.Conversion:
+                            case BehaviorValueKind.FieldRead:
+                            case BehaviorValueKind.ArrayElementRead:
+                            case BehaviorValueKind.Address:
+                                foreach (int input in origin.Value.InputValueIds.Take(1))
+                                {
+                                    bool throughReference = query.ThroughReference || origin.Value.Kind == BehaviorValueKind.FieldRead
+                                        && CallTargetResolver.IsReferenceType(catalog, resolution.ValueSources.GetInstance(origin.Reference.InstanceId)
+                                            .Substitute(catalog.ReadResolvedFieldType(origin.Value.Member!)).Text, resolution.ValueSources);
+                                    pending.Enqueue((origin.Reference with { ValueId = input }, throughReference));
+                                }
+                                break;
+                            case BehaviorValueKind.NewObject:
+                            case BehaviorValueKind.NewArray:
+                            case BehaviorValueKind.Local:
+                            case BehaviorValueKind.Constant:
+                                break;
+                            default:
+                                subject = new WriteSubject(origin.Reference, "被写对象来源尚未闭合", witness);
+                                break;
+                        }
+                    }
+                    catch (AnalysisException exception)
+                    {
+                        subject = new WriteSubject(origin.Reference, exception.Message, witness);
+                    }
+                    if (subject.HasValue)
+                    {
+                        publishedSubject = true;
+                        yield return subject.Value;
                     }
                 }
             }
             if (!complete && !publishedSubject)
             {
-                yield return new WriteSubject(reference, pathProof.MemoryFailure ?? "单次经过循环未取得旧对象写入见证，不能据此排除其它迭代", witness);
+                yield return new WriteSubject(reference, pathProof.ExecutionFailure ?? "单次经过循环未取得旧对象写入见证，不能据此排除其它迭代", witness);
             }
         }
 

@@ -46,6 +46,7 @@ namespace SetterChecker.Core
             text.AppendLine($"ShouldTrack：{detectedTrack}（检测出）/ {methods.Count - sourceNlt}（源码中）");
             text.AppendLine($"尚未证明：{unproved}；标签冲突：{conflicts}；待处理调用：{run.Annotations.PendingCalls}");
             text.AppendLine("\n日志豁免不改变真实行为；未知项不计入两种检测结论。待处理调用不为零时，上游告警清单尚不完整。");
+            text.AppendLine($"源码程序集：{run.Material.SourceAssemblies.Count}；仅保留编译上下文：{run.Material.SourceAssemblies.Count(source => source.CompilationOrigin == CompilationOrigin.Deferred)}；实际编译：{run.Material.SourceAssemblies.Count(source => source.CompilationOrigin == CompilationOrigin.Built)}；会话复用：{run.Material.SourceAssemblies.Count(source => source.CompilationOrigin == CompilationOrigin.Session)}；磁盘复用：{run.Material.SourceAssemblies.Count(source => source.CompilationOrigin == CompilationOrigin.DiskCache)}。");
             text.AppendLine("补丁仅供预览。手工检查时使用 git -c core.autocrlf=false apply --check preview.patch，避免个人 Git 配置转换源码换行。");
             WriteGroups(text, "源码有 NoLogTrack、真实行为为 Setter（保留人工豁免）", methods.Where(method => method.SourceNoLogTrack && method.Actual == MethodEffectKind.Setter));
             WriteGroups(text, "源码无 NoLogTrack、可补标", methods.Where(method => method.SuggestNoLogTrack));
@@ -107,6 +108,8 @@ namespace SetterChecker.Core
                 UnreadBodies = run.Calls?.Behaviors.Methods.Where(body => body.Failure != null).Select(body => new { body.MethodId, body.Failure }).ToArray(),
                 Pending = pending,
                 NativeBoundaries = native,
+                Compilation = run.Material.SourceAssemblies.Select(source => new
+                { source.Name, Origin = source.CompilationOrigin, SourceFiles = source.SourcePaths.Count, source.IsReportAssembly }).ToArray(),
             }, options);
             File.WriteAllText(Path.Combine(directory, "report.md"), text.ToString(), new UTF8Encoding(false));
             File.WriteAllText(Path.Combine(directory, "report.json"), json, new UTF8Encoding(false));

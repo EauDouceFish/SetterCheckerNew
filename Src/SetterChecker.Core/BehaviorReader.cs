@@ -39,9 +39,9 @@ namespace SetterChecker.Core
             }
 
             Stopwatch stopwatch = Stopwatch.StartNew();
-            IReadOnlyDictionary<string, byte[]> sourceImages = material.SourceAssemblies.ToDictionary(
+            IReadOnlyDictionary<string, SourceAssemblyMaterial> sourceImages = material.SourceAssemblies.ToDictionary(
                 assembly => Path.GetFullPath(assembly.AssemblyPath),
-                assembly => assembly.AssemblyImage,
+                assembly => assembly,
                 StringComparer.OrdinalIgnoreCase);
             long partitionCount = (long)jobs * 4;
             BehaviorWorkItem[] workItems = methods
@@ -95,13 +95,13 @@ namespace SetterChecker.Core
         // 一次打开内存编译结果或真实托管文件并读取一批函数。
         private static IReadOnlyList<MethodBehavior> ReadManagedBehaviors(
             string assemblyPath,
-            IReadOnlyDictionary<string, byte[]> sourceImages,
+            IReadOnlyDictionary<string, SourceAssemblyMaterial> sourceImages,
             MethodCatalogResult catalog,
             IReadOnlyList<MethodEntry> methods)
         {
             string fullPath = Path.GetFullPath(assemblyPath);
-            using Cecil.ModuleDefinition module = sourceImages.TryGetValue(fullPath, out byte[]? image)
-                ? MethodCatalog.OpenModule(image)
+            using Cecil.ModuleDefinition module = sourceImages.TryGetValue(fullPath, out SourceAssemblyMaterial? source)
+                ? MethodCatalog.OpenModule(source.AssemblyImage)
                 : MethodCatalog.OpenModule(fullPath);
 
             if (methods.Any(method => !string.Equals(
@@ -215,6 +215,14 @@ namespace SetterChecker.Core
             {
                 Mono.Cecil.Rocks.MethodBodyRocks.SimplifyMacros(body);
                 Cil.Instruction[] instructions = body.Instructions.ToArray();
+                foreach (Cil.Instruction allocation in instructions.Where(instruction => instruction.OpCode == OpCodes.Localloc))
+                {
+                    if (body.ExceptionHandlers.Any(handler => allocation.Offset >= (handler.FilterStart ?? handler.HandlerStart).Offset
+                        && allocation.Offset < (handler.HandlerEnd?.Offset ?? body.CodeSize)))
+                    {
+                        throw new AnalysisException($"栈内存分配不能位于异常处理器内：{this.m_method.Id} @ {allocation.Offset}");
+                    }
+                }
                 IReadOnlyDictionary<int, Cil.Instruction> instructionsByOffset = instructions
                     .ToDictionary(instruction => instruction.Offset);
                 Queue<int> pending = new();
@@ -308,7 +316,8 @@ namespace SetterChecker.Core
                     this.m_calls.Values.OrderBy(item => item.Point.BlockId).ToArray(),
                     this.m_returns.Values.OrderBy(item => item.Point.BlockId).ToArray(),
                     flow.Blocks,
-                    flow.Handlers);
+                    flow.Handlers)
+                { InitializesLocals = body.InitLocals };
             }
 
             // 按托管指令建立控制流块，并保留原始异常处理表。
@@ -569,6 +578,18 @@ namespace SetterChecker.Core
                         ReadCall(instruction, target);
                     }
 
+                    return;
+                }
+
+                if (code == OpCodes.Localloc)
+                {
+                    int lengthValueId = Pop(code, offset);
+                    if (this.m_stack.Count != 0)
+                    {
+                        throw new AnalysisException($"栈内存分配要求求值栈只包含字节长度：{this.m_method.Id} @ {offset}");
+                    }
+                    this.m_stack.Push(AddValue(BehaviorValueKind.StackAllocation, code.Name, new[] { lengthValueId },
+                        type: ReadTypeReference(this.m_typeSystem.IntPtr)));
                     return;
                 }
 
@@ -1176,6 +1197,8 @@ namespace SetterChecker.Core
         Computation,
         /// <summary>在一个执行位置读取参数、局部值、捕获值或控制流临时槽。</summary>
         SlotRead,
+        /// <summary>当前调用内申请的栈内存地址，输入为字节长度而非数组元素数。</summary>
+        StackAllocation,
     }
 
     /// <summary>
@@ -1266,6 +1289,9 @@ namespace SetterChecker.Core
         string? ReferringAssemblyPath,
         string? KnownTypeId)
     {
+        /// <summary>原类型使用点的真实元数据标记，反射构造实参仍从该位置解析。</summary>
+        public int ReferenceMetadataToken { get; init; }
+
         /// <summary>直接展示同一类型身份，不另存字符串副本。</summary>
         public string Id => this.Identity.Text;
 
@@ -1293,6 +1319,8 @@ namespace SetterChecker.Core
         /// <summary>读取字段引用的真实程序集路径。</summary>
         public string? ReferringAssemblyPath { get; init; }
 
+        /// <summary>运行时选定的实际声明类型；原始字段标记仍指向真实定义。</summary>
+        public TypeIdentityTemplate? BoundDeclaringType { get; init; }
     }
 
     /// <summary>
@@ -1398,6 +1426,9 @@ namespace SetterChecker.Core
         IReadOnlyList<BehaviorExceptionHandler> ExceptionHandlers,
         NativeBoundary? NativeBoundary = null)
     {
+        /// <summary>真实函数头的 localsinit 标志，不为未初始化内存补零。</summary>
+        public bool InitializesLocals { get; init; }
+
         /// <summary>当前函数体尚未读出的原始分析失败。</summary>
         public string? Failure { get; init; }
 

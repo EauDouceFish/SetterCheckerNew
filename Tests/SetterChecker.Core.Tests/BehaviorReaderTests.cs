@@ -154,6 +154,128 @@ namespace SetterChecker.Core.Tests
             }
         }
 
+        // 栈内存保留每次分配、字节长度及初始化标记，不冒充托管数组。
+        /// <summary>对照 C# stackalloc 与真实 DLL 的 localloc，并保留写入指向的分配位置。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task ReadAsyncKeepsStackAllocationFacts(bool initialize)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Calls { public static void Entry(int size) { } }
+                """);
+            project.WriteRootSource("""
+                namespace SourceSamples;
+                public static class Calls
+                {
+                    ATTRIBUTE
+                    public static unsafe void Entry(int size)
+                    {
+                        byte* first = stackalloc byte[size];
+                        byte* second = stackalloc byte[size];
+                        first[0] = 3;
+                        second[0] = 4;
+                    }
+                }
+                """.Replace("ATTRIBUTE", initialize ? string.Empty : "[System.Runtime.CompilerServices.SkipLocalsInit]"));
+            File.AppendAllLines(project.RootResponsePath, new[] { "-unsafe+" }, new System.Text.UTF8Encoding(false));
+            using (Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(project.ExternalAssemblyPath,
+                new Mono.Cecil.ReaderParameters { InMemory = true }))
+            {
+                Mono.Cecil.MethodDefinition method = module.GetType("ExternalSamples.Calls").Methods.Single(method => method.Name == "Entry");
+                method.Body.Instructions.Clear();
+                method.Body.InitLocals = initialize;
+                Mono.Cecil.Cil.ILProcessor writer = method.Body.GetILProcessor();
+                foreach (int value in new[] { 3, 4 })
+                {
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Conv_U);
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Localloc);
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4, value);
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Stind_I1);
+                }
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                module.Write(project.ExternalAssemblyPath);
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).ToArray();
+            Assert.HasCount(2, roots);
+            BehaviorReadResult result = await new BehaviorReader().ReadAsync(material, catalog, roots, 2);
+            foreach (MethodBehavior body in result.Methods)
+            {
+                BehaviorValue[] allocated = body.Values.Where(value => value.Reference == "localloc").ToArray();
+                Assert.AreEqual(initialize, body.InitializesLocals);
+                Assert.HasCount(2, allocated);
+                Assert.HasCount(2, body.Writes);
+                for (int index = 0; index < allocated.Length; index++)
+                {
+                    Assert.AreEqual("StackAllocation", allocated[index].Kind.ToString());
+                    AssertValueFlowsFrom(body, allocated[index].InputValueIds.Single(), body.Values.Single(value => value.Kind == BehaviorValueKind.Parameter).Id);
+                    AssertValueFlowsFrom(body, body.Writes[index].ReceiverValueId!.Value, allocated[index].Id);
+                }
+            }
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEntry root in roots)
+            {
+                StringAssert.Contains(Assert.Throws<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls)).Message,
+                    "间接访问的实际存储尚未闭合");
+            }
+        }
+
+        // 非法栈形状或异常处理位置不能被当作有效内存分配继续分析。
+        /// <summary>用真实 DLL 保留两个 localloc 格式错误的准确证据。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task ReadAsyncRejectsInvalidStackAllocation(bool inHandler)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Calls { public static void Entry() { } }
+                """);
+            using (Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(project.ExternalAssemblyPath,
+                new Mono.Cecil.ReaderParameters { InMemory = true }))
+            {
+                Mono.Cecil.MethodDefinition method = module.GetType("ExternalSamples.Calls").Methods.Single(method => method.Name == "Entry");
+                method.Body.Instructions.Clear();
+                Mono.Cecil.Cil.ILProcessor writer = method.Body.GetILProcessor();
+                var start = writer.Create(Mono.Cecil.Cil.OpCodes.Nop);
+                var caught = writer.Create(Mono.Cecil.Cil.OpCodes.Pop);
+                var end = writer.Create(Mono.Cecil.Cil.OpCodes.Ret);
+                writer.Append(start);
+                if (inHandler)
+                {
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Leave, end);
+                    writer.Append(caught);
+                    method.Body.ExceptionHandlers.Add(new Mono.Cecil.Cil.ExceptionHandler(Mono.Cecil.Cil.ExceptionHandlerType.Catch)
+                    {
+                        TryStart = start,
+                        TryEnd = caught,
+                        HandlerStart = caught,
+                        HandlerEnd = end,
+                        CatchType = module.ImportReference(typeof(Exception)),
+                    });
+                }
+                else
+                {
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+                }
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_4);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Localloc);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Pop);
+                writer.Append(end);
+                module.Write(project.ExternalAssemblyPath);
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry root = catalog.Types.Where(type => type.Name == "Calls" && type.AssemblyPath == project.ExternalAssemblyPath)
+                .SelectMany(catalog.GetMethods).Single();
+            AnalysisException failure = await Assert.ThrowsAsync<AnalysisException>(() => new BehaviorReader().ReadAsync(material, catalog, new[] { root }, 2));
+            StringAssert.Contains(failure.Message, inHandler ? "栈内存分配不能位于异常处理器内" : "栈内存分配要求求值栈只包含字节长度");
+        }
+
         // sizeof 的操作数不是结果类型，复制指令的类型也必须附着在真实写入上。
         /// <summary>源码与实际含 sizeof、cpobj 的 DLL 保留各自泛型类型操作数。</summary>
         [TestMethod]

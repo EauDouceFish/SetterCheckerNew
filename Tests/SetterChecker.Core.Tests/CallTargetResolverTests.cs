@@ -6,6 +6,121 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class CallTargetResolverTests
     {
+        // 代理实现由独立启动入口注册，使用入口仍需沿统一接口关系找到真实方法。
+        /// <summary>复刻 SetImpl 注册与后续代理调用，读取和写入实现分别对照源码与 DLL。</summary>
+        [TestMethod]
+        [DataRow(false, 0)]
+        [DataRow(true, 0)]
+        [DataRow(false, 1)]
+        [DataRow(true, 1)]
+        [DataRow(false, 2)]
+        [DataRow(true, 2)]
+        public async Task ResolveAsyncConnectsProxyRegisteredBySeparateEntry(bool writes, int shape)
+        {
+            string source = """
+                namespace Samples;
+                public interface IProxy { void Run(); }
+                public sealed class Implementation : IProxy
+                {
+                    private int state;
+                    public void Run() { WRITE }
+                }
+                public static class Proxy
+                {
+                    private static IProxy implementation;
+                    public static void SetImpl(IProxy value) { implementation = value; }
+                    public static void Run() => implementation.Run();
+                }
+                public static class Calls
+                {
+                    public static void Initialize() => Proxy.SetImpl(new Implementation());
+                    public static void Entry() => Proxy.Run();
+                }
+                """;
+            if (shape != 0)
+            {
+                source = """
+                    namespace Samples;
+                    public interface IRuntimeMethodProxy { }
+                    public interface IProxy : IRuntimeMethodProxy { void Run(); }
+                    public sealed class Implementation : IProxy
+                    {
+                        private int state;
+                        public void Run() { WRITE }
+                    }
+                    public class RuntimeMethodProxy<TInterface, TInstance> where TInterface : IRuntimeMethodProxy where TInstance : new()
+                    {
+                        protected static TInterface ms_impl;
+                        public static void SetImpl(TInterface impl) { ms_impl = impl; }
+                        private static TInstance ms_instance;
+                        public static TInstance Instance
+                        {
+                            get { if (ms_instance == null) ms_instance = new TInstance(); return ms_instance; }
+                        }
+                    }
+                    public class Proxy : RuntimeMethodProxy<IProxy, Proxy>, IProxy
+                    {
+                        private bool IsNull() => ms_impl == null;
+                        public void Run() { if (!IsNull()) ms_impl.Run(); }
+                    }
+                    public static class Calls
+                    {
+                        public static void Initialize() => Proxy.SetImpl(new Implementation());
+                        public static void Entry(Proxy value) => value.Run();
+                    }
+                    """.Replace(">, IProxy", shape == 2 ? ">, IProxy" : ">");
+            }
+            using TestProject project = TestProject.CreateWithCallTargets(source.Replace("WRITE", writes ? "state = 1;" : string.Empty));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEffect method in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(writes ? MethodEffectKind.Setter : MethodEffectKind.Getter, method.Kind, method.MethodId);
+            }
+        }
+
+        // 递归接收对象仍是旧静态快照时，途中覆盖的字段也必须进入下一次调用环境。
+        /// <summary>检查覆盖静态代理后的具体调用目标，不以静态赋值的 Setter 结论代替验证。</summary>
+        [TestMethod]
+        public async Task ResolveAsyncKeepsChangedStorageDuringStaticProxyRecursion()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public interface IProxy { void Run(); }
+                public sealed class Quiet : IProxy { public void Run() { } }
+                public sealed class Proxy : IProxy
+                {
+                    private static IProxy current, next;
+                    public static void SetNext(IProxy value) { next = value; }
+                    public static void Dispatch() => current.Run();
+                    public void Run() { var old = current; current = next; old.Run(); }
+                }
+                public static class Calls
+                {
+                    public static void Entry(Quiet quiet) { Proxy.SetNext(quiet); Proxy.Dispatch(); }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            CallTargetResolutionResult result = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEntry root in roots)
+            {
+                ResolvedCall dispatch = result.Calls.Single(call => call.CallerMethodId == root.Id && call.Call.Target.Name == "Dispatch");
+                ResolvedCall first = result.Calls.Single(call => call.CallerInstanceId == dispatch.Targets.Single().InstanceId);
+                ResolvedCallTarget proxy = first.Targets.Single(target => catalog.TypesById[result.Methods.Single(method => method.Id == target.MethodId).TypeId].Name == "Proxy");
+                ResolvedCall second = result.Calls.Single(call => call.CallerInstanceId == proxy.InstanceId);
+                ResolvedCallTarget recursive = second.Targets.Single(target => target.MethodId == proxy.MethodId);
+                Assert.AreNotEqual(proxy.InstanceId, recursive.InstanceId);
+                ResolvedCall third = result.Calls.Single(call => call.CallerInstanceId == recursive.InstanceId);
+                Assert.AreEqual("Quiet", catalog.TypesById[result.Methods.Single(method => method.Id == third.Targets.Single().MethodId).TypeId].Name);
+            }
+        }
+
         // 一个入口的剪枝或普通调用补读不能丢掉另一个入口尚未尝试的绑定。
         /// <summary>源码与 DLL 的普通、虚函数和委托入口在单路及四路下均完整闭合。</summary>
         [TestMethod]
@@ -199,6 +314,41 @@ namespace SetterChecker.Core.Tests
                     cancellation.Cancel();
                 }));
             Assert.IsTrue(reported);
+        }
+
+        // 条件计算中途取消后必须收拢独立求解任务，同一材料可以重新发起完整分析。
+        /// <summary>单路与四路均不把取消返回成已完成的调用结果。</summary>
+        [TestMethod]
+        [DataRow(1)]
+        [DataRow(4)]
+        public async Task ResolveAsyncCancelsConditionWorkAndRetries(int jobs)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Calls
+                {
+                    private static int state;
+                    public static void Entry(int value) { CONDITIONS }
+                }
+                """.Replace("CONDITIONS", string.Concat(Enumerable.Range(0, 128)
+                    .Select(index => $"if (value > {index} && value <= {index}) state = {index};"))));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, jobs));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, jobs);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            using CancellationTokenSource cancellation = new();
+            bool started = false;
+            await Assert.ThrowsAsync<OperationCanceledException>(() => new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs,
+                cancellation.Token, progress: message =>
+                {
+                    if (!started && message.StartsWith("本轮重新检查", StringComparison.Ordinal))
+                    {
+                        started = true;
+                        cancellation.CancelAfter(TimeSpan.FromMilliseconds(20));
+                    }
+                }));
+            Assert.IsTrue(started);
+            CallTargetResolutionResult result = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs);
+            Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, result).Methods.All(method => method.Kind == MethodEffectKind.Getter));
         }
 
         // 数组地址快排只能移除不相干存储，不能跳过真正写到字段或局部变量的引用。
@@ -437,15 +587,61 @@ namespace SetterChecker.Core.Tests
             }
         }
 
+        // 长串无关读取与最后强覆盖分别检查，规模变化不能改变最终委托目标。
+        /// <summary>只记录公开解析耗时，不以依赖机器负载的时间阈值决定测试成功。</summary>
+        [TestMethod]
+        [DataRow(32, false)]
+        [DataRow(128, false)]
+        [DataRow(512, false)]
+        [DataRow(32, true)]
+        [DataRow(128, true)]
+        [DataRow(512, true)]
+        public async Task ResolveAsyncScalesStoragePastReadonlyCalls(int count, bool overwrite)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                using System;
+                namespace Samples;
+                public sealed class Holder { public int Value; public Action Callback; }
+                public static class Calls
+                {
+                    public static void Entry() { var holder = new Holder(); holder.Callback = new Action(Before); Use(holder); }
+                    private static void Use(Holder holder) { READS OVERWRITE holder.Callback(); }
+                    private static int Read(Holder holder) => holder.Value;
+                    private static void Before() { }
+                    private static void After() { }
+                }
+                """.Replace("READS", string.Concat(Enumerable.Repeat("Read(holder);", count)))
+                .Replace("OVERWRITE", overwrite ? "holder.Callback = new Action(After);" : string.Empty));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            long allocated = GC.GetTotalAllocatedBytes(true);
+            System.Diagnostics.Stopwatch stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            CallTargetResolutionResult result = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            stopwatch.Stop();
+            Console.WriteLine($"storage-benchmark count={count} overwrite={overwrite} resolutionMs={stopwatch.Elapsed.TotalMilliseconds:F3} allocatedBytes={GC.GetTotalAllocatedBytes(true) - allocated}");
+            foreach (MethodEntry root in roots)
+            {
+                string helper = result.Methods.Single(method => method.AssemblyName == root.AssemblyName && method.Name == "Use").Id;
+                ResolvedCall use = result.Calls.Single(call => call.CallerMethodId == helper && call.Call.Kind == BehaviorCallKind.Delegate);
+                Assert.AreEqual(overwrite ? "After" : "Before", result.Methods.Single(method => method.Id == use.Targets.Single().MethodId).Name);
+            }
+        }
+
         // 已被后续确定覆盖的未知旧值不能阻止识别当前委托。
         /// <summary>跳过旧存储查询不等于忽略原生调用对整个函数的未知影响。</summary>
         [TestMethod]
-        [DataRow("none")]
-        [DataRow("always")]
-        [DataRow("conditional")]
-        [DataRow("finally")]
-        [DataRow("reflection")]
-        public async Task ResolveAsyncReadsOnlyWritesAfterLastDefiniteOverwrite(string overwrite)
+        [DataRow("none", false)]
+        [DataRow("always", false)]
+        [DataRow("conditional", false)]
+        [DataRow("finally", false)]
+        [DataRow("reflection", false)]
+        [DataRow("none", true)]
+        [DataRow("always", true)]
+        [DataRow("conditional", true)]
+        [DataRow("finally", true)]
+        [DataRow("reflection", true)]
+        public async Task ResolveAsyncReadsOnlyWritesAfterLastDefiniteOverwrite(string overwrite, bool sameMethod)
         {
             using TestProject project = TestProject.CreateWithCallTargets("""
                 using System;
@@ -458,24 +654,26 @@ namespace SetterChecker.Core.Tests
                     public static void Entry(bool flag)
                     {
                         var holder = new Holder();
-                        Unknown(holder);
+                        BEFORE
                         Use(holder, flag);
                     }
                     private static void Use(Holder holder, bool flag)
                     {
+                        LOCAL
                         WRITE
                         holder.Callback();
                     }
                     private static void After() { }
                 }
-                """.Replace("WRITE", overwrite switch
-            {
-                "always" => "holder.Callback = new Action(After);",
-                "conditional" => "if (flag) holder.Callback = new Action(After);",
-                "finally" => "try { } finally { holder.Callback = new Action(After); }",
-                "reflection" => "typeof(Holder).GetField(\"Callback\").SetValue(holder, new Action(After));",
-                _ => string.Empty,
-            }));
+                """.Replace("BEFORE", sameMethod ? string.Empty : "Unknown(holder);")
+                .Replace("LOCAL", sameMethod ? "Unknown(holder);" : string.Empty).Replace("WRITE", overwrite switch
+                {
+                    "always" => "holder.Callback = new Action(After);",
+                    "conditional" => "if (flag) holder.Callback = new Action(After);",
+                    "finally" => "try { } finally { holder.Callback = new Action(After); }",
+                    "reflection" => "typeof(Holder).GetField(\"Callback\").SetValue(holder, new Action(After));",
+                    _ => string.Empty,
+                }));
             MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
             MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
