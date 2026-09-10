@@ -351,24 +351,39 @@ namespace SetterChecker.Core
                 return false;
             }
             BehaviorValueReference resultReference = new(body.MethodId, call.ResultValueId ?? -1, instance.Id);
-            if (owner.FullName == "System.Activator" && declaration.Method.Name == "CreateInstance" && arguments.Count == 1)
+            if (owner.FullName == "System.Activator" && declaration.Method.Name == "CreateInstance"
+                && (arguments.Count == 1 || arguments.Count == 0 && declaration.Method.GenericArity == 1))
             {
-                IReadOnlyList<ValueOrigin> types = sources.GetCallOrigins(arguments[0].Single());
-                if (types.Any(value => value.Value.Kind == BehaviorValueKind.CallResult))
+                List<(BehaviorTypeReference Type, MethodCallInstance Scope, (BehaviorValueReference Input, ValueOrigin Selected)? Selection)> types = new();
+                if (arguments.Count == 0)
                 {
-                    return true;
+                    TypeIdentityTemplate actual = new(call.Target.GenericArgumentTypeIds.Single());
+                    if (TryReadTypeSuffix(actual.Text, out _, out _))
+                    {
+                        throw new AnalysisException($"反射创建的类型形状尚未闭合：{actual.Text}");
+                    }
+                    TypeEntry type = ReadAssignableType(catalog, actual.Text, out TypeIdentityTemplate[] typeArguments);
+                    types.Add((new(actual, new(type.LogicalId), typeArguments, type.AssemblyIdentity, type.AssemblyPath, type.Id), instance, null));
                 }
-                if (types.Count == 0 || types.Any(value => value.Value.Kind != BehaviorValueKind.Type))
+                else
                 {
-                    throw new AnalysisException($"反射创建的实际类型尚未闭合：{body.MethodId} @ {call.Point.BlockId}");
+                    IReadOnlyList<ValueOrigin> origins = sources.GetCallOrigins(arguments[0].Single());
+                    if (origins.Any(value => value.Value.Kind == BehaviorValueKind.CallResult))
+                    {
+                        return true;
+                    }
+                    if (origins.Count == 0 || origins.Any(value => value.Value.Kind != BehaviorValueKind.Type))
+                    {
+                        throw new AnalysisException($"反射创建的实际类型尚未闭合：{body.MethodId} @ {call.Point.BlockId}");
+                    }
+                    types.AddRange(origins.Select(origin => (origin.Value.Type!, sources.GetInstance(origin.Reference.InstanceId),
+                        ((BehaviorValueReference Input, ValueOrigin Selected)?)(arguments[0].Single(), origin))));
                 }
                 var constructors = types.Select(origin =>
                 {
-                    TypeEntry type = catalog.ResolveTypeDefinition(origin.Value.Type!);
-                    TypeIdentityTemplate[] typeArguments = catalog.ReadResolvedTypeArguments(origin.Value.Type!)
-                        .Select(sources.GetInstance(origin.Reference.InstanceId).Substitute).ToArray();
-                    TypeIdentityTemplate identity = sources.GetInstance(origin.Reference.InstanceId)
-                        .Substitute(catalog.ReadResolvedTypeIdentity(origin.Value.Type!));
+                    TypeEntry type = catalog.ResolveTypeDefinition(origin.Type);
+                    TypeIdentityTemplate[] typeArguments = catalog.ReadResolvedTypeArguments(origin.Type).Select(origin.Scope.Substitute).ToArray();
+                    TypeIdentityTemplate identity = origin.Scope.Substitute(catalog.ReadResolvedTypeIdentity(origin.Type));
                     if (identity != ConstructTypeIdentity(type, typeArguments)
                         || type.IsValueType || type.IsAbstract || typeArguments.Length != type.GenericParameters.Count
                         || typeArguments.Any(argument => argument.HasUnspecifiedParameter || ContainsTypeParameter(argument.Text)))
@@ -387,15 +402,14 @@ namespace SetterChecker.Core
                     {
                         throw new AnalysisException($"反射创建没有唯一公开无参构造函数：{type.FullName}");
                     }
-                    return (Origin: origin, Type: type, Arguments: typeArguments, Method: matches[0]);
+                    return (origin.Selection, Type: type, Arguments: typeArguments, Method: matches[0], Reference: catalog.ReadMethodReference(matches[0]));
                 }).ToArray();
                 List<(ResolvedMethodDefinition, ResolvedCallTarget)> bindings = new();
                 foreach (var constructor in constructors)
                 {
-                    BehaviorMethodReference reference = catalog.ReadMethodReference(constructor.Method);
-                    bindings.Add((new(constructor.Method, constructor.Arguments), new(constructor.Method.Id, reference,
+                    bindings.Add((new(constructor.Method, constructor.Arguments), new(constructor.Method.Id, constructor.Reference,
                         new[] { resultReference }, Array.Empty<IReadOnlyList<BehaviorValueReference>>(), constructor.Arguments.Select(argument => argument.Text).ToArray())
-                    { TargetSelections = new[] { (arguments[0].Single(), constructor.Origin) } }));
+                    { TargetSelections = constructor.Selection is { } selection ? new[] { selection } : Array.Empty<(BehaviorValueReference, ValueOrigin)>() }));
                 }
                 // 所有目标通过递归检查后才一起发布对象，失败重试不会留下半份创建结果。
                 publishRuntimeValues = () => sources.BindRuntimeValue(resultReference, constructors.Select(constructor =>
@@ -404,8 +418,8 @@ namespace SetterChecker.Core
                         new(constructor.Type.LogicalId), constructor.Arguments, constructor.Type.AssemblyIdentity,
                         constructor.Type.AssemblyPath, constructor.Type.Id);
                     return sources.BindRuntimeValue(new ValueOrigin(resultReference, body.Values[resultReference.ValueId] with
-                    { Kind = BehaviorValueKind.NewObject, Type = type, Method = catalog.ReadMethodReference(constructor.Method), InputValueIds = Array.Empty<int>() })
-                    { Selection = (arguments[0].Single(), constructor.Origin) });
+                    { Kind = BehaviorValueKind.NewObject, Type = type, Method = constructor.Reference, InputValueIds = Array.Empty<int>() })
+                    { Selection = constructor.Selection });
                 }).ToArray());
                 targets = bindings;
                 return true;
@@ -2274,6 +2288,7 @@ namespace SetterChecker.Core
         private readonly Dictionary<(BehaviorValueReference Reference, int Instance, ReturnedValuePath? Path, StoredObservation? Storage), BehaviorValueReference> m_observedValues = new();
         private readonly Dictionary<BehaviorValueReference, StoredObservation> m_observedStorage = new();
         private readonly HashSet<int> m_changedRoots = new();
+        private readonly Dictionary<int, int> m_preparedGenerations = new();
         private int m_refinedGeneration = -1;
         private int m_nextRuntimeValueId = -1;
         private readonly Dictionary<int, List<BehaviorWrite>> m_runtimeWrites = new();
@@ -2986,7 +3001,8 @@ namespace SetterChecker.Core
         {
             if (this.m_refinedGeneration != this.m_catalog.SemanticGeneration)
             {
-                this.m_changedRoots.UnionWith(this.m_rootInstances.Values.Select(instance => instance.Id));
+                this.m_changedRoots.UnionWith(this.m_rootInstances.Values.Where(instance =>
+                    this.m_preparedGenerations.GetValueOrDefault(instance.Id, -1) != this.m_catalog.SemanticGeneration).Select(instance => instance.Id));
                 this.m_refinedGeneration = this.m_catalog.SemanticGeneration;
             }
             HashSet<int> changed = this.m_changedRoots.Except(frozenRoots).ToHashSet();
@@ -3023,6 +3039,7 @@ namespace SetterChecker.Core
             IntegerPathProof?[] proofs = new IntegerPathProof[workerCount];
             Task[] running = Enumerable.Repeat(Task.CompletedTask, workerCount).ToArray();
             List<ConditionWork> work = new();
+            Dictionary<int, int> preparedGenerations = new();
             try
             {
                 foreach (var group in groups)
@@ -3042,7 +3059,8 @@ namespace SetterChecker.Core
                     IntegerPathProof proof = proofs[slot] ??= CreatePathProof();
                     Func<IntegerPathProof> constantProof = () => proof;
                     proof.ClearQuery();
-                    int generation = this.m_catalog.SemanticGeneration;
+                    int initialGeneration = this.m_catalog.SemanticGeneration;
+                    int generation = initialGeneration;
                     List<(Microsoft.Z3.BoolExpr Formula, HashSet<(int From, int To)> Results, (int From, int To) Edge)> queries = new();
                     foreach (MethodCallInstance instance in group)
                     {
@@ -3091,6 +3109,10 @@ namespace SetterChecker.Core
                         }
                         work.Add(new(instance, body, conditions, stops, impossible));
                     }
+                    if (initialGeneration == this.m_catalog.SemanticGeneration)
+                    {
+                        preparedGenerations.Add(group.Key, initialGeneration);
+                    }
 
                     // 后台只操作自己的公式与求解器，逐条独立断言，不读取共享来源或目录。
                     void Solve()
@@ -3129,6 +3151,10 @@ namespace SetterChecker.Core
                 }
             }
             cancellationToken.ThrowIfCancellationRequested();
+            foreach (var prepared in preparedGenerations)
+            {
+                this.m_preparedGenerations[prepared.Key] = prepared.Value;
+            }
             List<(int Instance, HashSet<int> Blocks, HashSet<(int From, int To)> Edges)> changes = new();
             foreach (ConditionWork current in work)
             {

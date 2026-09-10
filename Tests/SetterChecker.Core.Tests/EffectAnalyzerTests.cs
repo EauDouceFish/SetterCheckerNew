@@ -10,7 +10,8 @@ namespace SetterChecker.Core.Tests
         [DataRow(false, false)]
         [DataRow(true, false)]
         [DataRow(false, true)]
-        public async Task AnalyzeKeepsReflectionFactoryTypeSelection(bool guard, bool generic)
+        [DataRow(false, true, true)]
+        public async Task AnalyzeKeepsReflectionFactoryTypeSelection(bool guard, bool generic, bool genericApi = false)
         {
             using TestProject project = TestProject.CreateWithCallTargets("""
                 namespace Samples;
@@ -27,7 +28,7 @@ namespace SetterChecker.Core.Tests
                     }
                 }
                 """.Replace("ACTION", generic
-                    ? "var box = (Box<int>)System.Activator.CreateInstance(typeof(Box<int>)); box.Value = 1;"
+                    ? "var box = " + (genericApi ? "System.Activator.CreateInstance<Box<int>>()" : "(Box<int>)System.Activator.CreateInstance(typeof(Box<int>))") + "; box.Value = 1;"
                     : (guard ? "if (flag) " : string.Empty) + "_ = System.Activator.CreateInstance(type);"));
             MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
@@ -85,7 +86,9 @@ namespace SetterChecker.Core.Tests
         [TestMethod]
         [DataRow(false)]
         [DataRow(true)]
-        public async Task AnalyzeRetainsRecursiveReflectionFactoryFailure(bool generic)
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public async Task AnalyzeRetainsRecursiveReflectionFactoryFailure(bool generic, bool genericApi = false)
         {
             string source = """
                 namespace Samples;
@@ -97,6 +100,10 @@ namespace SetterChecker.Core.Tests
                 source = source.Replace("class Data", "class Data<T>")
                     .Replace("typeof(Data)", "typeof(Data<int>)")
                     .Replace("Entry() { _ = System.Activator.CreateInstance(typeof(Data<int>))", "Entry() { _ = System.Activator.CreateInstance(typeof(Data<string>))");
+            }
+            if (genericApi)
+            {
+                source = source.Replace("System.Activator.CreateInstance(typeof(", "System.Activator.CreateInstance<").Replace("));", ">();");
             }
             using TestProject project = TestProject.CreateWithCallTargets(source);
             MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
@@ -115,7 +122,9 @@ namespace SetterChecker.Core.Tests
         [TestMethod]
         [DataRow("Data[]")]
         [DataRow("Data[,]")]
-        public async Task AnalyzeRejectsReflectionFactoryArrayShape(string type)
+        [DataRow("Data[]", true)]
+        [DataRow("Data[,]", true)]
+        public async Task AnalyzeRejectsReflectionFactoryArrayShape(string type, bool genericApi = false)
         {
             using TestProject project = TestProject.CreateWithCallTargets("""
                 namespace Samples;
@@ -123,9 +132,9 @@ namespace SetterChecker.Core.Tests
                 public static class Calls
                 {
                     private static int state;
-                    public static void Entry() { _ = System.Activator.CreateInstance(typeof(TYPE)); state = 1; }
+                    public static void Entry() { _ = CREATE; state = 1; }
                 }
-                """.Replace("TYPE", type));
+                """.Replace("CREATE", genericApi ? $"System.Activator.CreateInstance<{type}>()" : $"System.Activator.CreateInstance(typeof({type}))"));
             MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
             MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).ToArray();
@@ -141,6 +150,10 @@ namespace SetterChecker.Core.Tests
         [DataRow("_ = System.Activator.CreateInstance(typeof(Data)); return null;", "Value = 1;", false)]
         [DataRow("_ = System.Activator.CreateInstance(typeof(Data)); return null;", "State.Value++;", true)]
         [DataRow("var data = (Data)Create<Data>(); data.Value = 2; return null;", "Value = 1;", false)]
+        [DataRow("return System.Activator.CreateInstance<Data>();", "Value = 1;", true)]
+        [DataRow("_ = System.Activator.CreateInstance<Data>(); return null;", "Value = 1;", false)]
+        [DataRow("_ = System.Activator.CreateInstance<Data>(); return null;", "State.Value++;", true)]
+        [DataRow("var data = CreateNew<Data>(); data.Value = 2; return null;", "Value = 1;", false)]
         public async Task AnalyzeFollowsReflectionFactoryConstructor(string action, string constructor, bool setter)
         {
             using TestProject project = TestProject.CreateWithCallTargets("""
@@ -150,6 +163,7 @@ namespace SetterChecker.Core.Tests
                 public static class Calls
                 {
                     private static object Create<T>() => System.Activator.CreateInstance(typeof(T));
+                    private static T CreateNew<T>() where T : new() => new T();
                     public static object Entry() { ACTION }
                 }
                 """.Replace("CONSTRUCTOR", constructor).Replace("ACTION", action));
@@ -265,14 +279,22 @@ namespace SetterChecker.Core.Tests
         // 反射的泛型字段及其值类型都由参考门面转交，存储身份仍对应唯一运行定义。
         /// <summary>真实 DLL 的参数写入和新容器读回旧对象使用相同转交规则。</summary>
         [TestMethod]
-        public async Task AnalyzeKeepsForwardedReflectionFieldArguments()
+        [DataRow(false, 1)]
+        [DataRow(true, 1)]
+        [DataRow(false, 4)]
+        [DataRow(true, 4)]
+        public async Task AnalyzeKeepsForwardedReflectionFieldArguments(bool reverse, int jobs)
         {
             using TestProject project = TestProject.CreateWithForwardedMethodSignature(includeReflectedFields: true);
             MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
             MethodEntry[] roots = catalog.GetMethods(catalog.Types.Single(type => type.Name == "ReflectedFields")).ToArray();
             Assert.HasCount(2, roots);
-            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            if (reverse)
+            {
+                Array.Reverse(roots);
+            }
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs);
             Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(method => method.Kind == MethodEffectKind.Setter));
         }
 
