@@ -4,6 +4,43 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 同一入口中的连续条件调用共用前序执行事实，不同入口和调用实参保持独立。
+        /// <summary>源码与 DLL 的矛盾条件仍为 Getter，换实参后的合法修改仍为 Setter。</summary>
+        [TestMethod]
+        [DataRow(8, 1)]
+        [DataRow(8, 4)]
+        [DataRow(32, 1)]
+        [DataRow(32, 4)]
+        public async Task AnalyzeRepeatedConditionalCallsPreserveEachRoot(int count, int jobs)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public class Box { public int Value; }
+                public static class Calls
+                {
+                    private static int Choose(int value) { if (value == 0) return 1; return 0; }
+                    private static void Check(Box target, int value, int other)
+                    {
+                        if (value != 0 && Choose(other) != 0) target.Value = 1;
+                    }
+                    public static void Getter(Box target, int value) { CALLS }
+                    public static void Setter(Box target, int value) { CALLS Check(target, value, 0); }
+                }
+                """.Replace("CALLS", string.Join("\n", Enumerable.Repeat("Check(target, value, value);", count))));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, jobs));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, jobs);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name is "Getter" or "Setter").ToArray();
+            Assert.HasCount(4, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs);
+            EffectAnalysisResult result = new EffectAnalyzer().Analyze(catalog, roots, calls);
+            foreach (MethodEntry root in roots)
+            {
+                Assert.AreEqual(root.Name == "Setter" ? MethodEffectKind.Setter : MethodEffectKind.Getter,
+                    result.Methods.Single(method => method.MethodId == root.Id).Kind, root.Id);
+            }
+        }
+
         // 直接读取别的类型的静态字段也会触发初始化，不能只检查普通方法调用。
         /// <summary>没有显式写入的读取函数，仍须交代初始化中的真实写入或未知实现。</summary>
         [TestMethod]

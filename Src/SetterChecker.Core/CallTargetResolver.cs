@@ -2885,84 +2885,86 @@ namespace SetterChecker.Core
             this.m_integerValues.Clear();
             List<(int Instance, HashSet<int> Blocks, HashSet<(int From, int To)> Edges)> changes = new();
             using IntegerPathProof proof = CreatePathProof();
-            foreach (IGrouping<string, MethodCallInstance> group in this.Instances.Where(instance => provenSetterRoots?.Contains(instance.RootId) != true
+            (int Root, int Generation) query = default;
+            foreach (MethodCallInstance instance in this.Instances.Where(instance => provenSetterRoots?.Contains(instance.RootId) != true
                          && (requestedRoots == null || requestedRoots.Contains(instance.RootId)))
-                         .GroupBy(instance => instance.MethodId))
+                         .OrderBy(instance => instance.RootId))
             {
-                if (!this.m_methods.TryGetValue(group.Key, out MethodBehavior? body)
+                if (!this.m_methods.TryGetValue(instance.MethodId, out MethodBehavior? body)
                     || body.BodyKind != MethodBodyKind.Executable || body.ExceptionHandlers.Count != 0)
                 {
                     continue;
                 }
                 BehaviorFlowBlock[] conditionalBlocks = body.Blocks.Where(block => block.ConditionValueId.HasValue).ToArray();
                 IReadOnlyDictionary<int, BehaviorFlowBlock> blocks = ReadValueFlowGraph(body).Blocks;
-                foreach (MethodCallInstance instance in group)
+                Dictionary<int, bool> conditions = new();
+                foreach (BehaviorFlowBlock block in conditionalBlocks.Where(block => block.SwitchTargetBlockIds == null && IsReachable(instance.Id, block.Id)))
                 {
-                    Dictionary<int, bool> conditions = new();
-                    foreach (BehaviorFlowBlock block in conditionalBlocks.Where(block => block.SwitchTargetBlockIds == null && IsReachable(instance.Id, block.Id)))
+                    try
                     {
-                        try
+                        if (ReadIntegerOperation(instance.Id, body.Values[block.ConditionValueId!.Value], new()) is { } condition)
                         {
-                            if (ReadIntegerOperation(instance.Id, body.Values[block.ConditionValueId!.Value], new()) is { } condition)
-                            {
-                                conditions.Add(block.Id, condition.Value != 0);
-                            }
-                        }
-                        catch (AnalysisException)
-                        {
-                            // 条件缺少证明时两条原始边均保留；其真实调用和失败仍由原流程检查。
+                            conditions.Add(block.Id, condition.Value != 0);
                         }
                     }
-                    HashSet<int> stops = (this.m_callsByCallerInstance.GetValueOrDefault(instance.Id)?.Values ?? Enumerable.Empty<ResolvedCall>())
-                        .Where(call => !call.CompletesWithoutTarget && call.Targets.All(target => this.m_methods.TryGetValue(target.MethodId, out MethodBehavior? targetBody)
-                            && targetBody.BodyKind == MethodBodyKind.Executable
-                            && !targetBody.Returns.Any(result => IsReachable(target.InstanceId, result.Point.BlockId))))
-                        .Select(call => call.Call.Point.BlockId).ToHashSet();
-                    HashSet<(int From, int To)> impossible = new();
-                    if (conditionalBlocks.Any(block => !conditions.ContainsKey(block.Id) && IsReachable(instance.Id, block.Id)))
+                    catch (AnalysisException)
+                    {
+                        // 条件缺少证明时两条原始边均保留；其真实调用和失败仍由原流程检查。
+                    }
+                }
+                HashSet<int> stops = (this.m_callsByCallerInstance.GetValueOrDefault(instance.Id)?.Values ?? Enumerable.Empty<ResolvedCall>())
+                    .Where(call => !call.CompletesWithoutTarget && call.Targets.All(target => this.m_methods.TryGetValue(target.MethodId, out MethodBehavior? targetBody)
+                        && targetBody.BodyKind == MethodBodyKind.Executable
+                        && !targetBody.Returns.Any(result => IsReachable(target.InstanceId, result.Point.BlockId))))
+                    .Select(call => call.Call.Point.BlockId).ToHashSet();
+                HashSet<(int From, int To)> impossible = new();
+                if (conditionalBlocks.Any(block => !conditions.ContainsKey(block.Id) && IsReachable(instance.Id, block.Id)))
+                {
+                    if (query != (instance.RootId, this.m_catalog.SemanticGeneration))
                     {
                         proof.ClearQuery();
-                        foreach (BehaviorFlowBlock block in conditionalBlocks.Where(block => !conditions.ContainsKey(block.Id) && IsReachable(instance.Id, block.Id)))
+                        query = (instance.RootId, this.m_catalog.SemanticGeneration);
+                    }
+                    foreach (BehaviorFlowBlock block in conditionalBlocks.Where(block => !conditions.ContainsKey(block.Id) && IsReachable(instance.Id, block.Id)))
+                    {
+                        foreach (BehaviorFlowEdge edge in block.Successors.Where(edge => edge.TargetBlockId.HasValue
+                            && this.m_excludedEdges.GetValueOrDefault(instance.Id)?.Contains((block.Id, edge.TargetBlockId.Value)) != true))
                         {
-                            foreach (BehaviorFlowEdge edge in block.Successors.Where(edge => edge.TargetBlockId.HasValue
-                                && this.m_excludedEdges.GetValueOrDefault(instance.Id)?.Contains((block.Id, edge.TargetBlockId.Value)) != true))
+                            if (proof.IsImpossibleEdge(instance.Id, block, edge.TargetBlockId!.Value))
                             {
-                                if (proof.IsImpossibleEdge(instance.Id, block, edge.TargetBlockId!.Value))
-                                {
-                                    impossible.Add((block.Id, edge.TargetBlockId.Value));
-                                }
+                                impossible.Add((block.Id, edge.TargetBlockId.Value));
                             }
                         }
                     }
-                    if (conditions.Count == 0 && stops.Count == 0 && impossible.Count == 0)
+                }
+                if (conditions.Count == 0 && stops.Count == 0 && impossible.Count == 0)
+                {
+                    continue;
+                }
+                HashSet<(int From, int To)> excluded = new(this.m_excludedEdges.GetValueOrDefault(instance.Id) ?? Enumerable.Empty<(int, int)>());
+                excluded.UnionWith(impossible);
+                foreach (BehaviorFlowBlock block in body.Blocks)
+                {
+                    excluded.UnionWith(block.Successors.Where(edge => edge.TargetBlockId.HasValue && (stops.Contains(block.Id)
+                        || block.Successors.Count > 1 && conditions.TryGetValue(block.Id, out bool taken) && taken != (edge.TargetBlockId == block.JumpTargetBlockId)))
+                        .Select(edge => (block.Id, edge.TargetBlockId!.Value)));
+                }
+                HashSet<int> reachable = new();
+                Queue<int> pending = new(new[] { -1 });
+                while (pending.TryDequeue(out int id))
+                {
+                    if (!IsReachable(instance.Id, id) || !reachable.Add(id))
                     {
                         continue;
                     }
-                    HashSet<(int From, int To)> excluded = new(this.m_excludedEdges.GetValueOrDefault(instance.Id) ?? Enumerable.Empty<(int, int)>());
-                    excluded.UnionWith(impossible);
-                    foreach (BehaviorFlowBlock block in body.Blocks)
+                    BehaviorFlowBlock block = blocks[id];
+                    foreach (BehaviorFlowEdge edge in block.Successors.Where(edge => edge.TargetBlockId.HasValue
+                        && !excluded.Contains((id, edge.TargetBlockId.Value))))
                     {
-                        excluded.UnionWith(block.Successors.Where(edge => edge.TargetBlockId.HasValue && (stops.Contains(block.Id)
-                            || block.Successors.Count > 1 && conditions.TryGetValue(block.Id, out bool taken) && taken != (edge.TargetBlockId == block.JumpTargetBlockId)))
-                            .Select(edge => (block.Id, edge.TargetBlockId!.Value)));
+                        pending.Enqueue(edge.TargetBlockId!.Value);
                     }
-                    HashSet<int> reachable = new();
-                    Queue<int> pending = new(new[] { -1 });
-                    while (pending.TryDequeue(out int id))
-                    {
-                        if (!IsReachable(instance.Id, id) || !reachable.Add(id))
-                        {
-                            continue;
-                        }
-                        BehaviorFlowBlock block = blocks[id];
-                        foreach (BehaviorFlowEdge edge in block.Successors.Where(edge => edge.TargetBlockId.HasValue
-                            && !excluded.Contains((id, edge.TargetBlockId.Value))))
-                        {
-                            pending.Enqueue(edge.TargetBlockId!.Value);
-                        }
-                    }
-                    changes.Add((instance.Id, blocks.Keys.Except(reachable).ToHashSet(), excluded));
                 }
+                changes.Add((instance.Id, blocks.Keys.Except(reachable).ToHashSet(), excluded));
             }
             HashSet<int> changedRoots = new();
             foreach (var change in changes)
@@ -3100,7 +3102,7 @@ namespace SetterChecker.Core
                 this.m_solver.Parameters = parameters;
             }
 
-            // 下一个函数实例只复用环境，不沿用前一个实例的公式或查询结果。
+            // 换根、目录变化或新的写入见证要清除整份查询，对象标号不能单独保留。
             public void ClearQuery()
             {
                 this.m_solver.Reset();
