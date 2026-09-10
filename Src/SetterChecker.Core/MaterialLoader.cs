@@ -83,7 +83,7 @@ namespace SetterChecker.Core
                         running.Add(Task.Run(() =>
                         {
                             SourceAssemblyMaterial source = BuildSourceAssembly(response, reportRoot,
-                                trees, references, generatorsByAnalyzerSet[AnalyzerSetKey(response.AnalyzerPaths)], cancellationToken);
+                                trees, references, generatorsByAnalyzerSet[string.Join('\0', response.AnalyzerPaths)], cancellationToken);
                             using MemoryStream image = new();
                             EmitResult result = source.Compilation.Emit(image, options: response.EmitOptions, cancellationToken: cancellationToken);
                             if (!result.Success)
@@ -1172,17 +1172,11 @@ namespace SetterChecker.Core
             IReadOnlyList<CompilerResponse> responses)
         {
             return responses
-                .GroupBy(response => AnalyzerSetKey(response.AnalyzerPaths), StringComparer.Ordinal)
+                .GroupBy(response => string.Join('\0', response.AnalyzerPaths), StringComparer.Ordinal)
                 .ToDictionary(
                     group => group.Key,
                     group => LoadGenerators(group.First().AnalyzerPaths),
                     StringComparer.Ordinal);
-        }
-
-        // 把一组已排序的分析器路径转换成一次运行内的查找键。
-        private static string AnalyzerSetKey(IReadOnlyList<string> analyzerPaths)
-        {
-            return string.Join('\0', analyzerPaths);
         }
 
         // 从 Unity 声明的分析器文件中读取 C# 源码生成器。

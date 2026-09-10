@@ -6,6 +6,48 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class CallTargetResolverTests
     {
+        // 一个入口的剪枝或普通调用补读不能丢掉另一个入口尚未尝试的绑定。
+        /// <summary>源码与 DLL 的普通、虚函数和委托入口在单路及四路下均完整闭合。</summary>
+        [TestMethod]
+        [DataRow("direct")]
+        [DataRow("virtual")]
+        [DataRow("delegate")]
+        public async Task ResolveAsyncRetainsUnattemptedRootsAcrossGlobalDeferral(string kind)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public interface IUse { void Touch(); }
+                public sealed class Target : IUse { public int Value; public void Touch() { Value=1; } }
+                public static class Helper { public static int Read() => 2; }
+                public static class Calls
+                {
+                    public static void First(PARAMETER input) { FIRST }
+                    public static void Second(bool flag) { SECOND Helper.Read(); }
+                    private static void Never() { state=1; }
+                    private static int state;
+                }
+                """.Replace("PARAMETER", kind == "virtual" ? "IUse" : "Target")
+                .Replace("FIRST", kind == "direct" ? "Helper.Read();" : kind == "virtual" ? "input.Touch();" : "new System.Action(input.Touch)();")
+                .Replace("SECOND", kind == "direct" ? "if (flag && !flag) Never();" : string.Empty));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name is "First" or "Second").OrderBy(method => method.Id, StringComparer.Ordinal).ToArray();
+            Assert.HasCount(4, roots);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs);
+                Assert.IsEmpty(calls.PendingCalls);
+                foreach (MethodEntry root in roots)
+                {
+                    Assert.IsTrue(calls.Calls.Any(call => call.CallerMethodId == root.Id), root.Id);
+                    Assert.AreEqual(root.Name == "First" && kind != "direct" ? MethodEffectKind.Setter : MethodEffectKind.Getter,
+                        new EffectAnalyzer().Analyze(catalog, new[] { root }, calls).Methods.Single().Kind, root.Id);
+                }
+                Assert.IsFalse(calls.Calls.Any(call => call.Call.Target.Name == "Never"));
+            }
+        }
+
         // 根引用参数的对象初值进入原别名查询，不能用负编号绕过另一个可能相同的对象。
         /// <summary>两个根对象的重合尚未证明时仍明确报缺口，不越界或固定旧值。</summary>
         [TestMethod]

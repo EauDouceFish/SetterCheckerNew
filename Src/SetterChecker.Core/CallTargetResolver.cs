@@ -47,6 +47,7 @@ namespace SetterChecker.Core
             {
                 sources.MarkChangedMethods(behaviors.Keys.ToHashSet(StringComparer.Ordinal));
             }
+            HashSet<int> bindingRoots = new();
 
             // 发布同一份调用和值来源快照，尚未解析的调用独立保存。
             CallTargetResolutionResult ReadResult()
@@ -97,6 +98,7 @@ namespace SetterChecker.Core
 
                 HashSet<int> frozenRoots = provenSetters.Keys.ToHashSet();
                 HashSet<int> recheckRoots = sources.TakeChangedRoots(frozenRoots);
+                bindingRoots.UnionWith(recheckRoots);
                 progress?.Invoke($"本轮重新检查 {recheckRoots.Count} 个入口的执行条件。");
                 HashSet<int> changedRoots = recheckRoots.Count == 0 ? new() : sources.RefineReachability(frozenRoots, recheckRoots);
                 if (changedRoots.Count != 0)
@@ -151,7 +153,10 @@ namespace SetterChecker.Core
                 List<MethodCallInstance> next = new();
                 HashSet<(int InstanceId, int Position)> resolvedCalls = new();
                 bool? deferDynamic = null;
-                foreach (var item in waiting.OrderBy(item => item.Call.Kind is BehaviorCallKind.Virtual
+                // 条件复查和绑定分别消费工作资格，跨轮保留尚未尝试的入口。
+                HashSet<int> attemptedRoots = new(bindingRoots);
+                bindingRoots.Clear();
+                foreach (var item in waiting.Where(item => attemptedRoots.Contains(item.Instance.RootId)).OrderBy(item => item.Call.Kind is BehaviorCallKind.Virtual
                              or BehaviorCallKind.Delegate ? 1 : 0).ToArray())
                 {
                     MethodBehavior behavior = item.Behavior;
@@ -160,6 +165,7 @@ namespace SetterChecker.Core
                     cancellationToken.ThrowIfCancellationRequested();
                     if (call.Kind is BehaviorCallKind.Virtual or BehaviorCallKind.Delegate && (deferDynamic ??= next.Count != 0))
                     {
+                        bindingRoots.Add(instance.RootId);
                         continue;
                     }
                     IReadOnlyList<(ResolvedMethodDefinition Definition, ResolvedCallTarget Binding)>? targets;
@@ -299,7 +305,7 @@ namespace SetterChecker.Core
                 waiting.RemoveAll(item => resolvedCalls.Contains((item.Instance.Id, item.Call.Position)));
                 if (next.Count == 0 && resolvedCalls.Count == 0 && waiting.Count != 0)
                 {
-                    if (sources.HasChangedRoots(frozenRoots))
+                    if (bindingRoots.Count != 0 || sources.HasChangedRoots(frozenRoots))
                     {
                         pending = next;
                         continue;
@@ -5149,9 +5155,7 @@ namespace SetterChecker.Core
         {
             TypeIdentityTemplate[] arguments = this.m_catalog.ReadResolvedTypeArguments(member.ReferringAssemblyPath!, member.ReferenceMetadataToken)
                 .Select(instance.Substitute).ToArray();
-            TypeEntry type = member.KnownDeclaringTypeId is string knownId
-                ? this.m_catalog.TypesById.TryGetValue(knownId, out TypeEntry? known) ? known : throw new AnalysisException($"本地类型定义尚未载入：{knownId}")
-                : this.m_catalog.ResolveTypeDefinition(new BehaviorTypeReference(instance.Substitute(member.DeclaringTypeIdentity),
+            TypeEntry type = this.m_catalog.ResolveTypeDefinition(new BehaviorTypeReference(instance.Substitute(member.DeclaringTypeIdentity),
                 new TypeIdentityTemplate(member.DeclaringTypeDefinitionId), arguments, member.TargetAssemblyIdentity,
                 member.ReferringAssemblyPath, member.KnownDeclaringTypeId));
             return (type, arguments);
