@@ -1539,6 +1539,23 @@ namespace SetterChecker.Core
                 : ReadResolvedTypeArguments(reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken);
         }
 
+        // 还原完整类型的真实身份，数组和指针等外层形状不能被元素声明代替。
+        internal TypeIdentityTemplate ReadResolvedTypeIdentity(BehaviorTypeReference reference)
+        {
+            if (reference.ReferenceMetadataToken == 0)
+            {
+                return reference.Identity;
+            }
+            Cecil.ModuleDefinition module = GetManagedModule(reference.ReferringAssemblyPath!);
+            Cecil.TypeReference type;
+            lock (module)
+            {
+                type = (Cecil.TypeReference)module.LookupToken(reference.ReferenceMetadataToken);
+            }
+            return MethodCatalog.ManagedTypeIdentity(type,
+                definition => ReadResolvedTypeId(definition, reference.ReferringAssemblyPath!));
+        }
+
         // 原元数据使用点保留程序集范围，不能用相同显示名称代替真实构造实参。
         internal IReadOnlyList<TypeIdentityTemplate> ReadResolvedTypeArguments(string path, int token, bool methodArguments = false)
         {

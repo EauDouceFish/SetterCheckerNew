@@ -4,6 +4,218 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 类型分支选中的构造函数必须和同一路径绑定，泛型创建也保留真实构造参数。
+        /// <summary>不同创建候选不能混用构造写入和对象身份。</summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        public async Task AnalyzeKeepsReflectionFactoryTypeSelection(bool guard, bool generic)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class State { public static int Value; }
+                public sealed class Quiet { }
+                public sealed class Writer { public Writer() { State.Value++; } }
+                public sealed class Box<T> { public T Value; }
+                public static class Calls
+                {
+                    public static void Entry(bool flag)
+                    {
+                        System.Type type = flag ? typeof(Quiet) : typeof(Writer);
+                        ACTION
+                    }
+                }
+                """.Replace("ACTION", generic
+                    ? "var box = (Box<int>)System.Activator.CreateInstance(typeof(Box<int>)); box.Value = 1;"
+                    : (guard ? "if (flag) " : string.Empty) + "_ = System.Activator.CreateInstance(type);"));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(method => method.Kind
+                == (guard || generic ? MethodEffectKind.Getter : MethodEffectKind.Setter)));
+        }
+
+        // 在同一创建表达式中分别写入旧对象和新对象，读回成员仍跟随实际选择。
+        /// <summary>构造函数写入的成员内容不能跨创建分支混合。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public async Task AnalyzeKeepsReflectionFactoryMemberSelection(bool existing, bool delegateCall = false)
+        {
+            string source = """
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public class Box { public Data Child; }
+                public static class State { public static Data Existing; }
+                public sealed class A : Box { public A() { Child = State.Existing; } public static void Fill(Box box) { box.Child = State.Existing; } }
+                public sealed class B : Box { public B() { Child = new Data(); } public static void Fill(Box box) { box.Child = new Data(); } }
+                public static class Calls
+                {
+                    public static void Entry(bool flag)
+                    {
+                        var box = (Box)System.Activator.CreateInstance(flag ? typeof(A) : typeof(B));
+                        if (CONDITION) box.Child.Value = 1;
+                    }
+                }
+                """.Replace("CONDITION", existing ? "flag" : "!flag");
+            if (delegateCall)
+            {
+                source = source.Replace("var box = (Box)System.Activator.CreateInstance(flag ? typeof(A) : typeof(B));",
+                    "var box = new Box(); System.Action<Box> fill = flag ? new System.Action<Box>(A.Fill) : new System.Action<Box>(B.Fill); fill(box);");
+            }
+            using TestProject project = TestProject.CreateWithCallTargets(source);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEffect effect in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(existing ? MethodEffectKind.Setter : MethodEffectKind.Getter, effect.Kind, effect.MethodId);
+            }
+        }
+
+        // 未闭合的递归创建进入待处理清单，重复解析不得反复发布同一个运行时值。
+        /// <summary>部分报告模式保留构造递归证据而不是崩溃或无限重试。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task AnalyzeRetainsRecursiveReflectionFactoryFailure(bool generic)
+        {
+            string source = """
+                namespace Samples;
+                public sealed class Data { public Data() { _ = System.Activator.CreateInstance(typeof(Data)); } }
+                public static class Calls { public static void Entry() { _ = System.Activator.CreateInstance(typeof(Data)); } }
+                """;
+            if (generic)
+            {
+                source = source.Replace("class Data", "class Data<T>")
+                    .Replace("typeof(Data)", "typeof(Data<int>)")
+                    .Replace("Entry() { _ = System.Activator.CreateInstance(typeof(Data<int>))", "Entry() { _ = System.Activator.CreateInstance(typeof(Data<string>))");
+            }
+            using TestProject project = TestProject.CreateWithCallTargets(source);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).ToArray();
+            Assert.HasCount(2, roots);
+            using CancellationTokenSource cancellation = new(TimeSpan.FromSeconds(10));
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2,
+                cancellation.Token, requireCompleteCalls: false);
+            Assert.IsNotEmpty(calls.PendingCalls);
+            Assert.IsTrue(calls.PendingCalls.Any(call => call.Failure?.Contains("递归", StringComparison.Ordinal) == true));
+        }
+
+        // 数组类型的元素声明不能冒充实际请求创建的类型。
+        /// <summary>没有无参构造函数的数组不允许继续证明后续写入。</summary>
+        [TestMethod]
+        [DataRow("Data[]")]
+        [DataRow("Data[,]")]
+        public async Task AnalyzeRejectsReflectionFactoryArrayShape(string type)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { }
+                public static class Calls
+                {
+                    private static int state;
+                    public static void Entry() { _ = System.Activator.CreateInstance(typeof(TYPE)); state = 1; }
+                }
+                """.Replace("TYPE", type));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).ToArray();
+            Assert.HasCount(2, roots);
+            AnalysisException exception = await Assert.ThrowsAsync<AnalysisException>(() => new CallTargetResolver().ResolveAsync(material, catalog, roots, 2));
+            StringAssert.Contains(exception.Message, "反射创建");
+        }
+
+        // 复刻脚本工厂按 Type 创建对象的入口，构造函数和新对象去向都必须实际分析。
+        /// <summary>反射创建不会直接获得固定 Getter 或 Setter 结论。</summary>
+        [TestMethod]
+        [DataRow("return System.Activator.CreateInstance(typeof(Data));", "Value = 1;", true)]
+        [DataRow("_ = System.Activator.CreateInstance(typeof(Data)); return null;", "Value = 1;", false)]
+        [DataRow("_ = System.Activator.CreateInstance(typeof(Data)); return null;", "State.Value++;", true)]
+        [DataRow("var data = (Data)Create<Data>(); data.Value = 2; return null;", "Value = 1;", false)]
+        public async Task AnalyzeFollowsReflectionFactoryConstructor(string action, string constructor, bool setter)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class State { public static int Value; }
+                public sealed class Data { public int Value; public Data() { CONSTRUCTOR } }
+                public static class Calls
+                {
+                    private static object Create<T>() => System.Activator.CreateInstance(typeof(T));
+                    public static object Entry() { ACTION }
+                }
+                """.Replace("CONSTRUCTOR", constructor).Replace("ACTION", action));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEffect effect in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(setter ? MethodEffectKind.Setter : MethodEffectKind.Getter, effect.Kind, effect.MethodId);
+            }
+        }
+
+        // 同一字段经过多次条件写入后，只按真正到达读取位置的值检查外部写入。
+        /// <summary>长存储倒查保持分支关系，同时记录分析阶段的时间与分配量。</summary>
+        [TestMethod]
+        [DataRow(16)]
+        [DataRow(64)]
+        [DataRow(16, true)]
+        [DataRow(64, true)]
+        public async Task AnalyzeScalesRepeatedConditionalFieldWrites(int count, bool privateSlot = false)
+        {
+            string writes = string.Join(Environment.NewLine, Enumerable.Range(1, count).Select(index => $"if (flag) local.Value = {index};"));
+            string source = """
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public static class Calls
+                {
+                    public static void Entry(Data outside, bool flag)
+                    {
+                        var local = new Data();
+                        WRITES
+                        if (local.Value == 0 && flag) outside.Value = 1;
+                    }
+                }
+                """.Replace("WRITES", writes);
+            if (privateSlot)
+            {
+                source = """
+                    namespace Samples;
+                    public sealed class Data { public int Value; }
+                    public static class Calls
+                    {
+                        private static int Identity(int value) => value;
+                        public static void Entry(Data outside, int value)
+                        {
+                            WRITES
+                            if (value > 0 && value < 0) outside.Value = 1;
+                        }
+                    }
+                    """.Replace("WRITES", string.Join(Environment.NewLine, Enumerable.Repeat("value = Identity(value);", count)));
+            }
+            using TestProject project = TestProject.CreateWithCallTargets(source);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            long allocated = GC.GetTotalAllocatedBytes(true);
+            System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            EffectAnalysisResult effects = new EffectAnalyzer().Analyze(catalog, roots, calls);
+            Console.WriteLine($"conditional_writes={count}; private_slot={privateSlot}; elapsed_ms={watch.Elapsed.TotalMilliseconds:F3}; allocated_bytes={GC.GetTotalAllocatedBytes(true) - allocated}");
+            Assert.IsTrue(effects.Methods.All(method => method.Kind == MethodEffectKind.Getter));
+        }
+
         // 同一泛型函数在两个实际类型下可能返回旧对象或新对象，不能按函数名合并整条调用。
         /// <summary>只读快捷判断仍须覆盖每个实际调用环境。</summary>
         [TestMethod]

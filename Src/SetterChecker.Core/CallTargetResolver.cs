@@ -172,6 +172,7 @@ namespace SetterChecker.Core
                     IReadOnlyList<(ResolvedMethodDefinition Definition, ResolvedCallTarget Binding)>? targets;
                     bool coversDeclaredReceivers = false;
                     bool completesWithoutTarget = false;
+                    Action? publishRuntimeValues = null;
                     List<MethodCallInstance?> recursiveInstances = new();
                     try
                     {
@@ -204,7 +205,7 @@ namespace SetterChecker.Core
                                     new BehaviorValueReference(behavior.MethodId, argument.ValueId, InstanceId: instance.Id),
                                 }).ToArray();
                         bool runtimeOperation = TryResolveReflectionCall(catalog, sources, behavior, instance, call,
-                            definition, receiver, arguments, out targets, out completesWithoutTarget);
+                            definition, receiver, arguments, out targets, out completesWithoutTarget, out publishRuntimeValues);
                         if (runtimeOperation)
                         {
                             // 运行时查找产生值事实，反射执行仍产生普通目标和实参绑定。
@@ -260,6 +261,7 @@ namespace SetterChecker.Core
                         {
                             if (!sources.TryFindRecursiveInstance(target.Binding, instance.Id, call.Point, out MethodCallInstance? recursive))
                             {
+                                failures[(instance.Id, item.Call.Point.BlockId)] = $"递归调用的输入或存储来源尚未闭合：{target.Binding.MethodId}";
                                 break;
                             }
                             recursiveInstances.Add(recursive);
@@ -275,6 +277,7 @@ namespace SetterChecker.Core
                     {
                         continue;
                     }
+                    publishRuntimeValues?.Invoke();
                     List<ResolvedCallTarget> bindings = new();
                     foreach (var (target, recursive) in targets.Zip(recursiveInstances))
                     {
@@ -335,18 +338,78 @@ namespace SetterChecker.Core
             MethodBehavior body, MethodCallInstance instance, BehaviorCall call, ResolvedMethodDefinition declaration,
             IReadOnlyList<BehaviorValueReference> receiver, IReadOnlyList<IReadOnlyList<BehaviorValueReference>> arguments,
             out IReadOnlyList<(ResolvedMethodDefinition Definition, ResolvedCallTarget Binding)>? targets,
-            out bool completesWithoutTarget)
+            out bool completesWithoutTarget, out Action? publishRuntimeValues)
         {
             targets = null;
             completesWithoutTarget = false;
+            publishRuntimeValues = null;
             TypeEntry owner = catalog.TypesById[declaration.Method.TypeId];
-            if (owner.FullName is not ("System.Type" or "System.Reflection.MethodBase" or "System.Reflection.MethodInfo"
+            if (owner.FullName is not ("System.Type" or "System.Activator" or "System.Reflection.MethodBase" or "System.Reflection.MethodInfo"
                 or "System.Reflection.FieldInfo" or "System.Reflection.PropertyInfo")
                 || owner.AssemblyPath != catalog.ReadPrimitiveType("System.Object").AssemblyPath)
             {
                 return false;
             }
             BehaviorValueReference resultReference = new(body.MethodId, call.ResultValueId ?? -1, instance.Id);
+            if (owner.FullName == "System.Activator" && declaration.Method.Name == "CreateInstance" && arguments.Count == 1)
+            {
+                IReadOnlyList<ValueOrigin> types = sources.GetCallOrigins(arguments[0].Single());
+                if (types.Any(value => value.Value.Kind == BehaviorValueKind.CallResult))
+                {
+                    return true;
+                }
+                if (types.Count == 0 || types.Any(value => value.Value.Kind != BehaviorValueKind.Type))
+                {
+                    throw new AnalysisException($"反射创建的实际类型尚未闭合：{body.MethodId} @ {call.Point.BlockId}");
+                }
+                var constructors = types.Select(origin =>
+                {
+                    TypeEntry type = catalog.ResolveTypeDefinition(origin.Value.Type!);
+                    TypeIdentityTemplate[] typeArguments = catalog.ReadResolvedTypeArguments(origin.Value.Type!)
+                        .Select(sources.GetInstance(origin.Reference.InstanceId).Substitute).ToArray();
+                    TypeIdentityTemplate identity = sources.GetInstance(origin.Reference.InstanceId)
+                        .Substitute(catalog.ReadResolvedTypeIdentity(origin.Value.Type!));
+                    if (identity != ConstructTypeIdentity(type, typeArguments)
+                        || type.IsValueType || type.IsAbstract || typeArguments.Length != type.GenericParameters.Count
+                        || typeArguments.Any(argument => argument.HasUnspecifiedParameter || ContainsTypeParameter(argument.Text)))
+                    {
+                        throw new AnalysisException($"反射创建的类型或装箱规则尚未闭合：{type.FullName}");
+                    }
+                    TypeEntry[] initializedTypes = catalog.ReadInheritedTypes(type, typeArguments, includeInterfaces: false)
+                        .Select(parent => parent.Definition).Prepend(type).ToArray();
+                    if (initializedTypes.Any(candidate => catalog.GetMethods(candidate).Any(method => method.Kind == MethodKind.StaticConstructor)))
+                    {
+                        throw new AnalysisException($"反射创建的类型初始化尚未闭合：{type.FullName}");
+                    }
+                    MethodEntry[] matches = catalog.GetMethods(type).Where(method => method.Kind == MethodKind.Constructor
+                        && method.IsPublic && method.Parameters.Count == 0).ToArray();
+                    if (matches.Length != 1)
+                    {
+                        throw new AnalysisException($"反射创建没有唯一公开无参构造函数：{type.FullName}");
+                    }
+                    return (Origin: origin, Type: type, Arguments: typeArguments, Method: matches[0]);
+                }).ToArray();
+                List<(ResolvedMethodDefinition, ResolvedCallTarget)> bindings = new();
+                foreach (var constructor in constructors)
+                {
+                    BehaviorMethodReference reference = catalog.ReadMethodReference(constructor.Method);
+                    bindings.Add((new(constructor.Method, constructor.Arguments), new(constructor.Method.Id, reference,
+                        new[] { resultReference }, Array.Empty<IReadOnlyList<BehaviorValueReference>>(), constructor.Arguments.Select(argument => argument.Text).ToArray())
+                    { TargetSelections = new[] { (arguments[0].Single(), constructor.Origin) } }));
+                }
+                // 所有目标通过递归检查后才一起发布对象，失败重试不会留下半份创建结果。
+                publishRuntimeValues = () => sources.BindRuntimeValue(resultReference, constructors.Select(constructor =>
+                {
+                    BehaviorTypeReference type = new(ConstructTypeIdentity(constructor.Type, constructor.Arguments),
+                        new(constructor.Type.LogicalId), constructor.Arguments, constructor.Type.AssemblyIdentity,
+                        constructor.Type.AssemblyPath, constructor.Type.Id);
+                    return sources.BindRuntimeValue(new ValueOrigin(resultReference, body.Values[resultReference.ValueId] with
+                    { Kind = BehaviorValueKind.NewObject, Type = type, Method = catalog.ReadMethodReference(constructor.Method), InputValueIds = Array.Empty<int>() })
+                    { Selection = (arguments[0].Single(), constructor.Origin) });
+                }).ToArray());
+                targets = bindings;
+                return true;
+            }
             if (owner.FullName == "System.Type" && declaration.Method.Name == "GetTypeFromHandle" && arguments.Count == 1)
             {
                 IReadOnlyList<ValueOrigin> values = sources.GetCallOrigins(arguments[0].Single());
@@ -4476,7 +4539,8 @@ namespace SetterChecker.Core
                                         .Where(returned => this.m_sources.IsReachable(target.InstanceId, returned.Point.BlockId)
                                             && (selectedReturn == null || selectedReturn.ReturnPoint == returned.Point))
                                         .SelectMany(returned => ReadGraph(target.InstanceId).NodesByBlockId[returned.Point.BlockId].Select(node =>
-                                            (Guard: JoinConditions(ReadPrefix(target.InstanceId, node), ReadExecutionBefore(target.InstanceId, returned.Point)),
+                                            (Guard: JoinConditions(selection ?? this.m_true,
+                                                JoinConditions(ReadPrefix(target.InstanceId, node), ReadExecutionBefore(target.InstanceId, returned.Point))),
                                                 Value: (Func<SelectedValue>)(() =>
                                                 {
                                                     if (!this.m_sources.HasClosedPrefix(target.InstanceId, returned.Point, closedPrefixes))
@@ -6135,8 +6199,8 @@ namespace SetterChecker.Core
                 }
                 var allocations = allocatedFields.Where(item => item.Value.Point!.Value.BlockId == current.Node.BlockId).ToLookup(item => item.Value.Point!.Value.Order);
                 var assignments = graph.Assignments[current.Node.BlockId].ToLookup(assignment => assignment.Point.Order);
-                var writesByOrder = GetWrites(instance.Id, current.Node.BlockId).ToLookup(write => write.Point.Order);
-                var callsByOrder = graph.Calls[current.Node.BlockId].ToLookup(call => call.Point.Order);
+                var writesByOrder = (privateSlotOnly ? Array.Empty<BehaviorWrite>() : GetWrites(instance.Id, current.Node.BlockId)).ToLookup(write => write.Point.Order);
+                var callsByOrder = (privateSlotOnly ? Array.Empty<BehaviorCall>() : graph.Calls[current.Node.BlockId]).ToLookup(call => call.Point.Order);
                 IEnumerable<int> orders = allocations.Select(group => group.Key).Concat(assignments.Select(group => group.Key))
                     .Concat(writesByOrder.Select(group => group.Key)).Concat(callsByOrder.Select(group => group.Key));
                 foreach (int order in orders.Where(order => order < current.Order).Distinct().OrderDescending())
