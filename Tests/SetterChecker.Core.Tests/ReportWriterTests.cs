@@ -81,6 +81,44 @@ namespace SetterChecker.Core.Tests
             }
         }
 
+        // 外部函数只因真实调用候选进入报告，编译目录中的无关程序集不是调用证据。
+        /// <summary>普通依赖及反向接口实现均保留根入口、调用位置和真实定义。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task RunReportsExternalFunctionInclusion(bool incoming)
+        {
+            using TestProject project = incoming ? TestProject.CreateWithIncomingImplementation()
+                : TestProject.CreateWithDirectDependencyAndUnrelatedSource();
+            string? previous = null;
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, jobs));
+                Assert.IsTrue(run.Complete, run.Failure);
+                string output = Path.Combine(project.RootPath, "reports");
+                new ReportWriter().Write(run, output);
+                using JsonDocument report = JsonDocument.Parse(File.ReadAllText(Path.Combine(output, "report.json")));
+                JsonElement functions = report.RootElement.GetProperty("ExternalFunctions");
+                Assert.IsFalse(functions.EnumerateArray().Any(function => function.GetProperty("AssemblyPath").GetString()!.Contains("Unrelated", StringComparison.Ordinal)));
+                JsonElement function = functions.EnumerateArray().Single(function => function.GetProperty("Name").GetString() == (incoming ? "Visible" : "Change"));
+                Assert.AreEqual(incoming ? "Consumer" : "DependencyType", function.GetProperty("Class").GetString());
+                Assert.AreEqual("Executable", function.GetProperty("BodyKind").GetString());
+                Assert.IsTrue(function.GetProperty("MetadataToken").GetInt32() != 0);
+                JsonElement reason = function.GetProperty("FirstReason");
+                Assert.Contains("Entry", reason.GetProperty("Root").GetString()!);
+                Assert.Contains("Entry", reason.GetProperty("Caller").GetString()!);
+                Assert.AreEqual(incoming ? "Virtual" : "Direct", reason.GetProperty("Kind").GetString());
+                Assert.IsTrue(reason.GetProperty("Position").GetProperty("BlockId").GetInt32() >= 0);
+                Assert.Contains(incoming ? "IUI" : "DependencyType", reason.GetProperty("DeclaredTarget").GetString()!);
+                Assert.Contains("外部函数的调用纳入依据", File.ReadAllText(Path.Combine(output, "report.md")));
+                if (previous != null)
+                {
+                    Assert.AreEqual(previous, functions.GetRawText());
+                }
+                previous = functions.GetRawText();
+            }
+        }
+
         // 原生边界是否影响结论按每个入口分别展示，不把已绑定调用从报告中隐藏。
         /// <summary>文本与 JSON 同时保留运行时入口、外部库入口和延期依据。</summary>
         [TestMethod]

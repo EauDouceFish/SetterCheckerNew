@@ -24,6 +24,33 @@ namespace SetterChecker.Core
             { call.CallerMethodId, Position = call.Call.Point.BlockId, call.Failure, Target = call.Call.Target.Identity.Text })
                 .Select(group => new { group.Key.CallerMethodId, group.Key.Position, group.Key.Failure, group.Key.Target, Count = group.Count() }).ToArray();
             var proved = run.Annotations.Methods.Where(method => method.Actual != null && method.Decision != null).Select(method => method.Id).ToHashSet(StringComparer.Ordinal);
+            var reportAssemblies = run.Material.SourceAssemblies.Where(source => source.IsReportAssembly)
+                .Select(source => (string?)source.AssemblyPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var external = (run.Calls?.Calls ?? Array.Empty<ResolvedCall>()).SelectMany(call => call.Targets
+                .Where(target => !reportAssemblies.Contains(names[target.MethodId].AssemblyPath)).Select(target => new
+                {
+                    target.MethodId,
+                    Root = run.Calls!.ValueSources.GetInstance(run.Calls.ValueSources.GetInstance(call.CallerInstanceId).RootId).MethodId,
+                    Caller = call.CallerMethodId,
+                    Position = call.Call.Point,
+                    call.Call.Kind,
+                    DeclaredTarget = call.Call.Target.Identity.Text
+                })).GroupBy(reason => reason.MethodId).OrderBy(group => group.Key, StringComparer.Ordinal).Select(group => new
+                {
+                    group.Key,
+                    Class = names[group.Key].TypeName,
+                    names[group.Key].Name,
+                    names[group.Key].AssemblyPath,
+                    names[group.Key].MetadataToken,
+                    names[group.Key].SourcePath,
+                    names[group.Key].Line,
+                    BodyKind = run.Calls!.Behaviors.MethodsById.TryGetValue(group.Key, out MethodBehavior? body) ? (MethodBodyKind?)body.BodyKind : null,
+                    BindingCount = group.Count(),
+                    RootCount = group.Select(reason => reason.Root).Distinct(StringComparer.Ordinal).Count(),
+                    FirstReason = group.OrderBy(reason => reason.Root, StringComparer.Ordinal).ThenBy(reason => reason.Caller, StringComparer.Ordinal)
+                        .ThenBy(reason => reason.Position.BlockId).ThenBy(reason => reason.Position.Order)
+                        .ThenBy(reason => reason.DeclaredTarget, StringComparer.Ordinal).ThenBy(reason => reason.Kind).First()
+                }).ToArray();
             var native = (run.Calls?.Calls ?? Array.Empty<ResolvedCall>()).SelectMany(call => call.Targets.Where(target =>
                     run.Calls!.Behaviors.MethodsById.TryGetValue(target.MethodId, out MethodBehavior? body)
                     && body.BodyKind is MethodBodyKind.PlatformInvocation or MethodBodyKind.RuntimeImplementation
@@ -84,6 +111,13 @@ namespace SetterChecker.Core
             {
                 text.AppendLine($"- 原生边界（{(boundary.Deferred ? "结论已有独立证据，可延期" : "尚未证明不影响结论")}）：{boundary.Root} → {boundary.Target}；{boundary.BodyKind}；{boundary.NativeBoundary}；{boundary.Count} 个调用绑定");
             }
+            text.AppendLine("\n## 外部函数的调用纳入依据\n");
+            text.AppendLine("以下来自已绑定调用，每个外部函数保留一条固定排序的依据；候选目标不等于运行时必定执行。独立读取的类型初始化不在此清单内。");
+            foreach (var function in external)
+            {
+                var reason = function.FirstReason;
+                text.AppendLine($"- {function.Class}.{function.Name}（{function.AssemblyPath}；标识 {function.MetadataToken}；{function.BodyKind}）：入口 {reason.Root}；调用者 {reason.Caller} @ {reason.Position}；{reason.Kind}；声明目标 {reason.DeclaredTarget}；{function.BindingCount} 个绑定，涉及 {function.RootCount} 个入口。");
+            }
             text.AppendLine("\n## 耗时（秒；其中项不重复相加）\n");
             foreach (var timing in run.Timings)
             {
@@ -108,6 +142,7 @@ namespace SetterChecker.Core
                 UnreadBodies = run.Calls?.Behaviors.Methods.Where(body => body.Failure != null).Select(body => new { body.MethodId, body.Failure }).ToArray(),
                 Pending = pending,
                 NativeBoundaries = native,
+                ExternalFunctions = external,
                 Compilation = run.Material.SourceAssemblies.Select(source => new
                 { source.Name, Origin = source.CompilationOrigin, SourceFiles = source.SourcePaths.Count, source.IsReportAssembly }).ToArray(),
             }, options);
