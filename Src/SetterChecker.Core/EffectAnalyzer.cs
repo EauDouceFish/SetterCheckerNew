@@ -100,6 +100,13 @@ namespace SetterChecker.Core
 
             foreach (MethodCallInstance instance in instances)
             {
+                foreach (BehaviorValue read in resolution.ValueSources.ReadStaticFieldReads(instance.Id))
+                {
+                    if (resolution.ValueSources.ReadStaticCallInitializationFailure(instance.Id, accessedField: read.Member) is string fieldFailure)
+                    {
+                        Propagate(instance.Id, new WriteSubject(null, fieldFailure), new EffectEvidence(new[] { instance.MethodId }, read.Point!.Value.BlockId, fieldFailure));
+                    }
+                }
                 if (resolution.ValueSources.ReadStaticCallInitializationFailure(instance.Id) is string initializationFailure)
                 {
                     Propagate(instance.Id, new WriteSubject(null, initializationFailure), new EffectEvidence(new[] { instance.MethodId }, -1, initializationFailure));

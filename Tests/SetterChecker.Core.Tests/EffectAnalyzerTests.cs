@@ -4,6 +4,49 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 直接读取别的类型的静态字段也会触发初始化，不能只检查普通方法调用。
+        /// <summary>没有显式写入的读取函数，仍须交代初始化中的真实写入或未知实现。</summary>
+        [TestMethod]
+        [DataRow(false, "value")]
+        [DataRow(false, "discard")]
+        [DataRow(false, "address")]
+        [DataRow(false, "reflection")]
+        [DataRow(true, "value")]
+        [DataRow(true, "discard")]
+        [DataRow(true, "address")]
+        [DataRow(true, "reflection")]
+        public async Task AnalyzeKeepsStaticFieldInitializationAtRead(bool unknown, string access)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Storage
+                {
+                    public static int Value;
+                    private static int state;
+                    static Storage() { INITIALIZER }
+                    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]
+                    private static extern void Unknown();
+                }
+                public static class Calls { public static int Entry() { READ } private static int Read(ref int value) => 0; }
+                """.Replace("INITIALIZER", unknown ? "Unknown();" : "state=1;")
+                .Replace("READ", access switch
+                {
+                    "discard" => "_ = Storage.Value; return 0;",
+                    "address" => "return Read(ref Storage.Value);",
+                    "reflection" => "typeof(Storage).GetField(\"Value\").GetValue(null); return 0;",
+                    _ => "return Storage.Value;",
+                }));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2, requireCompleteCalls: false);
+            foreach (MethodEntry root in roots)
+            {
+                Assert.Contains("初始化", Assert.ThrowsExactly<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls)).Message);
+            }
+        }
+
         // 共享相同泛型目标查找时，旧对象与新对象以及不同类型实参不能合并。
         /// <summary>源码与 DLL 的实际接收对象选择在单路、四路下保持一致。</summary>
         [TestMethod]
@@ -38,8 +81,8 @@ namespace SetterChecker.Core.Tests
             }
         }
 
-        // 连续序列化共用同一静态开关，不能把每次只读调用再次展开为所有历史组合。
-        /// <summary>复刻 KFBWriter 的默认值过滤流程，内部写入仍只修改新对象。</summary>
+        // 连续序列化不能指数展开历史查询，也不能漏掉公共静态开关的初始化。
+        /// <summary>复刻 KFBWriter 默认值过滤，局部对象写入不使尚未闭合的静态初始化消失。</summary>
         [TestMethod]
         [DataRow(8)]
         [DataRow(128)]
@@ -71,7 +114,10 @@ namespace SetterChecker.Core.Tests
             Assert.HasCount(2, roots);
             System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
             CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 4);
-            Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(effect => effect.Kind == MethodEffectKind.Getter));
+            foreach (MethodEntry root in roots)
+            {
+                Assert.Contains("初始化写入", Assert.ThrowsExactly<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls)).Message);
+            }
             Assert.IsTrue(watch.Elapsed < TimeSpan.FromSeconds(30), $"{count} 次调用分析耗时 {watch.Elapsed}");
         }
 

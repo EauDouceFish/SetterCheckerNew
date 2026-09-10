@@ -612,29 +612,12 @@ namespace SetterChecker.Core
                         { IsSetter: true } => CatalogMethodKind.PropertySetter,
                         { IsAddOn: true } => CatalogMethodKind.EventAdder,
                         { IsRemoveOn: true } => CatalogMethodKind.EventRemover,
-                        _ => ReadManagedOrdinaryKind(method),
+                        { IsConstructor: true, IsStatic: true } => CatalogMethodKind.StaticConstructor,
+                        { IsConstructor: true } => CatalogMethodKind.Constructor,
+                        { Name: "op_Implicit" or "op_Explicit" or "op_CheckedExplicit" } => CatalogMethodKind.Conversion,
+                        _ => method.Name.StartsWith("op_", StringComparison.Ordinal) ? CatalogMethodKind.Operator : CatalogMethodKind.Ordinary,
                     }))
                 .ToArray();
-        }
-
-        // 按 CLR 函数名识别构造、转换和运算符。
-        private static CatalogMethodKind ReadManagedOrdinaryKind(Cecil.MethodDefinition method)
-        {
-            if (method.IsConstructor)
-            {
-                return method.IsStatic
-                    ? CatalogMethodKind.StaticConstructor
-                    : CatalogMethodKind.Constructor;
-            }
-
-            if (method.Name is "op_Implicit" or "op_Explicit" or "op_CheckedExplicit")
-            {
-                return CatalogMethodKind.Conversion;
-            }
-
-            return method.Name.StartsWith("op_", StringComparison.Ordinal)
-                ? CatalogMethodKind.Operator
-                : CatalogMethodKind.Ordinary;
         }
 
         // 把一个 Cecil 函数定义转换为统一函数记录。

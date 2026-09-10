@@ -5100,18 +5100,19 @@ namespace SetterChecker.Core
             return result;
         }
 
-        // 静态调用的正常返回和外部影响共用初始化事实，不把自身可变静态字段写入当作无效果。
-        internal string? ReadStaticCallInitializationFailure(int instanceId, bool normalReturnOnly = false)
+        // 静态调用和字段访问共用初始化事实，正常返回与仍未纳入的真实写入分开判断。
+        internal string? ReadStaticCallInitializationFailure(int instanceId, bool normalReturnOnly = false, BehaviorMemberReference? accessedField = null)
         {
             MethodCallInstance instance = GetInstance(instanceId);
             MethodEntry method = this.m_definitions[instance.MethodId];
             MethodCallInstance root = GetInstance(instance.RootId);
-            if (!method.IsStatic || method.TypeId == this.m_definitions[root.MethodId].TypeId && instance.TypeArguments.SequenceEqual(root.TypeArguments))
+            (TypeEntry type, IReadOnlyList<TypeIdentityTemplate> arguments) = accessedField == null
+                ? (this.m_catalog.TypesById[method.TypeId], instance.TypeArguments) : ReadMemberType(accessedField, instance);
+            if (accessedField == null && !method.IsStatic || type.Id == this.m_definitions[root.MethodId].TypeId && arguments.SequenceEqual(root.TypeArguments))
             {
                 return null;
             }
-            TypeEntry type = this.m_catalog.TypesById[method.TypeId];
-            var initialization = ReadInitialization(type, instance.TypeArguments);
+            var initialization = ReadInitialization(type, arguments);
             if (!initialization.Independent)
             {
                 return $"静态调用的类型初始化尚未证明正常完成：{type.FullName}";
@@ -5182,16 +5183,25 @@ namespace SetterChecker.Core
             }
         }
 
+        // 普通读取、取地址和反射读取共用实际访问位置，单次调用查询不遍历其它调用。
+        internal IEnumerable<BehaviorValue> ReadStaticFieldReads(int instanceId, ResolvedCall? atCall = null)
+        {
+            IEnumerable<BehaviorValue> reads = atCall == null && this.m_methods.TryGetValue(GetInstance(instanceId).MethodId, out MethodBehavior? body) && body.BodyKind == MethodBodyKind.Executable
+                ? ReadValueFlowGraph(body).StaticReads.SelectMany(group => group) : Enumerable.Empty<BehaviorValue>();
+            IEnumerable<ResolvedCall> calls = atCall != null ? new[] { atCall }
+                : this.m_callsByCallerInstance.GetValueOrDefault(instanceId)?.Values ?? Enumerable.Empty<ResolvedCall>();
+            return reads.Concat(calls.Where(call => call.CompletesWithoutTarget && call.Call.ResultValueId.HasValue)
+                .SelectMany(call => this.m_runtimeValues.GetValueOrDefault(new(call.CallerMethodId, call.Call.ResultValueId!.Value, instanceId)) ?? Array.Empty<ValueOrigin>())
+                .Where(origin => origin.Value.Kind == BehaviorValueKind.FieldRead && origin.Value.InputValueIds.Count == 0).Select(origin => origin.Value))
+                .Where(value => IsReachable(instanceId, value.Point!.Value.BlockId));
+        }
+
         // 反射字段读取没有普通函数目标，但仍实际触发声明类型初始化。
         private void RequireRuntimeInitialization(ResolvedCall call)
         {
-            if (call.CompletesWithoutTarget && call.Call.ResultValueId is int resultId
-                && this.m_runtimeValues.TryGetValue(new(call.CallerMethodId, resultId, call.CallerInstanceId), out IReadOnlyList<ValueOrigin>? values))
+            foreach (BehaviorValue value in ReadStaticFieldReads(call.CallerInstanceId, call))
             {
-                foreach (ValueOrigin value in values.Where(value => value.Value.Kind == BehaviorValueKind.FieldRead && value.Value.InputValueIds.Count == 0))
-                {
-                    RequireStaticFieldInitialization(call.CallerInstanceId, value.Value.Member!);
-                }
+                RequireStaticFieldInitialization(call.CallerInstanceId, value.Member!);
             }
         }
 
