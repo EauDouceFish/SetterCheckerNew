@@ -1487,7 +1487,8 @@ namespace SetterChecker.Core
             IReadOnlyList<TypeIdentityTemplate> arguments = ReadResolvedTypeArguments(
                 reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken);
             TypeEntry[] declaringTypes = reference.KnownDeclaringTypeId == null
-                ? FindReferencedTypes(reference).ToArray()
+                ? FindTypeDefinitions(reference.DeclaringTypeDefinitionId, reference.TargetAssemblyIdentity,
+                    reference.ReferringAssemblyPath, loadMissing: true).ToArray()
                 : new[]
                 {
                     this.TypesById.TryGetValue(reference.KnownDeclaringTypeId, out TypeEntry? known)
@@ -1522,16 +1523,6 @@ namespace SetterChecker.Core
                 ? $"调用目标不存在：{reference.Identity.Text}"
                 : $"调用目标不唯一：{reference.Identity.Text} => "
                     + string.Join("; ", matches.Select(match => match.Method.Id)));
-        }
-
-        // 按开放类型身份和完整程序集身份筛选真实声明类型。
-        private IReadOnlyList<TypeEntry> FindReferencedTypes(BehaviorMethodReference reference)
-        {
-            return FindTypeDefinitions(
-                reference.DeclaringTypeDefinitionId,
-                reference.TargetAssemblyIdentity,
-                reference.ReferringAssemblyPath,
-                loadMissing: true);
         }
 
         // 把材料已证明的参考身份归一到唯一实际文件和身份。

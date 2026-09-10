@@ -266,7 +266,12 @@ namespace SetterChecker.Core
                 while (pending.TryDequeue(out int offset))
                 {
                     Cil.Instruction instruction = instructionsByOffset[offset];
-                    RestoreStack(this.m_incomingStacks[offset]);
+                    // 用本条指令的入口状态恢复求值栈。
+                    this.m_stack.Clear();
+                    foreach (int valueId in this.m_incomingStacks[offset])
+                    {
+                        this.m_stack.Push(valueId);
+                    }
                     this.m_currentOffset = offset;
                     this.m_currentOrder = this.m_incomingStacks[offset].Length;
                     ReadInstruction(instruction);
@@ -494,16 +499,6 @@ namespace SetterChecker.Core
                 return mergeValueId;
             }
 
-            // 用一条入口状态恢复当前正在模拟的指令栈。
-            private void RestoreStack(IReadOnlyList<int> valueIds)
-            {
-                this.m_stack.Clear();
-                foreach (int valueId in valueIds)
-                {
-                    this.m_stack.Push(valueId);
-                }
-            }
-
             // 读取一条会影响值栈或写入事实的基础指令。
             private void ReadInstruction(Cil.Instruction instruction)
             {
@@ -549,7 +544,8 @@ namespace SetterChecker.Core
                     }
                     else
                     {
-                        this.m_stack.Push(ReadSlot(slotId));
+                        // 每次加载独立保留位置，不让后续赋值改变已入栈的值。
+                        this.m_stack.Push(AddValue(BehaviorValueKind.SlotRead, this.m_values[slotId].Reference, new[] { slotId }));
                     }
                     return;
                 }
@@ -1100,15 +1096,6 @@ namespace SetterChecker.Core
             private BehaviorFlowPoint NextPoint()
             {
                 return new BehaviorFlowPoint(this.m_currentOffset, this.m_currentOrder++);
-            }
-
-            // 保留本次读取的位置，避免后续改写变量影响已经入栈的值。
-            private int ReadSlot(int slotId)
-            {
-                return AddValue(
-                    BehaviorValueKind.SlotRead,
-                    this.m_values[slotId].Reference,
-                    new[] { slotId });
             }
 
             // 追加一个不属于普通指令结果的入口值。

@@ -23,6 +23,22 @@ namespace SetterChecker.Core
             var pending = (run.Calls?.PendingCalls ?? Array.Empty<PendingCall>()).GroupBy(call => new
             { call.CallerMethodId, call.Call.Position, call.Failure, Target = call.Call.Target.Identity.Text })
                 .Select(group => new { group.Key.CallerMethodId, group.Key.Position, group.Key.Failure, group.Key.Target, Count = group.Count() }).ToArray();
+            var proved = run.Annotations.Methods.Where(method => method.Actual != null && method.Decision != null).Select(method => method.Id).ToHashSet(StringComparer.Ordinal);
+            var native = (run.Calls?.Calls ?? Array.Empty<ResolvedCall>()).SelectMany(call => call.Targets.Where(target =>
+                    run.Calls!.Behaviors.MethodsById.TryGetValue(target.MethodId, out MethodBehavior? body)
+                    && body.BodyKind is MethodBodyKind.PlatformInvocation or MethodBodyKind.RuntimeImplementation
+                    && !run.Calls.ValueSources.IsRuntimeDelegateCreation(call, target)).Select(target => new
+                    { Root = run.Calls!.ValueSources.GetInstance(run.Calls.ValueSources.GetInstance(call.CallerInstanceId).RootId).MethodId, Target = target.MethodId }))
+                .GroupBy(item => item).OrderBy(group => group.Key.Root, StringComparer.Ordinal).ThenBy(group => group.Key.Target, StringComparer.Ordinal)
+                .Select(group => new
+                {
+                    group.Key.Root,
+                    group.Key.Target,
+                    Count = group.Count(),
+                    Deferred = proved.Contains(group.Key.Root),
+                    run.Calls!.Behaviors.MethodsById[group.Key.Target].BodyKind,
+                    run.Calls.Behaviors.MethodsById[group.Key.Target].NativeBoundary
+                }).ToArray();
             StringBuilder text = new();
             text.AppendLine(run.IsInProgress ? "# 分析进行中：以下仅为当前已证明的部分结果" : run.Complete ? "# 分析完成" : "# 验收未通过：以下仅为已证明的部分结果");
             text.AppendLine($"\nkhengine 总函数数量：{methods.Count} 个");
@@ -62,6 +78,11 @@ namespace SetterChecker.Core
             {
                 text.AppendLine($"- 待处理调用 {call.CallerMethodId} @ {call.Position}（{call.Count} 次）：{call.Failure ?? call.Target}");
             }
+            text.AppendLine("\n## 已绑定的原生边界\n");
+            foreach (var boundary in native)
+            {
+                text.AppendLine($"- 原生边界（{(boundary.Deferred ? "结论已有独立证据，可延期" : "尚未证明不影响结论")}）：{boundary.Root} → {boundary.Target}；{boundary.BodyKind}；{boundary.NativeBoundary}；{boundary.Count} 个调用绑定");
+            }
             text.AppendLine("\n## 耗时（秒；其中项不重复相加）\n");
             foreach (var timing in run.Timings)
             {
@@ -85,6 +106,7 @@ namespace SetterChecker.Core
                 run.Timings,
                 UnreadBodies = run.Calls?.Behaviors.Methods.Where(body => body.Failure != null).Select(body => new { body.MethodId, body.Failure }).ToArray(),
                 Pending = pending,
+                NativeBoundaries = native,
             }, options);
             File.WriteAllText(Path.Combine(directory, "report.md"), text.ToString(), new UTF8Encoding(false));
             File.WriteAllText(Path.Combine(directory, "report.json"), json, new UTF8Encoding(false));

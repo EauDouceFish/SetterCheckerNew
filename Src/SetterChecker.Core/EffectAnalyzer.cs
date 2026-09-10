@@ -54,7 +54,7 @@ namespace SetterChecker.Core
                     {
                         continue;
                     }
-                    if (current.Subject.Failure == null && current.Point.HasValue
+                    if (current.Subject.Failure == null && !current.Subject.ExecutionProven && current.Point.HasValue
                         && !resolution.ValueSources.HasClosedPrefix(current.Instance, current.Point.Value, closedPrefixes, conditionFailures: unsettled))
                     {
                         current.Subject = new WriteSubject(null, "修改位置之前的调用尚未证明可以正常返回", current.Subject.Witness);
@@ -145,10 +145,10 @@ namespace SetterChecker.Core
             // 静态写入没有接收对象，但仍必须满足写入之前的引用及转换条件。
             IEnumerable<WriteSubject> ReadStaticWriteSubjects(MethodCallInstance instance, BehaviorWrite write)
             {
-                if (pathConditions.Contains(instance.RootId) || write.Selection != null)
+                string? failure = null;
+                try
                 {
-                    string? failure = null;
-                    try
+                    if (pathConditions.Contains(instance.RootId) || write.Selection != null)
                     {
                         var selected = pathProof.ReadSelectedOriginsAtPoint(instance.RootId, Array.Empty<ValueOrigin>(), instance.Id, write.Point, null, write: write);
                         if (!selected.Possible)
@@ -157,20 +157,24 @@ namespace SetterChecker.Core
                             {
                                 yield break;
                             }
-                            failure = pathProof.MemoryFailure ?? "单次经过循环未取得静态写入见证，不能据此排除其它迭代";
+                            failure = pathProof.MemoryFailure ?? "尚有未闭合执行路径，未取得静态写入见证";
                         }
                     }
-                    catch (AnalysisException exception)
+                    else
                     {
-                        failure = exception.Message;
-                    }
-                    if (failure != null)
-                    {
-                        yield return new WriteSubject(null, failure);
-                        yield break;
+                        resolution.ValueSources.RequireStaticFieldInitialization(instance.Id, write.Member!);
                     }
                 }
-                yield return new WriteSubject(null);
+                catch (AnalysisException exception)
+                {
+                    failure = exception.Message;
+                }
+                if (failure != null)
+                {
+                    yield return new WriteSubject(null, failure);
+                    yield break;
+                }
+                yield return new WriteSubject(null, ExecutionProven: pathConditions.Contains(instance.RootId) || write.Selection != null);
             }
 
             businessAssemblies ??= roots.Select(method => method.AssemblyPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -368,7 +372,7 @@ namespace SetterChecker.Core
         }
 
         private readonly record struct WriteSubject(BehaviorValueReference? Reference, string? Failure = null,
-            (BehaviorValueReference Receiver, BehaviorFlowPoint Point, BehaviorWrite Write)? Witness = null);
+            (BehaviorValueReference Receiver, BehaviorFlowPoint Point, BehaviorWrite Write)? Witness = null, bool ExecutionProven = false);
     }
 
     /// <summary>函数自身的真实行为，与日志豁免无关。</summary>

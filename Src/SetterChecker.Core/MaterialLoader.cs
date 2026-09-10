@@ -665,7 +665,9 @@ namespace SetterChecker.Core
             CSharpParseOptions parseOptions)
         {
             string[] dataDirectories = referencePaths
-                .Select(FindUnityDataDirectory)
+                .Select(reference => ReadParentDirectories(reference).FirstOrDefault(directory =>
+                    string.Equals(directory.Name, "Data", StringComparison.OrdinalIgnoreCase)
+                    && Directory.Exists(Path.Combine(directory.FullName, "MonoBleedingEdge")))?.FullName)
                 .Where(path => path != null)
                 .Cast<string>()
                 .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -771,14 +773,6 @@ namespace SetterChecker.Core
             }
 
             return usesAot ? $"unityaot-{hostName}" : $"unityjit-{hostName}";
-        }
-
-        // 找到引用路径所属的 Unity Data 目录。
-        private static string? FindUnityDataDirectory(string referencePath)
-        {
-            return ReadParentDirectories(referencePath).FirstOrDefault(directory =>
-                string.Equals(directory.Name, "Data", StringComparison.OrdinalIgnoreCase)
-                && Directory.Exists(Path.Combine(directory.FullName, "MonoBleedingEdge")))?.FullName;
         }
 
         // 判断文件是否位于一个已确认的目录内部。

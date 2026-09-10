@@ -4,6 +4,49 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class AnnotationEvaluatorTests
     {
+        // 静态开关与参数的省重查询不能抹去写回、旧副本或不同调用实参。
+        /// <summary>源码与 DLL 的缓存豁免保留真实数值，只有随后可执行的业务写入才追踪。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task RunPreservesStaticAndParameterChoices(bool external)
+        {
+            string library = """
+                namespace KH { public class NoLogTrackAttribute : System.Attribute { public NoLogTrackAttribute(string reason = "") { } } }
+                namespace Samples
+                {
+                    public class Box { public int Value; }
+                    public static class Cache
+                    {
+                        public static bool Gate;
+                        [KH.NoLogTrack("缓存")] public static void Set(bool value) { Gate = value; }
+                        public static bool Read(bool value) { if (Gate) return value; return false; }
+                        public static bool Copy(bool value) { bool old = value; value = false; return old && value; }
+                        public static bool ReadThenChange(ref bool value) { bool old = value; value = false; return old; }
+                    }
+                }
+                """;
+            using TestProject project = external ? TestProject.CreateWithCallTargets(library) : TestProject.CreateSingleAssembly();
+            project.WriteRootSource((external ? string.Empty : library) + """
+                public static class Calls
+                {
+                    public static void Disabled(Samples.Box target) { Samples.Cache.Set(false); if (Samples.Cache.Gate) target.Value = 1; }
+                    public static void Enabled(Samples.Box target) { Samples.Cache.Set(true); if (Samples.Cache.Gate) target.Value = 1; }
+                    public static void DifferentArguments(Samples.Box target) { if (Samples.Cache.Read(true) && Samples.Cache.Read(false)) target.Value = 1; }
+                    public static void OldCopy(Samples.Box target, bool value) { if (Samples.Cache.Copy(value)) target.Value = 1; }
+                    public static void RefCopy(Samples.Box target) { bool value = true; bool old = Samples.Cache.ReadThenChange(ref value); if (old && !value) target.Value = 1; }
+                    public static void OppositeBranch(Samples.Box target, bool flag) { bool read = flag ? Samples.Cache.Gate : false; if (!flag && read) target.Value = 1; }
+                }
+                """);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            Assert.IsTrue(run.Complete);
+            foreach (AnnotationMethod method in run.Annotations.Methods.Where(method => method.Class == "Calls"))
+            {
+                Assert.AreEqual(method.Name is "Enabled" or "RefCopy" ? "ShouldTrack" : "NoLogTrack", method.Decision, method.Name);
+                Assert.AreEqual(method.Name is "Enabled" or "Disabled" or "RefCopy" ? MethodEffectKind.Setter : MethodEffectKind.Getter, method.Actual, method.Name);
+            }
+        }
+
         // 豁免只改变追踪影响，调用者仍读取真实写回、返回对象以及其他调用。
         /// <summary>源码和托管 DLL 的标签都沿真实目标生效，不能遮住外层修改。</summary>
         [TestMethod]

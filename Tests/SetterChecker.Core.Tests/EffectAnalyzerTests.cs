@@ -4,10 +4,55 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 连续序列化共用同一静态开关，不能把每次只读调用再次展开为所有历史组合。
+        /// <summary>复刻 KFBWriter 的默认值过滤流程，内部写入仍只修改新对象。</summary>
+        [TestMethod]
+        [DataRow(8)]
+        [DataRow(128)]
+        public async Task AnalyzeCompletesRepeatedStaticReads(int count)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Writer
+                {
+                    public static bool SkipDefault = true;
+                    private uint m_value;
+                    private void WriteFieldHeader(int fieldNumber) { m_value = (uint)fieldNumber; }
+                    private void Write(uint value) { m_value = value; }
+                    public void WriteField(int fieldNumber, bool value, bool defaultValue = false)
+                    {
+                        if (SkipDefault && value == defaultValue) return;
+                        WriteFieldHeader(fieldNumber);
+                        Write(value ? 1u : 0u);
+                    }
+                }
+                public static class Calls
+                {
+                    public static void Entry(bool value) { Writer writer = new Writer(); CALLS }
+                }
+                """.Replace("CALLS", string.Join(" ", Enumerable.Range(0, count).Select(index => $"writer.WriteField({index}, value);"))));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 4);
+            Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(effect => effect.Kind == MethodEffectKind.Getter));
+            Assert.IsTrue(watch.Elapsed < TimeSpan.FromSeconds(30), $"{count} 次调用分析耗时 {watch.Elapsed}");
+        }
+
         // 局部值即使确定不变，也不能省略其写入前的真实初始化和正常返回检查。
         /// <summary>未知初始化之后的局部常量条件不提供 Setter 证明。</summary>
         [TestMethod]
-        public async Task AnalyzeKeepsInitializationBeforePrivateSlotCondition()
+        [DataRow("int local = 0; Trigger.Touch(); if (local == 0) outside.Value = 1;")]
+        [DataRow("Trigger.Touch(); if (flag) State = 1;")]
+        [DataRow("Trigger.Set(flag);")]
+        [DataRow("if (flag) Trigger.State = 1;")]
+        [DataRow("if (Trigger.State == 0 && flag) State = 1;")]
+        [DataRow("Trigger.State = 1;")]
+        [DataRow("_ = Trigger.State; if (flag) State = 1;")]
+        [DataRow("typeof(Trigger).GetField(\"State\").GetValue(null); if (flag) State = 1;")]
+        public async Task AnalyzeKeepsInitializationBeforePrivateSlotCondition(string entry)
         {
             using TestProject project = TestProject.CreateWithCallTargets("""
                 namespace Samples;
@@ -17,10 +62,12 @@ namespace SetterChecker.Core.Tests
                     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]
                     private static extern void Unknown();
                     static Trigger() { Unknown(); }
+                    public static int State;
                     public static void Touch() { }
+                    public static void Set(bool flag) { if (flag) State = 1; }
                 }
-                public static class Calls { public static void Entry(Data outside) { int local = 0; Trigger.Touch(); if (local == 0) outside.Value = 1; } }
-                """);
+                public static class Calls { public static int State; public static void Entry(Data outside, bool flag) { ENTRY } }
+                """.Replace("ENTRY", entry));
             MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
             MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
@@ -30,7 +77,7 @@ namespace SetterChecker.Core.Tests
                 CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, requireCompleteCalls: false);
                 foreach (MethodEntry root in roots)
                 {
-                    Assert.Contains("正常返回", Assert.ThrowsExactly<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls)).Message);
+                    Assert.Contains("初始化", Assert.ThrowsExactly<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls)).Message);
                 }
             }
         }

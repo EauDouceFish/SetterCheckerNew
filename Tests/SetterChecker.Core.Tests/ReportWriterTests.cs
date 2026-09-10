@@ -6,6 +6,125 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class ReportWriterTests
     {
+        // 原生边界是否影响结论按每个入口分别展示，不把已绑定调用从报告中隐藏。
+        /// <summary>文本与 JSON 同时保留运行时入口、外部库入口和延期依据。</summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(false, true)]
+        [DataRow(true, false)]
+        [DataRow(true, true)]
+        public async Task RunReportsBoundNativeCalls(bool platform, bool writesFirst)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("public static class Calls { private static int state; "
+                + (platform ? "[System.Runtime.InteropServices.DllImport(\"test-library\", EntryPoint=\"native-entry\")]"
+                    : "[System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]")
+                + " private static extern void Native(); public static void Entry() { "
+                + (writesFirst ? "state=1; Native();" : "Native(); state=1;") + " } }");
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            AnnotationMethod method = run.Annotations.Methods.Single(method => method.Name == "Entry");
+            Assert.AreEqual(writesFirst ? MethodEffectKind.Setter : (MethodEffectKind?)null, method.Actual);
+            string output = Path.Combine(project.RootPath, "reports");
+            new ReportWriter().Write(run, output);
+            using JsonDocument report = JsonDocument.Parse(File.ReadAllText(Path.Combine(output, "report.json")));
+            JsonElement boundary = report.RootElement.GetProperty("NativeBoundaries").EnumerateArray().Single();
+            Assert.AreEqual(writesFirst, boundary.GetProperty("Deferred").GetBoolean());
+            Assert.Contains("Entry", boundary.GetProperty("Root").GetString()!);
+            Assert.Contains("Native", boundary.GetProperty("Target").GetString()!);
+            Assert.AreEqual(1, boundary.GetProperty("Count").GetInt32());
+            string text = File.ReadAllText(Path.Combine(output, "report.md"));
+            Assert.Contains(writesFirst ? "结论已有独立证据，可延期" : "尚未证明不影响结论", text);
+            if (platform)
+            {
+                Assert.AreEqual("test-library", boundary.GetProperty("NativeBoundary").GetProperty("LibraryName").GetString());
+                Assert.Contains("native-entry", text);
+            }
+        }
+
+        // 同一原生目标按实际入口分别计数和判断延期，不能借用另一入口的写入证明。
+        /// <summary>单路与四路输出相同的根关联和调用绑定数量。</summary>
+        [TestMethod]
+        public async Task RunSeparatesNativeBoundariesByRoot()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                public static class Calls
+                {
+                    private static int state;
+                    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]
+                    private static extern void Native();
+                    public static void Before() { state=1; Native(); Native(); }
+                    public static void After() { Native(); state=1; }
+                }
+                """);
+            string? previous = null;
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, jobs));
+                string output = Path.Combine(project.RootPath, "reports");
+                new ReportWriter().Write(run, output);
+                using JsonDocument report = JsonDocument.Parse(File.ReadAllText(Path.Combine(output, "report.json")));
+                JsonElement boundaries = report.RootElement.GetProperty("NativeBoundaries");
+                Assert.AreEqual(2, boundaries.GetArrayLength());
+                foreach (JsonElement boundary in boundaries.EnumerateArray())
+                {
+                    bool before = boundary.GetProperty("Root").GetString()!.Contains("Before", StringComparison.Ordinal);
+                    Assert.AreEqual(before, boundary.GetProperty("Deferred").GetBoolean());
+                    Assert.AreEqual(before ? 2 : 1, boundary.GetProperty("Count").GetInt32());
+                }
+                if (previous != null)
+                {
+                    Assert.AreEqual(previous, boundaries.GetRawText());
+                }
+                previous = boundaries.GetRawText();
+            }
+        }
+
+        // 已按真实委托构造完成绑定的运行时函数不冒充未解决的原生边界。
+        /// <summary>纯委托的正常构造与调用不生成多余延期事项。</summary>
+        [TestMethod]
+        public async Task RunExcludesProvenDelegateCreationFromNativeReport()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("public static class Calls { private static void Pure() {} public static void Entry() { System.Action action=new System.Action(Pure); action(); } }");
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            Assert.IsTrue(run.Complete);
+            string output = Path.Combine(project.RootPath, "reports");
+            new ReportWriter().Write(run, output);
+            using JsonDocument report = JsonDocument.Parse(File.ReadAllText(Path.Combine(output, "report.json")));
+            Assert.AreEqual(0, report.RootElement.GetProperty("NativeBoundaries").GetArrayLength());
+        }
+
+        // 缺失调用仍阻止后续写入证明，正常绕过它的分支与必抛分支按原执行关系区分。
+        /// <summary>静态字段省重不把未返回调用之后的修改发布成 Setter。</summary>
+        [TestMethod]
+        [DataRow("Unknown(); if (Gate) state = 1;", null)]
+        [DataRow("if (flag) Unknown(); if (!flag && Gate) state = 1;", MethodEffectKind.Setter)]
+        [DataRow("Throw(); if (Gate) state = 1;", MethodEffectKind.Getter)]
+        public async Task RunKeepsStaticReadExecutionBoundaries(string body, MethodEffectKind? expected)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                public static class Calls
+                {
+                    public static bool Gate;
+                    private static int state;
+                    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]
+                    private static extern void Unknown();
+                    private static void Throw() { throw null; }
+                    public static void Entry(bool flag) { BODY }
+                }
+                """.Replace("BODY", body));
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            AnnotationMethod method = run.Annotations.Methods.Single(method => method.Name == "Entry");
+            Assert.AreEqual(expected, method.Actual, method.Failure);
+            if (expected == null)
+            {
+                Assert.IsFalse(run.Complete);
+                Assert.IsNull(method.Decision);
+            }
+        }
+
         // 委托含一个纯目标和一个未知参数时，未知支路不能在合并后消失。
         /// <summary>按旧审计原样混合方法组与参数，仍保留待分析且不给标签建议。</summary>
         [TestMethod]
@@ -559,8 +678,8 @@ namespace SetterChecker.Core.Tests
                 run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
         }
 
-        // 提前放弃整数求值不能遗漏另一个来源中的原生调用失败。
-        /// <summary>交换未知整数来源后，只有条件前已发生的写入可以独立证明。</summary>
+        // 明确绕过未知调用的参数分支可以证明写入，未知函数仍保留在调用证据中。
+        /// <summary>交换三元表达式顺序不改变已有真实写入路径，也不把未知返回值当输入。</summary>
         [TestMethod]
         [DataRow(false, false)]
         [DataRow(true, false)]
@@ -587,8 +706,16 @@ namespace SetterChecker.Core.Tests
                 """.Replace("FIRST_WRITE", writesFirst ? "state = 3;" : string.Empty)
                     .Replace("LEFT", reversed ? "Unknown()" : "input").Replace("RIGHT", reversed ? "input" : "Unknown()"));
             AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
-            Assert.AreEqual(writesFirst ? MethodEffectKind.Setter : (MethodEffectKind?)null,
+            Assert.AreEqual(MethodEffectKind.Setter,
                 run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+            Assert.IsTrue(run.Calls!.Behaviors.Methods.Any(body => body.MethodId.Contains("Unknown", StringComparison.Ordinal) && body.BodyKind == MethodBodyKind.RuntimeImplementation)
+                || run.Calls.PendingCalls.Any(call => call.Call.Target.Identity.Name == "Unknown"));
+            string output = Path.Combine(project.RootPath, "reports");
+            new ReportWriter().Write(run, output);
+            using JsonDocument report = JsonDocument.Parse(File.ReadAllText(Path.Combine(output, "report.json")));
+            Assert.IsTrue(report.RootElement.GetProperty("NativeBoundaries").EnumerateArray().Any(boundary =>
+                boundary.GetProperty("Target").GetString()!.Contains("Unknown", StringComparison.Ordinal) && boundary.GetProperty("Deferred").GetBoolean()));
+            Assert.Contains("Unknown", File.ReadAllText(Path.Combine(output, "report.md")));
             Assert.AreEqual(MethodEffectKind.Getter, run.Annotations.Methods.Single(method => method.Name == "Independent").Actual);
         }
 
