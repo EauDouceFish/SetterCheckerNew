@@ -230,6 +230,88 @@ namespace SetterChecker.Core.Tests
             Assert.IsTrue(effects.Methods.All(method => method.Kind == MethodEffectKind.Getter));
         }
 
+        // 多层调用逐层改写同一字段，最终条件仍须保留每个实际参数和出口。
+        /// <summary>跨函数存储倒查的规模对照同时包含可执行和互斥的外部修改。</summary>
+        [TestMethod]
+        [DataRow(2, false)]
+        [DataRow(6, false)]
+        [DataRow(16, false)]
+        [DataRow(2, true)]
+        [DataRow(6, true)]
+        [DataRow(16, true)]
+        public async Task AnalyzeScalesNestedConditionalStorage(int depth, bool setter)
+        {
+            string helpers = string.Join(Environment.NewLine, Enumerable.Range(0, depth).Select(index =>
+                $"private static void Step{index}(Data local, bool flag) {{ "
+                + (index == 0 ? "if (flag) local.Value = 1; else local.Value = 2;"
+                    : $"Step{index - 1}(local, flag); if (local.Value == 1) local.Value = 1; else local.Value = 2;") + " }"));
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public static class Calls
+                {
+                    HELPERS
+                    public static void Entry(Data outside, bool flag)
+                    {
+                        var local = new Data();
+                        STEP(local, flag);
+                        if (local.Value == EXPECTED && flag) outside.Value = 1;
+                    }
+                }
+                """.Replace("HELPERS", helpers).Replace("STEP", $"Step{depth - 1}").Replace("EXPECTED", setter ? "1" : "2"));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            long allocated = GC.GetTotalAllocatedBytes(true);
+            System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            EffectAnalysisResult effects = new EffectAnalyzer().Analyze(catalog, roots, calls);
+            Console.WriteLine($"nested_storage_depth={depth}; setter={setter}; elapsed_ms={watch.Elapsed.TotalMilliseconds:F3}; allocated_bytes={GC.GetTotalAllocatedBytes(true) - allocated}");
+            Assert.IsTrue(effects.Methods.All(method => method.Kind == (setter ? MethodEffectKind.Setter : MethodEffectKind.Getter)));
+        }
+
+        // 调用候选混合字段写入与只读实现，只读出口仍保留实际选择和调用前的值。
+        /// <summary>不改存储的正证不能抹掉其他候选的写入或返回条件。</summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public async Task AnalyzeKeepsMixedTargetStorageReturns(bool setter, bool guardedReturn)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public interface IWorker { int Execute(Data local, bool other); }
+                public sealed class Writes : IWorker
+                {
+                    public int Execute(Data local, bool other) { local.Value = 1; if (other) return 1; return 2; }
+                }
+                public sealed class Reads : IWorker
+                {
+                    public int Execute(Data local, bool other) { if (other) return 1; return 2; }
+                }
+                public static class Calls
+                {
+                    public static void Entry(Data outside, bool flag, bool other)
+                    {
+                        var local = new Data();
+                        IWorker worker = flag ? new Writes() : new Reads();
+                        int result = worker.Execute(local, other);
+                        if (local.Value == EXPECTED && flag RETURN) outside.Value = 1;
+                    }
+                }
+                """.Replace("EXPECTED", setter ? "1" : "0").Replace("RETURN", guardedReturn ? "&& result == 1 && !other" : string.Empty));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            MethodEffectKind expected = setter && !guardedReturn ? MethodEffectKind.Setter : MethodEffectKind.Getter;
+            Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(method => method.Kind == expected));
+        }
+
         // 同一泛型函数在两个实际类型下可能返回旧对象或新对象，不能按函数名合并整条调用。
         /// <summary>只读快捷判断仍须覆盖每个实际调用环境。</summary>
         [TestMethod]

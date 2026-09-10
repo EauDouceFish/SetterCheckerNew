@@ -4573,6 +4573,12 @@ namespace SetterChecker.Core
                                                     {
                                                         throw new AnalysisException("存储赋值的子调用尚未证明可以正常返回");
                                                     }
+                                                    if (this.m_sources.m_storageReadOnlyInstances.Contains((target.InstanceId, kind, member?.Name,
+                                                        locations.All(location => location.Definition == "slot" && !location.IsReferent),
+                                                        kind == BehaviorWriteKind.Field && member != null && this.m_sources.ReadMemberType(member, this.m_sources.GetInstance(target.InstanceId)).Type.IsValueType)))
+                                                    {
+                                                        return ReadAt(new FlowSearchPoint(point.Node, write.Point.Order));
+                                                    }
                                                     return ReadStorageChoice(reference, this.m_sources.GetInstance(target.InstanceId), returned.Point,
                                                         kind, member, locations, -1, () => new[] { s_previousStorageValue },
                                                         stored => stored == s_previousStorageValue ? ReadAt(new FlowSearchPoint(point.Node, write.Point.Order)) : readValue(stored),
@@ -6224,7 +6230,11 @@ namespace SetterChecker.Core
                     return Array.Empty<ReachingWrite<BehaviorValueReference>>();
                 }
                 var allocations = allocatedFields.Where(item => item.Value.Point!.Value.BlockId == current.Node.BlockId).ToLookup(item => item.Value.Point!.Value.Order);
-                var assignments = graph.Assignments[current.Node.BlockId].ToLookup(assignment => assignment.Point.Order);
+                var assignments = (kind == BehaviorWriteKind.Indirect || aggregateField
+                    ? graph.Assignments[current.Node.BlockId].Where(assignment => locations.Any(location => !location.IsReferent
+                        && (location.Definition == "slot" || aggregateField) && location.Receiver ==
+                            new BehaviorValueReference(method.MethodId, assignment.TargetValueId, instance.Id)))
+                    : Array.Empty<BehaviorAssignment>()).ToLookup(assignment => assignment.Point.Order);
                 var writesByOrder = (privateSlotOnly ? Array.Empty<BehaviorWrite>() : GetWrites(instance.Id, current.Node.BlockId)).ToLookup(write => write.Point.Order);
                 var callsByOrder = (privateSlotOnly ? Array.Empty<BehaviorCall>() : graph.Calls[current.Node.BlockId]).ToLookup(call => call.Point.Order);
                 IEnumerable<int> orders = allocations.Select(group => group.Key).Concat(assignments.Select(group => group.Key))
@@ -6249,9 +6259,7 @@ namespace SetterChecker.Core
                             : ReadCopiedField(allocated.Receiver with { ValueId = allocated.Value.InputValueIds.Single() }, member!, allocated.Location.Member),
                             allocated.Value.Point!.Value, locations.Count == 1);
                     }
-                    foreach (BehaviorAssignment assignment in assignments[order].Where(assignment => (kind == BehaviorWriteKind.Indirect || aggregateField)
-                        && locations.Any(location => !location.IsReferent && (location.Definition == "slot" || aggregateField) && location.Receiver ==
-                            new BehaviorValueReference(method.MethodId, assignment.TargetValueId, instance.Id))))
+                    foreach (BehaviorAssignment assignment in assignments[order])
                     {
                         yield return new ReachingWrite<BehaviorValueReference>(
                             aggregateField ? locations.SelectMany(location => ReadCopiedField(new(method.MethodId, assignment.ValueId, instance.Id), member!, location.Member)).ToArray()
