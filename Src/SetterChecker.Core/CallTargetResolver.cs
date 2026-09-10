@@ -2191,7 +2191,8 @@ namespace SetterChecker.Core
         private bool m_originCycle;
         private long m_originCycles;
         private readonly HashSet<StorageEffectQuery> m_activeStorageEffects = new();
-        private readonly HashSet<(int Instance, BehaviorWriteKind Kind, string? Member, bool Slot)> m_storageReadOnlyInstances = new();
+        private readonly HashSet<(BehaviorValueReference Reference, string Member)> m_activeCopiedFields = new();
+        private readonly HashSet<(int Instance, BehaviorWriteKind Kind, string? Member, bool Slot, bool Aggregate)> m_storageReadOnlyInstances = new();
         private readonly Stack<Dictionary<(BehaviorValueReference Reference, int Stop, bool Types, bool Storage), IReadOnlyList<ValueOrigin>>> m_storageOriginResults = new();
         private static readonly BehaviorValueReference s_previousStorageValue = new(string.Empty, -1);
         private static readonly BehaviorValueReference s_defaultObjectMember = new(string.Empty, -2);
@@ -3670,7 +3671,7 @@ namespace SetterChecker.Core
                             throw new AnalysisException("字段空值查询的引用类型尚未闭合");
                         }
                         uint bits = !array && !readNullness && ReadIntegerType(type) is "System.Int64" or "System.UInt64" ? 64u : 32u;
-                        return ReadStorageChoice(reference, this.m_sources.GetInstance(reference.InstanceId), value.Point!.Value, kind, value.Member, locations, value.InputValueIds[0],
+                        return ReadStorageChoice(reference, this.m_sources.GetInstance(reference.InstanceId), this.m_sources.ReadStoragePoint(reference, value), kind, value.Member, locations, value.InputValueIds[0],
                             () => this.m_sources.ReadStorageValuesBeforeInvocation(this.m_sources.GetInstance(reference.InstanceId), kind,
                                 value.Member, locations, reference),
                             stored => stored != reference ? readNullness ? ReadValue(stored, true) : ReadIntegerLoad(ReadValue(stored), type)
@@ -3931,7 +3932,7 @@ namespace SetterChecker.Core
                 }
                 Microsoft.Z3.BitVecExpr value = this.m_context.MkBVConst($"f{readNullness}_{bits}_{ReadStorageLocationKey(locations)}", bits);
                 Microsoft.Z3.BoolExpr valid = this.m_context.MkTrue();
-                if (!isStatic)
+                if (!isStatic && !this.m_sources.IsRootValueSlot(locations[0]))
                 {
                     SelectedValue nonNull = ReadValue(locations[0].Receiver!.Value, true);
                     valid = JoinConditions(nonNull.Condition, this.m_context.MkNot(this.m_context.MkEq(nonNull.Expression, this.m_context.MkBV(0, 32))));
@@ -4371,7 +4372,7 @@ namespace SetterChecker.Core
                                 }
                                 return leaf;
                             }
-                            return ReadStorageChoice(current, this.m_sources.GetInstance(current.InstanceId), value.Point!.Value, kind, value.Member, locations, value.InputValueIds[0],
+                            return ReadStorageChoice(current, this.m_sources.GetInstance(current.InstanceId), this.m_sources.ReadStoragePoint(current, value), kind, value.Member, locations, value.InputValueIds[0],
                                 () => this.m_sources.ReadStorageValuesBeforeInvocation(this.m_sources.GetInstance(current.InstanceId), kind, value.Member, locations, current),
                                 stored => stored != current ? ReadOrigin(stored, identity) : ReadInitial(), guard);
                         }));
@@ -5304,6 +5305,21 @@ namespace SetterChecker.Core
             Queue<(BehaviorValueReference Reference, ReturnedValuePath? Path)> pending = new(new[] { (reference, (ReturnedValuePath?)null) });
             HashSet<(BehaviorValueReference, ReturnedValuePath?)> visited = new();
             HashSet<ValueOrigin> result = new();
+            // 普通槽读取与间接读取共用续查；读回自身时保留未闭合标记。
+            void AddStoredValues(ValueOrigin origin, IReadOnlyList<BehaviorValueReference> values)
+            {
+                foreach (BehaviorValueReference stored in values)
+                {
+                    if (stored == origin.Reference)
+                    {
+                        result.Add(origin with { Value = origin.Value with { Kind = BehaviorValueKind.CallResult } });
+                    }
+                    else
+                    {
+                        pending.Enqueue((stored, origin.ReturnPath));
+                    }
+                }
+            }
             while (pending.TryDequeue(out var query))
             {
                 if (!visited.Add(query))
@@ -5327,17 +5343,7 @@ namespace SetterChecker.Core
                         IReadOnlyList<BehaviorValueReference> values = ReadStoredValuesAtPoint(GetInstance(origin.Reference.InstanceId),
                             BehaviorWriteKind.Indirect, null, new[] { new StorageLocation(slot, "slot", string.Empty, string.Empty) },
                             origin.Value.Point!.Value, -1, origin.Reference, () => new[] { slot });
-                        foreach (BehaviorValueReference stored in values)
-                        {
-                            if (stored == origin.Reference)
-                            {
-                                result.Add(origin with { Value = origin.Value with { Kind = BehaviorValueKind.CallResult } });
-                            }
-                            else
-                            {
-                                pending.Enqueue((stored, origin.ReturnPath));
-                            }
-                        }
+                        AddStoredValues(origin, values);
                     }
                     else if (origin.Value.Kind == BehaviorValueKind.Computation && origin.Value.Reference == "ldind.ref"
                         || origin.Value.Kind == BehaviorValueKind.Conversion && origin.Value.Reference == "ldobj"
@@ -5350,17 +5356,7 @@ namespace SetterChecker.Core
                             : locations.SelectMany(location => ReadStoredValuesAtPoint(instance, BehaviorWriteKind.Indirect, null, new[] { location },
                                 origin.Value.Point!.Value, -1, origin.Reference, () => ReadStorageValuesBeforeInvocation(instance,
                                     BehaviorWriteKind.Indirect, null, new[] { location }, origin.Reference))).Distinct().ToArray();
-                        foreach (BehaviorValueReference stored in storedValues)
-                        {
-                            if (stored == origin.Reference)
-                            {
-                                result.Add(origin with { Value = origin.Value with { Kind = BehaviorValueKind.CallResult } });
-                            }
-                            else
-                            {
-                                pending.Enqueue((stored, origin.ReturnPath));
-                            }
-                        }
+                        AddStoredValues(origin, storedValues);
                     }
                     else if (!retainStorageReads && origin.Value.Kind is BehaviorValueKind.FieldRead or BehaviorValueKind.ArrayElementRead)
                     {
@@ -5370,6 +5366,21 @@ namespace SetterChecker.Core
                         {
                             if (stored == origin.Reference)
                             {
+                                if (origin.Value.Member != null && origin.Value.InputValueIds is [int receiverId]
+                                    && this.m_methods[origin.Reference.MethodId].Values[receiverId] is
+                                    { Kind: BehaviorValueKind.Address, Member: null, InputValueIds.Count: 1 } address
+                                    && ReadMemberType(origin.Value.Member, GetInstance(origin.Reference.InstanceId)).Type.IsValueType
+                                    && ReadStorageLocations(origin.Reference, origin.Value.Member, receiverId, Array.Empty<int>()) is [StorageLocation location]
+                                    && IsRootValueSlot(location) && location.Receiver == origin.Reference with { ValueId = address.InputValueIds[0] })
+                                {
+                                    origin = origin with { Value = origin.Value with { InputValueIds = address.InputValueIds } };
+                                }
+                                else if (origin.Value.Member != null && origin.Value.InputValueIds is [int fieldReceiver]
+                                    && ReadMemberType(origin.Value.Member, GetInstance(origin.Reference.InstanceId)).Type.IsValueType
+                                    && GetCallOrigins(origin.Reference with { ValueId = fieldReceiver }).Any(parent => parent.Value.Kind == BehaviorValueKind.Address))
+                                {
+                                    throw new AnalysisException("结构体入口的嵌套或间接字段路径尚未闭合");
+                                }
                                 result.Add(origin);
                             }
                             else
@@ -5638,9 +5649,9 @@ namespace SetterChecker.Core
                     kind,
                     value.Member,
                     locations,
-                    value.Point!.Value,
+                    ReadStoragePoint(reference, value),
                     value.InputValueIds.FirstOrDefault(-1),
-                    ReadPendingStorageValue(reference, value.Point.Value),
+                    ReadPendingStorageValue(reference, value.Point!.Value),
                     () => ReadStorageValuesBeforeInvocation(instance, kind, value.Member, locations, reference, returnedPath), returnedPath: returnedPath)
                 .Select(item => returnedPath == null ? item : ObserveValue(item, reference.InstanceId, returnedPath))
                 .OrderBy(item => item.MethodId, StringComparer.Ordinal)
@@ -5665,6 +5676,12 @@ namespace SetterChecker.Core
             }
 
             MethodCallInstance parent = GetInstance(instance.ParentId);
+            if (kind == BehaviorWriteKind.Field && member != null && ReadMemberType(member, instance).Type.IsValueType
+                && locations is [{ Receiver: { ValueId: >= 0 } receiver } location] && receiver.InstanceId == instance.Id
+                && this.m_methods[receiver.MethodId].Values[receiver.ValueId] is { Kind: BehaviorValueKind.Parameter, IsManagedReferenceSlot: false } parameter)
+            {
+                return instance.Binding!.Arguments[parameter.ParameterIndex!.Value].SelectMany(input => ReadCopiedField(input, member, location.Member)).ToArray();
+            }
             return ReadStoredValuesAtPoint(
                 parent,
                 kind,
@@ -5719,6 +5736,7 @@ namespace SetterChecker.Core
             Dictionary<FlowSearchPoint, ReachingWrite<BehaviorValueReference>?>? trace = null)
         {
             MethodBehavior method = this.m_methods[instance.MethodId];
+            bool aggregateField = kind == BehaviorWriteKind.Field && member != null && ReadMemberType(member, instance).Type.IsValueType;
             bool referenceSlotOnly = kind == BehaviorWriteKind.Indirect && locations.All(location => location.Definition == "slot"
                 && location.Receiver is { ValueId: >= 0 } receiver && this.m_methods[receiver.MethodId].Values[receiver.ValueId].IsManagedReferenceSlot);
             bool separateArrayElements = kind == BehaviorWriteKind.Field && member != null
@@ -5743,22 +5761,22 @@ namespace SetterChecker.Core
                 {
                     BehaviorValue allocated = method.Values[location.Receiver!.Value.ValueId];
                     if (allocated.Kind == BehaviorValueKind.NewObject && allocated.Point!.Value.BlockId == current.Node.BlockId
-                        && allocated.Point.Value.Order < current.Order
-                        && ReadDefaultFieldValue(location, member!) is BehaviorValueReference defaultValue)
+                        && allocated.Point.Value.Order < current.Order)
                     {
-                        yield return new ReachingWrite<BehaviorValueReference>(new[] { defaultValue }, allocated.Point.Value, locations.Count == 1);
+                        yield return new ReachingWrite<BehaviorValueReference>(new[] { ReadDefaultFieldValue(location, member!) }, allocated.Point.Value, locations.Count == 1);
                     }
                 }
-                foreach (BehaviorAssignment assignment in graph.Assignments[current.Node.BlockId].Where(assignment => kind == BehaviorWriteKind.Indirect
-                    && locations.Any(location => location.Definition == "slot" && location.Receiver ==
+                foreach (BehaviorAssignment assignment in graph.Assignments[current.Node.BlockId].Where(assignment => (kind == BehaviorWriteKind.Indirect || aggregateField)
+                    && locations.Any(location => (location.Definition == "slot" || aggregateField) && location.Receiver ==
                         new BehaviorValueReference(method.MethodId, assignment.TargetValueId, instance.Id))
                     && assignment.Point.Order < current.Order))
                 {
                     yield return new ReachingWrite<BehaviorValueReference>(
-                        new[] { new BehaviorValueReference(method.MethodId, assignment.ValueId, instance.Id) }, assignment.Point, locations.Count == 1);
+                        aggregateField ? locations.SelectMany(location => ReadCopiedField(new(method.MethodId, assignment.ValueId, instance.Id), member!, location.Member)).ToArray()
+                            : new[] { new BehaviorValueReference(method.MethodId, assignment.ValueId, instance.Id) }, assignment.Point, locations.Count == 1);
                 }
                 foreach (BehaviorWrite write in GetWrites(instance.Id, current.Node.BlockId).Where(write =>
-                             !referenceSlotOnly && MayWriteStorage(write, kind, member?.Name, locations.All(location => location.Definition == "slot"))
+                             !referenceSlotOnly && MayWriteStorage(write, kind, member?.Name, locations.All(location => location.Definition == "slot"), aggregateField)
                              && write.Point.Order < current.Order))
                 {
                     // 托管数组元素不能覆盖局部槽或引用对象字段；外部引用、值类型字段和块写入仍完整追查。
@@ -5783,6 +5801,15 @@ namespace SetterChecker.Core
                             new[] { written, unresolvedRead },
                             write.Point,
                             false);
+                    }
+                    else if (aggregateField && targets.Any(target => locations.Any(location => location.Receiver == target.Receiver && location.Indices == target.Indices
+                        && (target.Member.Length == 0 || location.Member.StartsWith(target.Member + "/", StringComparison.Ordinal)))))
+                    {
+                        if (targets.Count != 1 || locations.Count != 1)
+                        {
+                            throw new AnalysisException("结构体整值写入的地址选择尚未闭合");
+                        }
+                        yield return new(ReadCopiedField(written, member!, locations[0].Member[(targets[0].Member.Length == 0 ? 0 : targets[0].Member.Length + 1)..]), write.Point, true);
                     }
                     else if (targets.Any(target => locations.Any(location => StorageLocationsMatch(target, location))))
                     {
@@ -5839,8 +5866,66 @@ namespace SetterChecker.Core
             return ReadReachingValues(method, point, ReadWrites, initialValues, instance.Id, throughPoint, trace).ToArray();
         }
 
+        // 按值加载结构体时已取得字段快照；取地址的读取仍使用实际字段访问点。
+        private BehaviorFlowPoint ReadStoragePoint(BehaviorValueReference reference, BehaviorValue value)
+        {
+            BehaviorFlowPoint point = value.Point!.Value;
+            while (value.Member != null && value.InputValueIds.Count == 1 && ReadMemberType(value.Member, GetInstance(reference.InstanceId)).Type.IsValueType)
+            {
+                value = this.m_methods[reference.MethodId].Values[value.InputValueIds[0]];
+                if (value.Kind is not (BehaviorValueKind.SlotRead or BehaviorValueKind.FieldRead) && value.Reference != "ldobj"
+                    || value.Kind == BehaviorValueKind.SlotRead && this.m_methods[reference.MethodId].Values[value.InputValueIds.Single()].IsManagedReferenceSlot)
+                {
+                    break;
+                }
+                point = value.Point!.Value;
+            }
+            return point;
+        }
+
+        // 整个结构体赋值时读取字段在复制瞬间的值，不让后来的原件修改污染副本。
+        private IReadOnlyList<BehaviorValueReference> ReadCopiedField(BehaviorValueReference reference, BehaviorMemberReference member, string memberPath)
+        {
+            ValueOrigin[] origins = ReadOrigins(reference, true, true).ToArray();
+            if (origins.Length != 1)
+            {
+                throw new AnalysisException("结构体字段复制的值选择尚未闭合");
+            }
+            ValueOrigin origin = origins[0];
+            MethodCallInstance instance = GetInstance(origin.Reference.InstanceId);
+            if (origin.Value.Kind == BehaviorValueKind.Constant && origin.Value.Reference?.StartsWith("default:", StringComparison.Ordinal) == true)
+            {
+                StorageLocation location = new(origin.Reference, member.DeclaringTypeDefinitionId, member.Name, string.Empty,
+                    instance.Substitute(this.m_catalog.ReadResolvedFieldType(member)).Text);
+                return new[] { ReadDefaultFieldValue(location, member) };
+            }
+            if (origin.Value.Kind != BehaviorValueKind.SlotRead || origin.Value.Point is not BehaviorFlowPoint point)
+            {
+                throw new AnalysisException("结构体字段复制的读取位置尚未闭合");
+            }
+            IReadOnlyList<StorageLocation> locations = ReadStorageLocations(origin.Reference, member, origin.Reference.ValueId, Array.Empty<int>())
+                ?? throw new AnalysisException("结构体字段复制的存储位置尚未闭合");
+            if (!this.m_activeCopiedFields.Add((origin.Reference, memberPath)))
+            {
+                throw new AnalysisException("结构体复制沿循环回到同一读取，字段来源尚未闭合");
+            }
+            try
+            {
+                return locations.Select(location => location with { Member = memberPath }).SelectMany(location => ReadStoredValuesAtPoint(instance, BehaviorWriteKind.Field, member, new[] { location }, point,
+                    -1, origin.Reference, () => instance.ParentId != 0 && location.Receiver is { ValueId: >= 0 } receiver
+                        && this.m_methods[receiver.MethodId].Values[receiver.ValueId] is { Kind: BehaviorValueKind.Parameter, IsManagedReferenceSlot: false }
+                        ? ReadStorageValuesBeforeInvocation(instance, BehaviorWriteKind.Field, member, new[] { location }, origin.Reference)
+                        : throw new AnalysisException("结构体字段复制的入口内容尚未闭合"))
+                    .Select(value => ObserveValue(value, instance.Id, null, new StoredObservation(value, location.Receiver!.Value, point, null, null, member, location)))).ToArray();
+            }
+            finally
+            {
+                this.m_activeCopiedFields.Remove((origin.Reference, memberPath));
+            }
+        }
+
         // 分配时只为确定类型建立零值或空引用，构造与后续写入仍按原执行顺序覆盖它。
-        private BehaviorValueReference? ReadDefaultFieldValue(StorageLocation location, BehaviorMemberReference member)
+        private BehaviorValueReference ReadDefaultFieldValue(StorageLocation location, BehaviorMemberReference member)
         {
             if (this.m_defaultFieldValues.TryGetValue(location, out BehaviorValueReference cached))
             {
@@ -5853,15 +5938,12 @@ namespace SetterChecker.Core
                 "System.Single" or "System.Double" => location.ValueType,
                 _ => null,
             };
-            if (stackType == null && !CallTargetResolver.IsReferenceType(this.m_catalog, location.ValueType!, this))
-            {
-                return null;
-            }
+            bool aggregate = stackType == null && !CallTargetResolver.IsReferenceType(this.m_catalog, location.ValueType!, this);
             BehaviorValueReference reference = location.Receiver!.Value with { ValueId = --this.m_nextRuntimeValueId };
             BehaviorTypeReference? type = stackType == null ? null : new BehaviorTypeReference(new TypeIdentityTemplate(stackType),
                 new TypeIdentityTemplate(stackType), Array.Empty<TypeIdentityTemplate>(), null, member.ReferringAssemblyPath, null);
             BindRuntimeValue(reference, new[] { new ValueOrigin(reference,
-                new BehaviorValue(reference.ValueId, BehaviorValueKind.Constant, stackType == null ? null : "0", null, Array.Empty<int>()) { Type = type }) });
+                new BehaviorValue(reference.ValueId, BehaviorValueKind.Constant, aggregate ? "default:" + location.ValueType : stackType == null ? null : "0", null, Array.Empty<int>()) { Type = type }) });
             this.m_defaultFieldValues.Add(location, reference);
             return reference;
         }
@@ -6004,7 +6086,8 @@ namespace SetterChecker.Core
                 {
                     throw new AnalysisException($"跨函数存储效果尚未闭合：{method.MethodId}");
                 }
-                if (HasNoStorageWrites(instanceId, kind, member?.Name, locations.All(location => location.Definition == "slot")))
+                if (HasNoStorageWrites(instanceId, kind, member?.Name, locations.All(location => location.Definition == "slot"),
+                    kind == BehaviorWriteKind.Field && member != null && ReadMemberType(member, instance).Type.IsValueType))
                 {
                     return new StorageEffect(Array.Empty<BehaviorValueReference>(), true);
                 }
@@ -6051,20 +6134,20 @@ namespace SetterChecker.Core
         }
 
         // 倒查与无关写入证明共用筛选，未知间接地址始终保留。
-        private static bool MayWriteStorage(BehaviorWrite write, BehaviorWriteKind kind, string? memberName, bool localSlotOnly)
+        private static bool MayWriteStorage(BehaviorWrite write, BehaviorWriteKind kind, string? memberName, bool localSlotOnly, bool aggregateField)
         {
-            return (write.Kind == kind || write.Kind == BehaviorWriteKind.Indirect || kind == BehaviorWriteKind.Indirect && !localSlotOnly)
+            return aggregateField || (write.Kind == kind || write.Kind == BehaviorWriteKind.Indirect || kind == BehaviorWriteKind.Indirect && !localSlotOnly)
                 && (memberName == null || write.Member?.Name == memberName || write.Kind == BehaviorWriteKind.Indirect);
         }
 
         // 仅整个已绑定调用闭包均不修改该类存储且有正常出口时复用正证。
-        private bool HasNoStorageWrites(int instanceId, BehaviorWriteKind kind, string? memberName, bool localSlotOnly)
+        private bool HasNoStorageWrites(int instanceId, BehaviorWriteKind kind, string? memberName, bool localSlotOnly, bool aggregateField)
         {
             Queue<int> pending = new(new[] { instanceId });
             HashSet<int> visited = new();
             while (pending.TryDequeue(out int current))
             {
-                if (this.m_storageReadOnlyInstances.Contains((current, kind, memberName, localSlotOnly)) || !visited.Add(current))
+                if (this.m_storageReadOnlyInstances.Contains((current, kind, memberName, localSlotOnly, aggregateField)) || !visited.Add(current))
                 {
                     continue;
                 }
@@ -6080,7 +6163,7 @@ namespace SetterChecker.Core
                 {
                     RequireStaticFieldInitialization(current, member);
                 }
-                if (GetWrites(current).Any(write => MayWriteStorage(write, kind, memberName, localSlotOnly))
+                if (GetWrites(current).Any(write => MayWriteStorage(write, kind, memberName, localSlotOnly, aggregateField))
                     || kind == BehaviorWriteKind.Field && body.Values.Any(value => value.Kind == BehaviorValueKind.NewObject)
                     || body.Calls.Any(call => IsReachable(current, call.Point.BlockId)
                         && this.m_callsByCallerInstance.GetValueOrDefault(current)?.ContainsKey(call.Point) != true))
@@ -6097,7 +6180,7 @@ namespace SetterChecker.Core
                     }
                 }
             }
-            this.m_storageReadOnlyInstances.UnionWith(visited.Select(current => (current, kind, memberName, localSlotOnly)));
+            this.m_storageReadOnlyInstances.UnionWith(visited.Select(current => (current, kind, memberName, localSlotOnly, aggregateField)));
             return true;
         }
 
@@ -6119,11 +6202,13 @@ namespace SetterChecker.Core
         {
             string memberId = string.Empty;
             string definitionId = string.Empty;
+            bool valueTypeReceiver = false;
             string? valueType = member == null ? null : GetInstance(reference.InstanceId).Substitute(this.m_catalog.ReadResolvedFieldType(member)).Text;
             if (member != null)
             {
                 MethodCallInstance instance = GetInstance(reference.InstanceId);
                 (TypeEntry declaringType, TypeIdentityTemplate[] arguments) = ReadMemberType(member, instance);
+                valueTypeReceiver = declaringType.IsValueType;
                 if (receiverId != -1 && declaringType.IsExplicitLayout)
                 {
                     throw new AnalysisException($"显式布局字段的重叠关系尚未闭合：{declaringType.Id}::{member.Name}");
@@ -6137,7 +6222,27 @@ namespace SetterChecker.Core
                 return new[] { new StorageLocation(null, definitionId, memberId, string.Empty, valueType) };
             }
 
+            if (valueTypeReceiver && this.m_methods[reference.MethodId].Values[receiverId] is { Reference: "ldobj" } loaded)
+            {
+                return ReadStorageLocations(reference, member, loaded.InputValueIds.Single(), indices, expectedReceivers: expectedReceivers);
+            }
+            if (valueTypeReceiver && this.m_methods[reference.MethodId].Values[receiverId] is { Kind: BehaviorValueKind.SlotRead } read
+                && !this.m_methods[reference.MethodId].Values[read.InputValueIds.Single()].IsManagedReferenceSlot)
+            {
+                return new[] { new StorageLocation(reference with { ValueId = read.InputValueIds.Single() }, definitionId, memberId, string.Empty, valueType) };
+            }
+            if (valueTypeReceiver && this.m_methods[reference.MethodId].Values[receiverId] is { Kind: BehaviorValueKind.FieldRead, Member: not null } field)
+            {
+                return ReadStorageLocations(reference with { ValueId = receiverId }, field.Member, field.InputValueIds.FirstOrDefault(-1), Array.Empty<int>())?.Select(location =>
+                    new StorageLocation(location.Receiver, definitionId, location.Member + "/" + memberId, location.Indices, valueType, location.InputPath)).ToArray();
+            }
             receivers ??= GetCallOrigins(reference with { ValueId = receiverId });
+            if (valueTypeReceiver && receivers.Any(origin => origin.Value.Kind == BehaviorValueKind.Address || origin.Value.IsManagedReferenceSlot))
+            {
+                return ReadStorageLocations(reference, null, receiverId, Array.Empty<int>(), receivers)?.Select(location =>
+                    new StorageLocation(location.Receiver, definitionId, (location.Member.Length == 0 ? string.Empty : location.Member + "/") + memberId,
+                        location.Indices, valueType, location.InputPath)).ToArray();
+            }
             if (expectedReceivers != null)
             {
                 receivers = receivers.Where(origin => !(origin.Value.Kind == BehaviorValueKind.Constant && origin.Value.Reference == null)).ToArray();
@@ -6230,6 +6335,14 @@ namespace SetterChecker.Core
 
             return receivers.Select(origin => new StorageLocation(origin.Reference, definitionId, memberId,
                 string.Join(",", indexValues), valueType, inputPaths.GetValueOrDefault(origin.Reference))).Distinct().ToArray();
+        }
+
+        // 按值传入的结构体槽一定存在，但槽内的引用字段仍可能为空。
+        private bool IsRootValueSlot(StorageLocation location)
+        {
+            return location.Receiver is { ValueId: >= 0 } receiver && GetInstance(receiver.InstanceId).ParentId == 0
+                && this.m_methods[receiver.MethodId].Values[receiver.ValueId] is { Kind: BehaviorValueKind.Parameter, IsManagedReferenceSlot: false } parameter
+                && !CallTargetResolver.IsReferenceType(this.m_catalog, ReadParameterType(new ValueOrigin(receiver, parameter)).Text, this);
         }
 
         // 入口字段路径只由已经倒查后的真实父对象组成，循环快照不冒充稳定身份。

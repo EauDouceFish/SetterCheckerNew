@@ -4,6 +4,348 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 嵌套结构体入口的引用字段不能因为取了局部地址就被当成新对象。
+        /// <summary>未闭合的入口成员路径必须保留失败证据，不能发布 Getter。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task AnalyzeKeepsUnclosedNestedStructInputVisible(bool loop)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public struct Holder { public Data Target; }
+                public struct Pair { public Holder Left; }
+                public static class Calls { public static void Entry(Pair value, bool flag) { BODY } }
+                """.Replace("BODY", loop
+                    ? "Holder h=default; h.Target=value.Left.Target; while(flag) { Holder copy=h; h=copy; } h.Target.Value=1;"
+                    : "value.Left.Target.Value = 1;"));
+            if (!loop)
+            {
+                using Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(project.ExternalAssemblyPath,
+                    new Mono.Cecil.ReaderParameters { InMemory = true });
+                Mono.Cecil.MethodDefinition entry = module.GetType("ExternalSamples.Calls").Methods.Single(method => method.Name == "Entry");
+                entry.Body.Instructions.Clear();
+                Mono.Cecil.Cil.ILProcessor writer = entry.Body.GetILProcessor();
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldarga_S, entry.Parameters[0]);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldflda, module.GetType("ExternalSamples.Pair").Fields.Single());
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldfld, module.GetType("ExternalSamples.Holder").Fields.Single());
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Stfld, module.GetType("ExternalSamples.Data").Fields.Single());
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                module.Write(project.ExternalAssemblyPath);
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 4);
+            foreach (MethodEntry root in roots)
+            {
+                if (loop || root.SourcePath == null)
+                {
+                    Assert.Contains("结构体", Assert.ThrowsExactly<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls)).Message);
+                }
+                else
+                {
+                    Assert.AreEqual(MethodEffectKind.Setter, new EffectAnalyzer().Analyze(catalog, new[] { root }, calls).Methods.Single().Kind);
+                }
+            }
+        }
+
+        // 根结构体取地址不会让它所引用的已有对象变成局部数据。
+        /// <summary>实际 DLL 经 ldarga 读取引用字段后写入，仍应发现外部对象修改。</summary>
+        [TestMethod]
+        [DataRow("always", MethodEffectKind.Setter)]
+        [DataRow("null", MethodEffectKind.Getter)]
+        [DataRow("nonnull", MethodEffectKind.Setter)]
+        public async Task AnalyzeTracksReferenceFieldThroughRootStructAddress(string guard, MethodEffectKind expected)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public struct Holder { public Data Target; }
+                public static class Calls { public static void Entry(Holder value) { GUARD value.Target.Value = 1; } }
+                """.Replace("GUARD", guard == "always" ? string.Empty : guard == "null" ? "if (value.Target == null)" : "if (value.Target != null)"));
+            using (Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(project.ExternalAssemblyPath,
+                new Mono.Cecil.ReaderParameters { InMemory = true }))
+            {
+                Mono.Cecil.MethodDefinition entry = module.GetType("ExternalSamples.Calls").Methods.Single(method => method.Name == "Entry");
+                entry.Body.Instructions.Clear();
+                Mono.Cecil.Cil.ILProcessor writer = entry.Body.GetILProcessor();
+                Mono.Cecil.Cil.Instruction returned = writer.Create(Mono.Cecil.Cil.OpCodes.Ret);
+                if (guard != "always")
+                {
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Ldarga_S, entry.Parameters[0]);
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Ldfld, module.GetType("ExternalSamples.Holder").Fields.Single());
+                    writer.Emit(guard == "null" ? Mono.Cecil.Cil.OpCodes.Brtrue : Mono.Cecil.Cil.OpCodes.Brfalse, returned);
+                }
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldarga_S, entry.Parameters[0]);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldfld, module.GetType("ExternalSamples.Holder").Fields.Single());
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Stfld, module.GetType("ExternalSamples.Data").Fields.Single());
+                writer.Append(returned);
+                module.Write(project.ExternalAssemblyPath);
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 4);
+            Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(effect => effect.Kind == expected));
+        }
+
+        // 结构体留在求值栈上时已复制完成，后续修改原槽不能改变这份快照。
+        /// <summary>实际执行 DLL 核对写入对象，再对照源码副本与求值栈副本。</summary>
+        [TestMethod]
+        [DataRow(false, "flat")]
+        [DataRow(true, "flat")]
+        [DataRow(false, "nested")]
+        [DataRow(true, "nested")]
+        [DataRow(false, "indirect")]
+        [DataRow(true, "indirect")]
+        public async Task AnalyzePreservesAggregateStackSnapshot(bool oldFirst, string shape)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public struct Holder { public Data Target; }
+                public struct Pair { public Holder Left; }
+                public static class Calls
+                {
+                    private static void Replace(ref Holder value, Data next) { value.Target = next; }
+                    public static void Entry(Data outside)
+                    {
+                        AGGREGATE local = default; Replace(ref localMEMBER, FIRST); AGGREGATE copy = local;
+                        Replace(ref localMEMBER, SECOND); copyMEMBER.Target.Value = 1;
+                    }
+                }
+                """.Replace("FIRST", oldFirst ? "outside" : "new Data()").Replace("SECOND", oldFirst ? "new Data()" : "outside")
+                .Replace("AGGREGATE", shape == "nested" ? "Pair" : "Holder").Replace("MEMBER", shape == "nested" ? ".Left" : string.Empty));
+            using (Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(project.ExternalAssemblyPath,
+                new Mono.Cecil.ReaderParameters { InMemory = true }))
+            {
+                Mono.Cecil.TypeDefinition type = module.GetType("ExternalSamples.Calls");
+                Mono.Cecil.TypeDefinition data = module.GetType("ExternalSamples.Data");
+                Mono.Cecil.TypeDefinition holder = module.GetType("ExternalSamples.Holder");
+                Mono.Cecil.TypeDefinition aggregate = shape == "nested" ? module.GetType("ExternalSamples.Pair") : holder;
+                Mono.Cecil.MethodDefinition entry = type.Methods.Single(method => method.Name == "Entry");
+                entry.Body.Instructions.Clear();
+                entry.Body.Variables.Clear();
+                entry.Body.Variables.Add(new Mono.Cecil.Cil.VariableDefinition(aggregate));
+                Mono.Cecil.Cil.ILProcessor writer = entry.Body.GetILProcessor();
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, entry.Body.Variables[0]);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Initobj, aggregate);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, entry.Body.Variables[0]);
+                if (shape == "nested")
+                {
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Ldflda, aggregate.Fields.Single());
+                }
+                if (oldFirst)
+                {
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+                }
+                else
+                {
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Newobj, data.Methods.Single(method => method.IsConstructor));
+                }
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Call, type.Methods.Single(method => method.Name == "Replace"));
+                if (shape == "indirect")
+                {
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, entry.Body.Variables[0]);
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Ldobj, holder);
+                }
+                else
+                {
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Ldloc_0);
+                }
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldloca_S, entry.Body.Variables[0]);
+                if (shape == "nested")
+                {
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Ldflda, aggregate.Fields.Single());
+                }
+                if (oldFirst)
+                {
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Newobj, data.Methods.Single(method => method.IsConstructor));
+                }
+                else
+                {
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+                }
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Call, type.Methods.Single(method => method.Name == "Replace"));
+                if (shape == "nested")
+                {
+                    writer.Emit(Mono.Cecil.Cil.OpCodes.Ldfld, aggregate.Fields.Single());
+                }
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldfld, holder.Fields.Single());
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldc_I4_1);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Stfld, data.Fields.Single());
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                module.Write(project.ExternalAssemblyPath);
+            }
+            System.Runtime.Loader.AssemblyLoadContext execution = new(null, isCollectible: true);
+            try
+            {
+                using FileStream bytes = File.OpenRead(project.ExternalAssemblyPath);
+                System.Reflection.Assembly assembly = execution.LoadFromStream(bytes);
+                Type data = assembly.GetType("ExternalSamples.Data", throwOnError: true)!;
+                object outside = Activator.CreateInstance(data)!;
+                assembly.GetType("ExternalSamples.Calls", throwOnError: true)!.GetMethod("Entry")!.Invoke(null, new[] { outside });
+                Assert.AreEqual(oldFirst ? 1 : 0, data.GetField("Value")!.GetValue(outside));
+            }
+            finally
+            {
+                execution.Unload();
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 4);
+            foreach (MethodEffect effect in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(oldFirst ? MethodEffectKind.Setter : MethodEffectKind.Getter, effect.Kind, effect.MethodId);
+            }
+        }
+
+        // 局部变量本身与它指向的对象分开处理，取地址后仍完整读取调用写回。
+        /// <summary>直接赋值、对象修改、ref 参数及结构体地址在源码和 DLL 中保持相同结果。</summary>
+        [TestMethod]
+        [DataRow("LocalOnly", MethodEffectKind.Getter)]
+        [DataRow("ObjectChanged", MethodEffectKind.Setter)]
+        [DataRow("LocalReplaced", MethodEffectKind.Setter)]
+        [DataRow("ParameterReplaced", MethodEffectKind.Getter)]
+        [DataRow("StructReplaced", MethodEffectKind.Setter)]
+        [DataRow("StructReset", MethodEffectKind.Getter)]
+        [DataRow("StructCopied", MethodEffectKind.Setter)]
+        [DataRow("StructCopyKept", MethodEffectKind.Getter)]
+        [DataRow("StructByValue", MethodEffectKind.Getter)]
+        [DataRow("StructReadByValue", MethodEffectKind.Setter)]
+        [DataRow("StructCopyConditional", MethodEffectKind.Setter)]
+        [DataRow("NestedCopy", MethodEffectKind.Setter)]
+        [DataRow("NestedOther", MethodEffectKind.Getter)]
+        [DataRow("NestedReset", MethodEffectKind.Getter)]
+        [DataRow("ArrayReplaceOld", MethodEffectKind.Setter)]
+        [DataRow("ArrayReplaceFresh", MethodEffectKind.Getter)]
+        [DataRow("RootStruct", MethodEffectKind.Setter)]
+        [DataRow("StructReadThroughCopy", MethodEffectKind.Setter)]
+        [DataRow("BranchReplaced", MethodEffectKind.Getter)]
+        public async Task AnalyzeSeparatesPrivateSlotsFromAddressedStorage(string name, MethodEffectKind expected)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public struct Holder { public Data Target; }
+                public struct Pair { public Holder Left; public Holder Right; }
+                public static class Calls
+                {
+                    private static void Change(Data value) { value.Value = 1; }
+                    private static void Replace(ref Data value, Data next) { value = next; }
+                    private static void ReplaceHolder(ref Holder value, Data next) { value.Target = next; }
+                    private static void ReplaceCopy(Holder value, Data next) { value.Target = next; }
+                    private static void ReadCopy(Holder value) { value.Target.Value = 1; }
+                    private static void ForwardCopy(Holder value) { ReadCopy(value); }
+                    private static void ReplaceElement(Holder[] values, Holder next) { values[0] = next; }
+                    public static void LocalOnly(Data outside)
+                    {
+                        Data local = new Data(); Change(new Data());
+                        if (local.Value == 1) outside.Value = 1;
+                    }
+                    public static void ObjectChanged(Data outside)
+                    {
+                        Data local = new Data(); Change(local);
+                        if (local.Value == 1) outside.Value = 1;
+                    }
+                    public static void LocalReplaced(Data outside)
+                    {
+                        Data local = new Data(); Replace(ref local, outside); local.Value = 1;
+                    }
+                    public static void ParameterReplaced(Data outside)
+                    {
+                        Replace(ref outside, new Data()); outside.Value = 1;
+                    }
+                    public static void StructReplaced(Data outside)
+                    {
+                        Holder local = default; ReplaceHolder(ref local, outside); local.Target.Value = 1;
+                    }
+                    public static void StructReset(Data outside)
+                    {
+                        Holder local = default; ReplaceHolder(ref local, outside); local = default;
+                        if (local.Target != null) local.Target.Value = 1;
+                    }
+                    public static void StructCopied(Data outside)
+                    {
+                        Holder local = default; ReplaceHolder(ref local, outside); Holder copy = local;
+                        ReplaceHolder(ref local, new Data()); copy.Target.Value = 1;
+                    }
+                    public static void StructCopyKept(Data outside)
+                    {
+                        Holder local = default; ReplaceHolder(ref local, new Data()); Holder copy = local;
+                        ReplaceHolder(ref local, outside); copy.Target.Value = 1;
+                    }
+                    public static void StructByValue(Data outside)
+                    {
+                        Holder local = default; ReplaceHolder(ref local, new Data());
+                        ReplaceCopy(local, outside); local.Target.Value = 1;
+                    }
+                    public static void StructReadByValue(Data outside)
+                    {
+                        Holder local = default; ReplaceHolder(ref local, outside); ReadCopy(local);
+                    }
+                    public static void StructCopyConditional(Data outside, bool flag)
+                    {
+                        Holder local = default; ReplaceHolder(ref local, outside); Holder copy = local;
+                        if (flag) copy.Target.Value = 1;
+                    }
+                    public static void NestedCopy(Data outside)
+                    {
+                        Pair local = default; local.Left.Target = outside; Pair copy = local;
+                        copy.Left.Target.Value = 1;
+                    }
+                    public static void NestedOther(Data outside)
+                    {
+                        Pair local = default; local.Left.Target = outside; Pair copy = local;
+                        if (copy.Right.Target != null) copy.Right.Target.Value = 1;
+                    }
+                    public static void NestedReset(Data outside)
+                    {
+                        Pair local = default; local.Left.Target = outside; local.Left = default;
+                        if (local.Left.Target != null) local.Left.Target.Value = 1;
+                    }
+                    public static void ArrayReplaceOld(Data outside)
+                    {
+                        Holder[] values = new Holder[1]; Holder next = default; next.Target = outside;
+                        ReplaceElement(values, next); values[0].Target.Value = 1;
+                    }
+                    public static void ArrayReplaceFresh(Data outside)
+                    {
+                        Holder[] values = new Holder[1]; values[0].Target = outside;
+                        Holder next = default; next.Target = new Data();
+                        ReplaceElement(values, next); values[0].Target.Value = 1;
+                    }
+                    public static void RootStruct(Holder value) { value.Target.Value = 1; }
+                    public static void StructReadThroughCopy(Data outside)
+                    {
+                        Holder local = default; ReplaceHolder(ref local, outside); ForwardCopy(local);
+                    }
+                    public static void BranchReplaced(Data outside, bool flag)
+                    {
+                        Data local = new Data();
+                        if (flag) Replace(ref local, outside);
+                        if (!flag) local.Value = 1;
+                    }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == name).ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 4);
+            EffectAnalysisResult effects = new EffectAnalyzer().Analyze(catalog, roots, calls);
+            Assert.HasCount(2, effects.Methods);
+            Assert.IsTrue(effects.Methods.All(method => method.Kind == expected), System.Text.Json.JsonSerializer.Serialize(effects.Methods));
+        }
+
         // 显式创建委托排除自动缓存，锁定旧审计命名实参和空可写语法的效果。
         /// <summary>源码与真实 DLL 共用正式参数槽，空 ref 和空属性 setter 不产生写入。</summary>
         [TestMethod]

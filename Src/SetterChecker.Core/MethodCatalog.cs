@@ -70,8 +70,12 @@ namespace SetterChecker.Core
                     SourceCatalogContext? context = workItem.SourceContext;
                     using Cecil.ModuleDefinition module = context == null ? OpenModule(workItem.Path) : OpenModule(context.Material.AssemblyImage);
                     ManagedAssemblyPart part = ReadManagedTypes(Path.GetFullPath(workItem.Path), module);
-                    Dictionary<string, INamedTypeSymbol>? sourceTypes = context == null ? null : EnumerateTypes(context.Material.Compilation.Assembly.GlobalNamespace)
-                        .Where(type => IsDeclaredSourceType(type, context)).ToDictionary(ReadDocumentationId, StringComparer.Ordinal);
+                    // 仅把当前用户源码声明配回元数据，生成器产物仍保留在托管目录。
+                    Dictionary<string, INamedTypeSymbol>? sourceTypes = context == null ? null : context.Material.Compilation
+                        .GetSymbolsWithName(_ => true, SymbolFilter.Type, cancellationToken).OfType<INamedTypeSymbol>()
+                        .Where(type => type.Locations.Any(location => location.IsInSource
+                            && location.SourceTree != null && context.DeclaredPaths.Contains(location.SourceTree.FilePath)))
+                        .ToDictionary(ReadDocumentationId, StringComparer.Ordinal);
                     managedParts.Add(part);
                     foreach (TypeEntry metadata in part.Types)
                     {
@@ -165,33 +169,6 @@ namespace SetterChecker.Core
             }
         }
 
-        // 按同一深度优先顺序列出命名空间和嵌套类型中的源码类型。
-        private static IEnumerable<INamedTypeSymbol> EnumerateTypes(INamespaceOrTypeSymbol root)
-        {
-            if (root is INamedTypeSymbol type)
-            {
-                yield return type;
-            }
-            IEnumerable<INamespaceOrTypeSymbol> members = root is INamespaceSymbol space ? space.GetMembers() : root.GetTypeMembers();
-            foreach (INamespaceOrTypeSymbol member in members)
-            {
-                foreach (INamedTypeSymbol item in EnumerateTypes(member))
-                {
-                    yield return item;
-                }
-            }
-        }
-
-        // 判断类型是用户源文件声明而不是编译或生成器产物。
-        private static bool IsDeclaredSourceType(
-            INamedTypeSymbol type,
-            SourceCatalogContext context)
-        {
-            return type.Locations.Any(location => location.IsInSource
-                && location.SourceTree != null
-                && context.DeclaredPaths.Contains(location.SourceTree.FilePath));
-        }
-
         // 读取标准成员编号，并保留显式接口函数实际写入元数据的名称。
         private static string ReadDocumentationId(ISymbol symbol)
         {
@@ -219,7 +196,7 @@ namespace SetterChecker.Core
             return metadata with
             {
                 Id = metadata.LogicalId,
-                FullName = DisplaySourceType(definition),
+                FullName = definition.ToDisplayString(s_typeDisplayFormat),
                 SourceSymbol = definition,
             };
         }
@@ -230,7 +207,7 @@ namespace SetterChecker.Core
         {
             Dictionary<string, IMethodSymbol> sourceMethods = symbol.GetMembers()
                 .OfType<IMethodSymbol>()
-                .Select(NormalizeMethod)
+                .Select(method => (method.ReducedFrom ?? method.PartialImplementationPart ?? method).OriginalDefinition)
                 .Distinct<IMethodSymbol>(SymbolEqualityComparer.Default)
                 .ToDictionary(ReadDocumentationId, StringComparer.Ordinal);
             List<MethodEntry> result = new(metadataMethods.Count);
@@ -265,12 +242,11 @@ namespace SetterChecker.Core
 
         // 把源码显示和标签信息附加到 Cecil 已读取的函数事实。
         private static MethodEntry CreateSourceMethod(
-            IMethodSymbol method,
+            IMethodSymbol definition,
             TypeEntry type,
             SourceCatalogContext context,
             MethodEntry metadata)
         {
-            IMethodSymbol definition = NormalizeMethod(method);
             Location? location = definition.Locations.FirstOrDefault(item => item.IsInSource);
             string? sourcePath = location?.SourceTree?.FilePath;
             int line = location == null ? 0 : location.GetLineSpan().StartLinePosition.Line + 1;
@@ -299,18 +275,6 @@ namespace SetterChecker.Core
                     context),
                 SourceSymbol = definition,
             };
-        }
-
-        // 还原扩展函数、部分函数及构造函数的原始声明。
-        private static IMethodSymbol NormalizeMethod(IMethodSymbol method)
-        {
-            return (method.ReducedFrom ?? method.PartialImplementationPart ?? method).OriginalDefinition;
-        }
-
-        // 生成用户可读的源码类型名称。
-        private static string DisplaySourceType(ITypeSymbol type)
-        {
-            return type.ToDisplayString(s_typeDisplayFormat);
         }
 
         // 判断源码函数是否属于最终标签统计范围。
@@ -414,7 +378,7 @@ namespace SetterChecker.Core
             string assemblyName)
         {
             string logicalId = ManagedNamedTypeDefinitionId(type);
-            string id = PhysicalTypeId(logicalId, path);
+            string id = PhysicalDefinitionId(logicalId, path);
 
             return new TypeEntry(
                 id,
@@ -471,7 +435,7 @@ namespace SetterChecker.Core
             return new TypeRelationEntry(
                 ManagedNamedTypeDefinitionId(type.GetElementType()),
                 identity.Text,
-                ReadManagedAssemblyFullName(type.GetElementType()),
+                ReadManagedAssemblyName(type.GetElementType(), fullName: true),
                 arguments.Select(argument => argument.Text).ToArray())
             {
                 FullName = type.GetElementType().FullName,
@@ -496,11 +460,11 @@ namespace SetterChecker.Core
             }
 
             return new ForwardedTypeEntry(
-                NamedTypeId(facadeAssemblyName, NormalizeManagedFullName(type.FullName)),
+                NamedTypeId(facadeAssemblyName, type.FullName.Replace('/', '+')),
                 facadeAssemblyIdentity,
                 NamedTypeId(
                     assembly.Name,
-                    NormalizeManagedFullName(type.FullName)),
+                    type.FullName.Replace('/', '+')),
                 assembly.FullName,
                 path);
         }
@@ -683,7 +647,7 @@ namespace SetterChecker.Core
             ParameterEntry[] parameters = method.Parameters.Select((parameter, index) =>
                 new ParameterEntry(parameter.Name, identity.Parameters[index].Text, ReadManagedRefKind(parameter))
                 { TypeIdentity = identity.Parameters[index] }).ToArray();
-            string id = PhysicalMethodId(identity.Text, type.AssemblyPath!, method.MetadataToken.ToInt32());
+            string id = $"{PhysicalDefinitionId(identity.Text, type.AssemblyPath!)}|M{method.MetadataToken.ToInt32()}";
 
             return new MethodEntry(
                 id,
@@ -875,13 +839,9 @@ namespace SetterChecker.Core
             Cecil.TypeReference type,
             Func<Cecil.TypeReference, string>? namedTypeId = null)
         {
-            if (type is not Cecil.GenericInstanceType instance)
-            {
-                return Array.Empty<TypeIdentityTemplate>();
-            }
-
-            return instance.GenericArguments.Select(argument =>
-                ManagedTypeIdentity(argument, namedTypeId)).ToArray();
+            return type is Cecil.GenericInstanceType instance
+                ? instance.GenericArguments.Select(argument => ManagedTypeIdentity(argument, namedTypeId)).ToArray()
+                : Array.Empty<TypeIdentityTemplate>();
         }
 
         // 建立 Cecil 命名类型定义的跨文件身份。
@@ -891,11 +851,11 @@ namespace SetterChecker.Core
             Cecil.TypeReference element = type.GetElementType();
             string assemblyName = ReadManagedAssemblyName(element);
 
-            return NamedTypeId(assemblyName, NormalizeManagedFullName(element.FullName));
+            return NamedTypeId(assemblyName, element.FullName.Replace('/', '+'));
         }
 
         // 沿 Cecil 嵌套类型找到类型所属程序集。
-        private static string ReadManagedAssemblyName(Cecil.TypeReference type, bool fullName = false)
+        internal static string ReadManagedAssemblyName(Cecil.TypeReference type, bool fullName = false)
         {
             Cecil.TypeReference root = type;
             while (root.DeclaringType != null)
@@ -911,18 +871,6 @@ namespace SetterChecker.Core
                 _ => throw new AnalysisException(fullName ? $"托管类型没有程序集身份：{type.FullName}"
                     : $"托管类型没有明确的程序集范围：{type.FullName}"),
             };
-        }
-
-        // 沿 Cecil 嵌套类型读取完整程序集身份。
-        internal static string ReadManagedAssemblyFullName(Cecil.TypeReference type)
-        {
-            return ReadManagedAssemblyName(type, fullName: true);
-        }
-
-        // 把 Cecil 的嵌套类型分隔符统一成 CLR 身份分隔符。
-        private static string NormalizeManagedFullName(string fullName)
-        {
-            return fullName.Replace('/', '+');
         }
 
         // 生成用户可读的 Cecil 类型定义名称。
@@ -952,20 +900,12 @@ namespace SetterChecker.Core
                     : name;
         }
 
-        // 生成托管类型包含物理文件的唯一身份。
-        private static string PhysicalTypeId(string logicalId, string path)
+        // 为类型和函数共用物理文件的身份部分。
+        private static string PhysicalDefinitionId(string logicalId, string path)
         {
             string fullPath = Path.GetFullPath(path);
 
             return $"{logicalId}|P{fullPath.Length}:{fullPath}";
-        }
-
-        // 生成托管函数包含物理文件和元数据标记的唯一身份。
-        private static string PhysicalMethodId(string logicalId, string path, int token)
-        {
-            string fullPath = Path.GetFullPath(path);
-
-            return $"{logicalId}|P{fullPath.Length}:{fullPath}|M{token}";
         }
 
         /// <summary>保存一次 Cecil 托管文件读取结果。</summary>
@@ -1981,8 +1921,8 @@ namespace SetterChecker.Core
                 MethodCatalog.ManagedNamedTypeDefinitionId(method.DeclaringType.GetElementType()),
                 genericArguments.Select(type => type.Text).ToArray(),
                 method.HasThis,
-                MethodCatalog.ReadManagedAssemblyFullName(
-                    method.DeclaringType.GetElementType()),
+                MethodCatalog.ReadManagedAssemblyName(
+                    method.DeclaringType.GetElementType(), fullName: true),
                 referringAssemblyPath)
             {
                 ReferenceMetadataToken = method.MetadataToken.ToInt32(),
@@ -2012,8 +1952,8 @@ namespace SetterChecker.Core
             {
                 ReferenceMetadataToken = field.MetadataToken.ToInt32(),
                 KnownDeclaringTypeId = ReadKnownTypeId(field.DeclaringType, referringAssemblyPath),
-                TargetAssemblyIdentity = MethodCatalog.ReadManagedAssemblyFullName(
-                    field.DeclaringType.GetElementType()),
+                TargetAssemblyIdentity = MethodCatalog.ReadManagedAssemblyName(
+                    field.DeclaringType.GetElementType(), fullName: true),
                 ReferringAssemblyPath = referringAssemblyPath,
             };
         }
@@ -2037,7 +1977,7 @@ namespace SetterChecker.Core
                 new TypeIdentityTemplate(MethodCatalog.ManagedNamedTypeDefinitionId(
                     definition)),
                 MethodCatalog.ReadManagedTypeArguments(type).ToArray(),
-                MethodCatalog.ReadManagedAssemblyFullName(definition),
+                MethodCatalog.ReadManagedAssemblyName(definition, fullName: true),
                 referringAssemblyPath,
                 ReadKnownTypeId(type, referringAssemblyPath));
         }
@@ -2100,7 +2040,7 @@ namespace SetterChecker.Core
                             string? known = ReadKnownTypeId(target.DeclaringType, type.AssemblyPath!);
                             return known != null ? classOwners.Contains(known)
                                 : FindTypeDefinitions(MethodCatalog.ManagedNamedTypeDefinitionId(target.DeclaringType.GetElementType()),
-                                    MethodCatalog.ReadManagedAssemblyFullName(target.DeclaringType.GetElementType()), type.AssemblyPath, loadMissing: false)
+                                    MethodCatalog.ReadManagedAssemblyName(target.DeclaringType.GetElementType(), fullName: true), type.AssemblyPath, loadMissing: false)
                                     .Any(owner => classOwners.Contains(owner.Id));
                         }).ToArray();
                     }

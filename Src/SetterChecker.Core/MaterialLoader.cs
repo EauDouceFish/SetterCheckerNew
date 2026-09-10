@@ -518,31 +518,10 @@ namespace SetterChecker.Core
             using FileStream stream = File.OpenRead(path);
             using PEReader portableExecutable = new(stream);
             MetadataReader metadata = portableExecutable.GetMetadataReader();
-            Dictionary<string, AssemblyName> identities = new(
-                StringComparer.OrdinalIgnoreCase);
-
-            foreach (ExportedTypeHandle handle in metadata.ExportedTypes)
-            {
-                ExportedType exportedType = metadata.GetExportedType(handle);
-
-                EntityHandle implementation = exportedType.Implementation;
-
-                while (implementation.Kind == HandleKind.ExportedType)
-                {
-                    implementation = metadata
-                        .GetExportedType((ExportedTypeHandle)implementation)
-                        .Implementation;
-                }
-
-                if (implementation.Kind == HandleKind.AssemblyReference)
-                {
-                    AssemblyName identity = metadata.GetAssemblyReference((AssemblyReferenceHandle)implementation).GetAssemblyName();
-
-                    identities[ReadAssemblyReferenceKey(identity)] = identity;
-                }
-            }
-
-            return identities.Values
+            return metadata.ExportedTypes.Select(handle => ReadExportedTypeImplementation(metadata, handle))
+                .Where(implementation => implementation.Kind == HandleKind.AssemblyReference)
+                .Select(implementation => metadata.GetAssemblyReference((AssemblyReferenceHandle)implementation).GetAssemblyName())
+                .GroupBy(ReadAssemblyReferenceKey, StringComparer.OrdinalIgnoreCase).Select(group => group.Last())
                 .OrderBy(ReadAssemblyReferenceKey, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         }
@@ -666,16 +645,18 @@ namespace SetterChecker.Core
             return metadata.ExportedTypes.Count > 0
                 && definitions.Length == 1
                 && metadata.GetString(metadata.GetTypeDefinition(definitions[0]).Name) == "<Module>"
-                && metadata.ExportedTypes.All(handle =>
-                {
-                    EntityHandle implementation = metadata.GetExportedType(handle).Implementation;
-                    while (implementation.Kind == HandleKind.ExportedType)
-                    {
-                        implementation = metadata.GetExportedType((ExportedTypeHandle)implementation).Implementation;
-                    }
+                && metadata.ExportedTypes.All(handle => ReadExportedTypeImplementation(metadata, handle).Kind == HandleKind.AssemblyReference);
+        }
 
-                    return implementation.Kind == HandleKind.AssemblyReference;
-                });
+        // 嵌套导出类型沿父记录找到实际承载位置，调用处再核对是否为程序集。
+        private static EntityHandle ReadExportedTypeImplementation(MetadataReader metadata, ExportedTypeHandle handle)
+        {
+            EntityHandle implementation = metadata.GetExportedType(handle).Implementation;
+            while (implementation.Kind == HandleKind.ExportedType)
+            {
+                implementation = metadata.GetExportedType((ExportedTypeHandle)implementation).Implementation;
+            }
+            return implementation;
         }
 
         // 从当前编译标记和 Unity 安装路径选择唯一运行目录。
