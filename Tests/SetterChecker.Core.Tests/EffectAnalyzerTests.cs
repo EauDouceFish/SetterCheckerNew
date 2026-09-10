@@ -4,6 +4,40 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 共享相同泛型目标查找时，旧对象与新对象以及不同类型实参不能合并。
+        /// <summary>源码与 DLL 的实际接收对象选择在单路、四路下保持一致。</summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(false, true)]
+        [DataRow(true, false)]
+        [DataRow(true, true)]
+        public async Task AnalyzePreservesReceiverChoiceWhileSharingGenericTargetLookup(bool differentType, bool useOld)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public interface IUse { void Touch(); }
+                public sealed class Box<T> : IUse { public int Value; public void Touch() { Value=1; } }
+                public static class Calls
+                {
+                    public static void Entry(Box<int> outside, bool flag)
+                    {
+                        IUse target = flag ? outside : new Box<ARGUMENT>();
+                        if (CONDITION) target.Touch();
+                    }
+                }
+                """.Replace("ARGUMENT", differentType ? "string" : "int").Replace("CONDITION", useOld ? "flag" : "!flag"));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs);
+                Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(method =>
+                    method.Kind == (useOld ? MethodEffectKind.Setter : MethodEffectKind.Getter)));
+            }
+        }
+
         // 连续序列化共用同一静态开关，不能把每次只读调用再次展开为所有历史组合。
         /// <summary>复刻 KFBWriter 的默认值过滤流程，内部写入仍只修改新对象。</summary>
         [TestMethod]

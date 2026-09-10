@@ -828,7 +828,8 @@ namespace SetterChecker.Core
                     ? new[] { constrainedReceiver!.ArgumentIdentities }
                     : receiverOrigins.SelectMany(origin => ReadReceiverArguments(
                         catalog, candidate, origin, valueSources, new())).ToArray();
-                foreach (IReadOnlyList<TypeIdentityTemplate> inferredArguments in candidateArguments)
+                foreach (IReadOnlyList<TypeIdentityTemplate> inferredArguments in candidateArguments
+                    .DistinctBy(arguments => string.Concat(arguments.Select(argument => $"{argument.Text.Length}:{argument.Text}")), StringComparer.Ordinal))
                 {
                     if (inferredArguments.Count != candidate.GenericParameters.Count)
                     {
@@ -4740,7 +4741,7 @@ namespace SetterChecker.Core
         internal HashSet<int> ResetRoots(HashSet<int> roots)
         {
             this.m_changedRoots.UnionWith(roots);
-            HashSet<int> instances = this.m_instances.Values.Where(instance => roots.Contains(instance.RootId)).Select(instance => instance.Id).ToHashSet();
+            HashSet<int> instances = this.Instances.Where(instance => roots.Contains(instance.RootId)).Select(instance => instance.Id).ToHashSet();
             this.m_reentries.RemoveWhere(call => instances.Contains(call.Caller));
             this.m_inactiveInstances.UnionWith(instances.Except(roots));
             foreach (int id in instances)
@@ -4752,7 +4753,7 @@ namespace SetterChecker.Core
             {
                 this.m_resultCalls.Remove(key);
             }
-            HashSet<BehaviorValueReference> derived = this.m_observedValues.Values.Concat(this.m_addressReads.Values).ToHashSet();
+            HashSet<BehaviorValueReference> derived = this.m_observedValues.Values.Concat(this.m_addressReads.Values).Where(value => instances.Contains(value.InstanceId)).ToHashSet();
             foreach (var key in this.m_runtimeValues.Keys.Where(key => instances.Contains(key.InstanceId) && (key.ValueId >= 0 || derived.Contains(key))).ToArray())
             {
                 this.m_runtimeValues.Remove(key);
@@ -4860,7 +4861,7 @@ namespace SetterChecker.Core
             BehaviorValue value = body.Values[reference.ValueId];
             var original = (Reference: reference, Point: returned.Point);
             if (value.Kind != BehaviorValueKind.SlotRead || body.Values[value.InputValueIds.Single()].Kind != BehaviorValueKind.Local
-                || body.Values.Any(item => item.Kind == BehaviorValueKind.Address && item.Member == null && item.InputValueIds.SequenceEqual(value.InputValueIds)))
+                || ReadValueFlowGraph(body).AddressedSlots.Contains(value.InputValueIds.Single()))
             {
                 return new[] { original };
             }
@@ -5148,7 +5149,9 @@ namespace SetterChecker.Core
         {
             TypeIdentityTemplate[] arguments = this.m_catalog.ReadResolvedTypeArguments(member.ReferringAssemblyPath!, member.ReferenceMetadataToken)
                 .Select(instance.Substitute).ToArray();
-            TypeEntry type = this.m_catalog.ResolveTypeDefinition(new BehaviorTypeReference(instance.Substitute(member.DeclaringTypeIdentity),
+            TypeEntry type = member.KnownDeclaringTypeId is string knownId
+                ? this.m_catalog.TypesById.TryGetValue(knownId, out TypeEntry? known) ? known : throw new AnalysisException($"本地类型定义尚未载入：{knownId}")
+                : this.m_catalog.ResolveTypeDefinition(new BehaviorTypeReference(instance.Substitute(member.DeclaringTypeIdentity),
                 new TypeIdentityTemplate(member.DeclaringTypeDefinitionId), arguments, member.TargetAssemblyIdentity,
                 member.ReferringAssemblyPath, member.KnownDeclaringTypeId));
             return (type, arguments);
@@ -5169,7 +5172,7 @@ namespace SetterChecker.Core
             foreach (BehaviorMemberReference member in (blockId.HasValue ? reads[blockId.Value] : reads.SelectMany(group => group))
                 .Where(value => (blockId.HasValue || IsReachable(instanceId, value.Point!.Value.BlockId)) && value.Point!.Value.Order < beforeOrder)
                 .Select(value => value.Member!).Concat(GetWrites(instanceId, blockId)
-                    .Where(write => write.Kind == BehaviorWriteKind.Field && write.ReceiverValueId == null && write.Point.Order < beforeOrder).Select(write => write.Member!)))
+                    .Where(write => write.Kind == BehaviorWriteKind.Field && write.ReceiverValueId == null && write.Point.Order < beforeOrder).Select(write => write.Member!)).Distinct())
             {
                 RequireStaticFieldInitialization(instanceId, member);
             }
@@ -5776,7 +5779,7 @@ namespace SetterChecker.Core
                 && location.Receiver is { ValueId: >= 0 } receiver && (this.m_methods[receiver.MethodId].Values[receiver.ValueId].IsManagedReferenceSlot
                     || receiver.InstanceId == instance.Id && !ReadValueFlowGraph(method).AddressedSlots.Contains(receiver.ValueId)));
             bool separateArrayElements = kind == BehaviorWriteKind.Field && member != null
-                && (locations.All(location => location.Receiver == null) || !ReadMemberType(member, instance).Type.IsValueType)
+                && (locations.All(location => location.Receiver == null) || !aggregateField)
                 || kind == BehaviorWriteKind.Indirect && locations.All(location => location.Definition == "slot" && !location.IsReferent
                     && location.Receiver is { ValueId: >= 0 });
             this.m_callsByCallerInstance.TryGetValue(instance.Id, out Dictionary<BehaviorFlowPoint, ResolvedCall>? calls);

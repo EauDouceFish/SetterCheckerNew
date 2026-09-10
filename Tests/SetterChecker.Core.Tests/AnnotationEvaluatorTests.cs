@@ -4,6 +4,90 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class AnnotationEvaluatorTests
     {
+        // 复刻 KH 校验和生成属性：外层避免重复日志，实际字段写入由内层记录。
+        /// <summary>源码和 DLL 都保留真实写入，可信豁免仅阻断追踪，裸标签仍提示补充原因。</summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public async Task RunAuditsKhGeneratedPropertyWithoutDuplicatingTracking(bool external, bool reason)
+        {
+            string library = """
+                namespace KH
+                {
+                    public class CheckSumAttribute : System.Attribute { }
+                    public class NoLogTrackAttribute : System.Attribute
+                    {
+                        private long m_flag;
+                        private string m_reason;
+                        public NoLogTrackAttribute(long flag = 0, string reason = "")
+                        {
+                            m_flag = flag;
+                            m_reason = reason;
+                        }
+                        public NoLogTrackAttribute(string reason) : this(0, reason) { }
+                    }
+                    public class LogTrackAttribute : System.Attribute
+                    {
+                        private long m_flag;
+                        public LogTrackAttribute(long flag = 0) { m_flag = flag; }
+                    }
+                    public class LogTrackFlag { public const long Setter = 1; }
+                    public partial class SkillModel
+                    {
+                        public int actionID_checksum_replace;
+                        [CheckSum]
+                        public System.Int32 actionID
+                        {
+                            get => actionID_checksum_replace;
+                            [NoLogTrack()]
+                            set
+                            {
+                                if (actionID_checksum_replace != value)
+                                {
+                                    actionID_checksum_setter(value);
+                                }
+                            }
+                        }
+                        [LogTrack(LogTrackFlag.Setter)]
+                        private void actionID_checksum_setter(System.Int32 value)
+                        {
+                            actionID_checksum_replace = value;
+                        }
+                    }
+                }
+                """.Replace("[NoLogTrack()]", reason ? "[NoLogTrack(\"实际字段写入由内层函数记录\")]" : "[NoLogTrack()]");
+            using TestProject project = external ? TestProject.CreateWithCallTargets(library) : TestProject.CreateSingleAssembly();
+            project.WriteRootSource((external ? string.Empty : library) + """
+                public static class Calls
+                {
+                    public static void Entry(KH.SkillModel model, int value) { model.actionID = value; }
+                    public static void Independent(KH.SkillModel model, int value) { model.actionID = value; model.actionID_checksum_replace = 2; }
+                }
+                """);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            Assert.IsTrue(run.Complete);
+            AnnotationMethod entry = run.Annotations.Methods.Single(method => method.Class == "Calls" && method.Name == "Entry");
+            Assert.AreEqual(MethodEffectKind.Setter, entry.Actual);
+            Assert.AreEqual("NoLogTrack", entry.Decision);
+            AnnotationMethod independent = run.Annotations.Methods.Single(method => method.Class == "Calls" && method.Name == "Independent");
+            Assert.AreEqual(MethodEffectKind.Setter, independent.Actual);
+            Assert.AreEqual("ShouldTrack", independent.Decision);
+            if (!external)
+            {
+                AnnotationMethod wrapper = run.Annotations.Methods.Single(method => method.Name == "set_actionID");
+                AnnotationMethod writer = run.Annotations.Methods.Single(method => method.Name == "actionID_checksum_setter");
+                Assert.AreEqual(MethodEffectKind.Setter, wrapper.Actual);
+                Assert.AreEqual("NoLogTrack", wrapper.Decision);
+                Assert.AreEqual(!reason, wrapper.MissingReason);
+                Assert.AreEqual(reason, wrapper.ReviewExemption);
+                Assert.AreEqual(MethodEffectKind.Setter, writer.Actual);
+                Assert.AreEqual("ShouldTrack", writer.Decision);
+                Assert.AreEqual(!reason, wrapper.WarningPaths.Any(path => path.First() == entry.Id));
+            }
+        }
+
         // 静态开关与参数的省重查询不能抹去写回、旧副本或不同调用实参。
         /// <summary>源码与 DLL 的缓存豁免保留真实数值，只有随后可执行的业务写入才追踪。</summary>
         [TestMethod]
