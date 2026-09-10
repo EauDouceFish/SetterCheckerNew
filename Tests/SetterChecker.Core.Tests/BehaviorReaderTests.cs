@@ -136,19 +136,81 @@ namespace SetterChecker.Core.Tests
                 BehaviorValue token = body.Values.Single(value => methodName == "Method"
                     ? value.Method?.Name == "Run" : value.Member?.Name == "Value");
                 Assert.IsNotNull(token.Point);
-                BehaviorTypeUse[] uses = body.TypeUses.Where(use => use.Position == token.Point.Value.BlockId).ToArray();
-                Assert.IsNotEmpty(uses);
                 if (methodName == "Method")
                 {
-                    BehaviorTypeReference argument = uses.Single(use => use.Type.Id == "!!0").Type;
-                    Assert.AreEqual("!!0", argument.DefinitionId);
-                    Assert.IsNull(argument.TargetAssemblyIdentity);
+                    Assert.IsNotNull(token.Method);
+                    CollectionAssert.AreEqual(new[] { "!!0" }, token.Method.GenericArgumentTypeIds.ToArray());
+                    Assert.IsNotNull(token.Method.ReferringAssemblyPath);
                 }
                 else
                 {
-                    BehaviorTypeReference declaringType = uses.Single().Type;
-                    CollectionAssert.AreEqual(new[] { "!!0" }, declaringType.ArgumentIdentities.Select(type => type.Text).ToArray());
-                    StringAssert.Contains(declaringType.DefinitionId, "Holder");
+                    Assert.IsNotNull(token.Member);
+                    StringAssert.EndsWith(token.Member.DeclaringTypeIdentity.Text, "<!!0>");
+                    StringAssert.Contains(token.Member.DeclaringTypeDefinitionId, "Holder");
+                    Assert.IsNotNull(token.Member.ReferringAssemblyPath);
+                }
+            }
+        }
+
+        // sizeof 的操作数不是结果类型，复制指令的类型也必须附着在真实写入上。
+        /// <summary>源码与实际含 sizeof、cpobj 的 DLL 保留各自泛型类型操作数。</summary>
+        [TestMethod]
+        public async Task ReadAsyncKeepsOperandTypesSeparateFromResultTypes()
+        {
+            string source = """
+                namespace Samples;
+                public static class Calls
+                {
+                    public static int Size<T, U>() where T : unmanaged where U : unmanaged => 0;
+                    public static void Copy<T>(ref T target, in T source) { target = source; }
+                }
+                """;
+            using TestProject project = TestProject.CreateWithCallTargets(source);
+            project.WriteRootSource(source.Replace("namespace Samples;", "namespace SourceSamples;")
+                .Replace("static int Size", "static unsafe int Size").Replace("=> 0;", "=> sizeof(T) + sizeof(U);"));
+            File.AppendAllLines(project.RootResponsePath, new[] { "-unsafe+" }, new System.Text.UTF8Encoding(false));
+            using (Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(project.ExternalAssemblyPath,
+                new Mono.Cecil.ReaderParameters { InMemory = true }))
+            {
+                Mono.Cecil.TypeDefinition type = module.GetType("ExternalSamples.Calls");
+                Mono.Cecil.MethodDefinition size = type.Methods.Single(method => method.Name == "Size");
+                size.Body.Instructions.Clear();
+                Mono.Cecil.Cil.ILProcessor writer = size.Body.GetILProcessor();
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Sizeof, size.GenericParameters[0]);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Sizeof, size.GenericParameters[1]);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Add);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                Mono.Cecil.MethodDefinition copy = type.Methods.Single(method => method.Name == "Copy");
+                copy.Body.Instructions.Clear();
+                writer = copy.Body.GetILProcessor();
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_1);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Cpobj, copy.GenericParameters[0]);
+                writer.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                module.Write(project.ExternalAssemblyPath);
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name is "Size" or "Copy").ToArray();
+            Assert.HasCount(4, roots);
+            BehaviorReadResult read = await new BehaviorReader().ReadAsync(material, catalog, roots, 4);
+            foreach (MethodEntry root in roots)
+            {
+                MethodBehavior body = read.Methods.Single(method => method.MethodId == root.Id);
+                if (root.Name == "Size")
+                {
+                    BehaviorValue[] sizes = body.Values.Where(value => value.Reference == "sizeof").ToArray();
+                    CollectionAssert.AreEqual(new[] { "!!0", "!!1" }, sizes.Select(value => value.OperandType!.Id).ToArray());
+                    Assert.IsTrue(sizes.All(value => value.Type == null && value.OperandType!.ReferringAssemblyPath == root.AssemblyPath));
+                    Assert.IsNull(body.Values.Single(value => value.Reference == "add").OperandType);
+                    Assert.AreEqual("System.Int32", root.ReturnTypeId);
+                }
+                else
+                {
+                    BehaviorWrite write = body.Writes.Single();
+                    Assert.AreEqual("!!0", write.OperandType!.Id);
+                    Assert.AreEqual(root.AssemblyPath, write.OperandType.ReferringAssemblyPath);
                 }
             }
         }
@@ -195,8 +257,11 @@ namespace SetterChecker.Core.Tests
 
             foreach (MethodBehavior body in result.Methods)
             {
-                Assert.HasCount(expectedCount, body.TypeUses);
-                foreach (BehaviorTypeUse use in body.TypeUses)
+                var uses = body.Values.Where(value => value.OperandType != null).Select(value => (Type: value.OperandType!, Position: value.Point!.Value.BlockId))
+                    .Concat(body.Writes.Where(write => write.OperandType != null).Select(write => (Type: write.OperandType!, write.Position)))
+                    .DistinctBy(use => use.Position).ToArray();
+                Assert.HasCount(expectedCount, uses);
+                foreach (var use in uses)
                 {
                     Assert.AreEqual(classParameter ? "!0" : "!!0", use.Type.Id);
                     Assert.AreEqual(use.Type.Id, use.Type.DefinitionId);
@@ -204,7 +269,7 @@ namespace SetterChecker.Core.Tests
                     Assert.IsNull(use.Type.KnownTypeId);
                     Assert.IsNotNull(use.Type.ReferringAssemblyPath);
                 }
-                Assert.HasCount(expectedCount, body.TypeUses.Select(use => use.Position).Distinct().ToArray());
+                Assert.HasCount(expectedCount, uses.Select(use => use.Position).Distinct().ToArray());
             }
         }
 
@@ -397,10 +462,12 @@ namespace SetterChecker.Core.Tests
 
         // 检查未实现的托管指令不会因固定栈数量而被当作普通计算。
         /// <summary>
-        /// 验证遇到尚未读取的跳转调用时明确停止并指出指令位置。
+        /// 验证遇到尚未读取的跳转调用或参数区域地址时明确停止并指出指令位置。
         /// </summary>
         [TestMethod]
-        public async Task ReadAsyncRejectsUnsupportedManagedInstruction()
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task ReadAsyncRejectsUnsupportedManagedInstruction(bool argumentList)
         {
             using TestProject project = TestProject.CreateWithBehaviorMethods();
             using (Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(
@@ -411,9 +478,15 @@ namespace SetterChecker.Core.Tests
                     .Single(type => type.FullName == "ExternalSamples.BehaviorSample")
                     .Methods.Single(method => method.Name == "Apply");
                 method.Body.Instructions.Clear();
-                method.Body.Instructions.Add(Mono.Cecil.Cil.Instruction.Create(
-                    Mono.Cecil.Cil.OpCodes.Jmp,
-                    method));
+                method.Body.Instructions.Add(argumentList
+                    ? Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Arglist)
+                    : Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Jmp, method));
+                if (argumentList)
+                {
+                    method.CallingConvention = Mono.Cecil.MethodCallingConvention.VarArg;
+                    method.Body.Instructions.Add(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Pop));
+                    method.Body.Instructions.Add(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Ret));
+                }
                 module.Write(project.ExternalAssemblyPath);
             }
 
@@ -430,7 +503,7 @@ namespace SetterChecker.Core.Tests
                 new BehaviorReader().ReadAsync(material, catalog, new[] { target }, 2));
 
             StringAssert.Contains(exception.Message, target.Id);
-            StringAssert.Contains(exception.Message, "jmp");
+            StringAssert.Contains(exception.Message, argumentList ? "arglist" : "jmp");
         }
 
         // 验证行为模块按调用方明确给出的统计根读取行为。

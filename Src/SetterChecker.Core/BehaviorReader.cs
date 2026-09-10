@@ -198,6 +198,7 @@ namespace SetterChecker.Core
             private readonly Stack<int> m_stack = new();
             private int m_currentOffset;
             private int m_currentOrder;
+            private BehaviorTypeReference? m_currentOperandType;
 
             // 保存当前托管文件和函数信息。
             public ManagedBehaviorBuilder(
@@ -303,33 +304,7 @@ namespace SetterChecker.Core
                     this.m_calls.Values.OrderBy(item => item.Position).ToArray(),
                     this.m_returns.Values.OrderBy(item => item.Position).ToArray(),
                     flow.Blocks,
-                    flow.Handlers)
-                {
-                    TypeUses = instructions.Where(instruction => this.m_incomingStacks.ContainsKey(instruction.Offset))
-                        .SelectMany(instruction => ReadObservedTypes(instruction).Select(type =>
-                            new BehaviorTypeUse(ReadTypeReference(type), instruction.Offset, instruction.OpCode.Name))).ToArray(),
-                };
-            }
-
-            // 读取指令直接使用或通过反射成员标记暴露的类型，普通传递不算观察类型。
-            private static IEnumerable<Cecil.TypeReference> ReadObservedTypes(Cil.Instruction instruction)
-            {
-                if (instruction.Operand is Cecil.TypeReference type)
-                {
-                    yield return type;
-                }
-                else if (instruction.OpCode == Cil.OpCodes.Ldtoken && instruction.Operand is Cecil.MemberReference member)
-                {
-                    // 字段的类型参数只能来自所属类型；这里保留所属类型的实际构造参数。
-                    yield return member.DeclaringType;
-                    if (member is Cecil.GenericInstanceMethod method)
-                    {
-                        foreach (Cecil.TypeReference argument in method.GenericArguments)
-                        {
-                            yield return argument;
-                        }
-                    }
-                }
+                    flow.Handlers);
             }
 
             // 按托管指令建立控制流块，并保留原始异常处理表。
@@ -535,6 +510,7 @@ namespace SetterChecker.Core
                 OpCode code = instruction.OpCode;
                 object? operand = instruction.Operand;
                 int offset = instruction.Offset;
+                this.m_currentOperandType = operand is Cecil.TypeReference operandType ? ReadTypeReference(operandType) : null;
 
                 if (code == OpCodes.Ret)
                 {
@@ -792,6 +768,7 @@ namespace SetterChecker.Core
             {
                 this.m_writes[offset] = new BehaviorWrite(kind, receiver, member, indices, value, offset)
                 {
+                    OperandType = this.m_currentOperandType,
                     Point = NextPoint(),
                 };
             }
@@ -1101,6 +1078,7 @@ namespace SetterChecker.Core
                 int id = this.m_instructionValueIds.GetValueOrDefault(this.m_currentOffset, this.m_values.Count);
                 BehaviorValue value = new(id, kind, reference ?? type?.Id ?? method?.Name ?? member?.Name, null, inputValueIds)
                 {
+                    OperandType = this.m_currentOperandType,
                     Type = type,
                     Method = method,
                     Member = member,
@@ -1341,6 +1319,9 @@ namespace SetterChecker.Core
         /// <summary>该值已知的结构化类型。</summary>
         public BehaviorTypeReference? Type { get; init; }
 
+        /// <summary>原指令的类型操作数，与 sizeof 等指令的结果类型分开保存。</summary>
+        public BehaviorTypeReference? OperandType { get; init; }
+
         /// <summary>该槽保存托管引用本身；间接写入修改其所指数据，不改变引用槽。</summary>
         public bool IsManagedReferenceSlot { get; init; }
 
@@ -1424,6 +1405,9 @@ namespace SetterChecker.Core
         /// <summary>写入发生的执行位置。</summary>
         public required BehaviorFlowPoint Point { get; init; }
 
+        /// <summary>原写入指令的类型操作数；合成反射写入不伪造此项。</summary>
+        public BehaviorTypeReference? OperandType { get; init; }
+
         // 动态选出的写入仍须满足原成员选择，不将多个候选同时覆盖。
         internal (BehaviorValueReference Input, ValueOrigin Selected)? Selection { get; init; }
     }
@@ -1495,9 +1479,6 @@ namespace SetterChecker.Core
         string LibraryName,
         string EntryPoint);
 
-    /// <summary>保存非调用指令直接使用的类型及其原始位置。</summary>
-    public sealed record BehaviorTypeUse(BehaviorTypeReference Type, int Position, string Operation);
-
     /// <summary>
     /// 保存一个函数的值来源、写入、调用与返回事实。
     /// </summary>
@@ -1525,9 +1506,6 @@ namespace SetterChecker.Core
     {
         /// <summary>当前函数体尚未读出的原始分析失败。</summary>
         public string? Failure { get; init; }
-
-        /// <summary>数组、转换、复制、初始化等指令直接使用的类型。</summary>
-        public IReadOnlyList<BehaviorTypeUse> TypeUses { get; init; } = Array.Empty<BehaviorTypeUse>();
 
         // 建立没有可执行行为的声明或原生函数结果。
         internal static MethodBehavior Empty(

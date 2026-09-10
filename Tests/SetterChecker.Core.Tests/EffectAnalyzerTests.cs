@@ -4,6 +4,172 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 局部值即使确定不变，也不能省略其写入前的真实初始化和正常返回检查。
+        /// <summary>未知初始化之后的局部常量条件不提供 Setter 证明。</summary>
+        [TestMethod]
+        public async Task AnalyzeKeepsInitializationBeforePrivateSlotCondition()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public static class Trigger
+                {
+                    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]
+                    private static extern void Unknown();
+                    static Trigger() { Unknown(); }
+                    public static void Touch() { }
+                }
+                public static class Calls { public static void Entry(Data outside) { int local = 0; Trigger.Touch(); if (local == 0) outside.Value = 1; } }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, requireCompleteCalls: false);
+                foreach (MethodEntry root in roots)
+                {
+                    Assert.Contains("正常返回", Assert.ThrowsExactly<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls)).Message);
+                }
+            }
+        }
+
+        // 未取地址的变量槽可以省去无关写入追查，但真实赋值和所指对象的变化必须保留。
+        /// <summary>源码和 DLL 在单路、四路下核对普通槽与暴露地址槽的不同处理。</summary>
+        [TestMethod]
+        [DataRow("LocalOnly", MethodEffectKind.Getter)]
+        [DataRow("AssignLocal", MethodEffectKind.Setter)]
+        [DataRow("AddressLocal", MethodEffectKind.Setter)]
+        [DataRow("AddressParameter", MethodEffectKind.Setter)]
+        [DataRow("ObjectContents", MethodEffectKind.Setter)]
+        [DataRow("StructContents", MethodEffectKind.Setter)]
+        public async Task AnalyzeSeparatesUnaddressedSlotsFromObjectContents(string entryName, MethodEffectKind expected)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public struct Holder { public Data Target; }
+                public static class Calls
+                {
+                    private static void Empty() { }
+                    private static void Set(Data value) { value.Value = 1; }
+                    private static void Replace(ref Data value, Data outside) { value = outside; }
+                    private static void ReplaceHolder(ref Holder value, Data outside) { value.Target = outside; }
+                    public static void LocalOnly(Data outside) { Data x = new Data(); Empty(); x.Value = 1; }
+                    public static void AssignLocal(Data outside) { Data x = new Data(); Empty(); x = outside; x.Value = 1; }
+                    public static void AddressLocal(Data outside) { Data x = new Data(); Replace(ref x, outside); x.Value = 1; }
+                    public static void AddressParameter(Data input, Data outside) { input = new Data(); Replace(ref input, outside); input.Value = 1; }
+                    public static void ObjectContents(Data outside) { Data x = new Data(); Set(x); if (x.Value == 1) outside.Value = 1; }
+                    public static void StructContents(Data outside) { Holder x = default; ReplaceHolder(ref x, outside); x.Target.Value = 1; }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == entryName).ToArray();
+            Assert.HasCount(2, roots);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs);
+                Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(effect => effect.Kind == expected));
+            }
+        }
+
+        // 引用标量的旧值快照不会随后续写回改变，调用者局部槽写入也不算外部修改。
+        /// <summary>同一 ref 参数写前写后的比较使用各自真实内容。</summary>
+        [TestMethod]
+        [DataRow(false, MethodEffectKind.Getter)]
+        [DataRow(true, MethodEffectKind.Setter)]
+        public async Task AnalyzePreservesScalarReferenceSnapshot(bool unequal, MethodEffectKind expected)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public static class Calls
+                {
+                    private static void Change(ref int value, Data target) { int before = value; value = 1; if (before OP value) target.Value = 1; }
+                    public static void Entry(Data target) { int local = 0; Change(ref local, target); }
+                }
+                """.Replace("OP", unequal ? "!=" : "=="));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 4);
+            Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(effect => effect.Kind == expected));
+        }
+
+        // 参数重绑只改变指针槽，旧地址、结构体自身和输出参数仍指向各自的真实存储。
+        /// <summary>源码和真实 DLL 对照验证入口存储身份与条件分支。</summary>
+        [TestMethod]
+        [DataRow("ScalarNever", MethodEffectKind.Getter)]
+        [DataRow("ScalarWrite", MethodEffectKind.Setter)]
+        [DataRow("OutInitialized", MethodEffectKind.Setter)]
+        [DataRow("RebindFresh", MethodEffectKind.Getter)]
+        [DataRow("CapturedAddress", MethodEffectKind.Setter)]
+        [DataRow("StructThis", MethodEffectKind.Setter)]
+        [DataRow("StructThisNull", MethodEffectKind.Getter)]
+        [DataRow("RefObjectNull", MethodEffectKind.Getter)]
+        [DataRow("RefObjectWrite", MethodEffectKind.Setter)]
+        public async Task AnalyzePreservesRootStorageRole(string entryName, MethodEffectKind expected)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public struct Holder
+                {
+                    public Data Target;
+                    public void StructThis() { if (Target != null) Target.Value = 1; }
+                    public void StructThisNull() { if (Target == null) Target.Value = 1; }
+                }
+                public static class Calls
+                {
+                    public static void ScalarNever(ref int value, Data target) { if (value != value) target.Value = 1; }
+                    public static void ScalarWrite(ref int value, Data target) { if (value == 1) target.Value = 1; }
+                    public static void OutInitialized(out Holder value) { value = default; value.Target = new Data(); value.Target.Value = 1; }
+                    public static void RebindFresh(ref Holder value) { Holder[] local = new Holder[1]; local[0].Target = new Data(); value = ref local[0]; value.Target.Value = 1; }
+                    public static void CapturedAddress(ref Holder value)
+                    {
+                        ref Holder captured = ref value; Holder[] local = new Holder[1]; local[0].Target = new Data();
+                        value = ref local[0]; if (captured.Target != null) captured.Target.Value = 1;
+                    }
+                    public static void RefObjectNull(ref Data value) { if (value == null) value.Value = 1; }
+                    public static void RefObjectWrite(ref Data value) { if (value != null) value.Value = 1; }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls" || type.Name == "Holder")
+                .SelectMany(catalog.GetMethods).Where(method => method.Name == entryName).ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 4);
+            foreach (MethodEntry root in roots)
+            {
+                Assert.AreEqual(expected, new EffectAnalyzer().Analyze(catalog, new[] { root }, calls).Methods.Single().Kind, root.Id);
+            }
+        }
+
+        // 引用结构体的成员读取必须使用真实入口存储，不能把内部地址编号当作指令下标。
+        /// <summary>源码和真实 DLL 的 ref 结构体引用字段在空值条件下仍正确判定。</summary>
+        [TestMethod]
+        [DataRow(false, MethodEffectKind.Setter)]
+        [DataRow(true, MethodEffectKind.Getter)]
+        public async Task AnalyzeReadsRootRefStructField(bool nullBranch, MethodEffectKind expected)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public struct Holder { public Data Target; }
+                public static class Calls { public static void Entry(ref Holder value) { if (value.Target OP null) value.Target.Value = 1; } }
+                """.Replace("OP", nullBranch ? "==" : "!="));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 4);
+            Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(effect => effect.Kind == expected));
+        }
+
         // 嵌套结构体入口的引用字段不能因为取了局部地址就被当成新对象。
         /// <summary>未闭合的入口成员路径必须保留失败证据，不能发布 Getter。</summary>
         [TestMethod]

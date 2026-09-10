@@ -204,25 +204,51 @@ namespace SetterChecker.Core.Tests
             File.AppendAllLines(project.RootResponsePath, new[] { "-unsafe+" }, new System.Text.UTF8Encoding(false));
             AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
             Assert.IsFalse(run.Complete);
-            Assert.Contains("分支或对象来源仍缺少调用结果", run.Annotations.Methods.Single(method => method.Name == "Entry").Failure!);
+            Assert.Contains("间接访问的实际存储尚未闭合", run.Annotations.Methods.Single(method => method.Name == "Entry").Failure!);
             Assert.IsNull(run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
         }
 
-        // 后续指针条件缺少证明，不应抹掉进入该循环前已经发生的静态修改。
-        /// <summary>独立写入证明按真实先后顺序保留，条件之后的写入仍需闭合条件。</summary>
+        // 可以不进入指针循环时仍能证明随后写入，必须执行一次时不能绕过指针读取。
+        /// <summary>分别保留循环前写入和零次循环路径的写入见证。</summary>
         [TestMethod]
-        [DataRow(false)]
-        [DataRow(true)]
-        public async Task RunKeepsWritesBeforeUnclosedPointerCondition(bool writeFirst)
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public async Task RunKeepsWritesBeforeUnclosedPointerCondition(bool writeFirst, bool mandatory)
         {
             using TestProject project = TestProject.CreateSingleAssembly();
             project.WriteRootSource("public static class Calls { private static int state; public static unsafe void Entry(int* pointer, int count) { "
-                + (writeFirst ? "state = 1; " : string.Empty) + "while (count-- > 0) (*pointer)++; "
+                + (writeFirst ? "state = 1; " : string.Empty)
+                + (mandatory ? "do { (*pointer)++; } while (count-- > 0); " : "while (count-- > 0) (*pointer)++; ")
                 + (writeFirst ? string.Empty : "state = 1;") + " } }");
             File.AppendAllLines(project.RootResponsePath, new[] { "-unsafe+" }, new System.Text.UTF8Encoding(false));
             AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
-            Assert.AreEqual(writeFirst ? MethodEffectKind.Setter : (MethodEffectKind?)null,
+            Assert.AreEqual(writeFirst || !mandatory ? MethodEffectKind.Setter : (MethodEffectKind?)null,
                 run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+        }
+
+        // 原生指针取得字段地址后仍是未表示的存储，另一条绕过访问的分支可独立作证。
+        /// <summary>地址包装不能证明原生访问可执行，也不能抹掉真正绕过它的路径。</summary>
+        [TestMethod]
+        [DataRow("ref int slot = ref pointer->Value; do { slot++; } while (count-- > 0); state = 1;", false)]
+        [DataRow("state = 1; ref int slot = ref pointer->Value; do { slot++; } while (count-- > 0);", true)]
+        [DataRow("if (flag) { ref int slot = ref pointer->Value; slot++; } state = 1;", true)]
+        [DataRow("if (flag) (*other)++; state = 1;", true)]
+        public async Task RunChecksNativeAddressWrappersOnTheirActualPath(string body, bool setter)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("public struct Cell { public int Value; } public static class Calls { private static int state; "
+                + "public static unsafe void Entry(Cell* pointer, int* other, int count, bool flag) { " + body + " } }");
+            File.AppendAllLines(project.RootResponsePath, new[] { "-unsafe+" }, new System.Text.UTF8Encoding(false));
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            AnnotationMethod method = run.Annotations.Methods.Single(method => method.Name == "Entry");
+            Assert.AreEqual(setter ? MethodEffectKind.Setter : (MethodEffectKind?)null, method.Actual);
+            if (!setter)
+            {
+                Assert.IsFalse(run.Complete);
+                Assert.Contains("间接访问的实际存储尚未闭合", method.Failure!);
+            }
         }
 
         // 空委托和空接口接收对象都无法正常进入后续写入。

@@ -157,7 +157,7 @@ namespace SetterChecker.Core
                             {
                                 yield break;
                             }
-                            failure = "单次经过循环未取得静态写入见证，不能据此排除其它迭代";
+                            failure = pathProof.MemoryFailure ?? "单次经过循环未取得静态写入见证，不能据此排除其它迭代";
                         }
                     }
                     catch (AnalysisException exception)
@@ -298,8 +298,8 @@ namespace SetterChecker.Core
                 try
                 {
                     origins = resolution.ValueSources.GetRelativeOrigins(current, instanceId, retainTypeChecks: true);
-                    if (witness.HasValue && (witness.Value.Write.Selection != null || hasPathConditions && origins.Any(origin => origin.Value.Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance
-                            && !origin.Value.IsManagedReferenceSlot)
+                    if (witness.HasValue && (witness.Value.Write.Selection != null || witness.Value.Write.Kind == BehaviorWriteKind.Indirect && !resolution.ValueSources.IsManagedAddress(witness.Value.Receiver)
+                        || hasPathConditions && origins.Any(origin => origin.Value.Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance)
                         || origins.Any(origin => origin.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray or BehaviorValueKind.Local or BehaviorValueKind.Constant)
                             && origins.Any(origin => origin.Value.Kind is not (BehaviorValueKind.NewObject or BehaviorValueKind.NewArray or BehaviorValueKind.Local or BehaviorValueKind.Constant))))
                     {
@@ -363,7 +363,7 @@ namespace SetterChecker.Core
             }
             if (!complete && !publishedSubject)
             {
-                yield return new WriteSubject(reference, "单次经过循环未取得旧对象写入见证，不能据此排除其它迭代", witness);
+                yield return new WriteSubject(reference, pathProof.MemoryFailure ?? "单次经过循环未取得旧对象写入见证，不能据此排除其它迭代", witness);
             }
         }
 
