@@ -6,6 +6,41 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class ReportWriterTests
     {
+        // 委托含一个纯目标和一个未知参数时，未知支路不能在合并后消失。
+        /// <summary>按旧审计原样混合方法组与参数，仍保留待分析且不给标签建议。</summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public async Task RunKeepsUnknownBranchBesidePureDelegate(bool reverse, bool compilerCache)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("""
+                public static class Calls
+                {
+                    private static void Pure() { }
+                    public static void Entry(bool flag, System.Action unknown)
+                    {
+                        System.Action action = EXPRESSION;
+                        action();
+                    }
+                }
+                """.Replace("EXPRESSION", (reverse ? "flag ? unknown : PURE" : "flag ? PURE : unknown")
+                .Replace("PURE", compilerCache ? "Pure" : "new System.Action(Pure)")));
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            AnnotationMethod entry = run.Annotations.Methods.Single(method => method.Name == "Entry");
+            Assert.IsFalse(run.Complete);
+            Assert.AreEqual(compilerCache ? MethodEffectKind.Setter : (MethodEffectKind?)null, entry.Actual);
+            Assert.AreEqual(compilerCache ? "ShouldTrack" : null, entry.Decision);
+            if (compilerCache)
+            {
+                Assert.AreEqual("<0>__Pure", entry.Evidence!.Detail);
+            }
+            Assert.IsFalse(entry.SuggestNoLogTrack);
+            Assert.IsTrue(run.Calls!.PendingCalls.Any(call => call.CallerMethodId == entry.Id && call.Call.Kind == BehaviorCallKind.Delegate));
+        }
+
         // 未读取条件函数时，进度报告不能先把稍后会被排除的写入报成确定 Setter。
         /// <summary>写入路径与接收对象来源都必须等待条件真实结果。</summary>
         [TestMethod]

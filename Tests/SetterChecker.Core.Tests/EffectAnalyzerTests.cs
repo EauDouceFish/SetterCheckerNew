@@ -4,6 +4,44 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 显式创建委托排除自动缓存，锁定旧审计命名实参和空可写语法的效果。
+        /// <summary>源码与真实 DLL 共用正式参数槽，空 ref 和空属性 setter 不产生写入。</summary>
+        [TestMethod]
+        [DataRow("NamedOld", MethodEffectKind.Setter)]
+        [DataRow("NamedFresh", MethodEffectKind.Getter)]
+        [DataRow("EmptyRef", MethodEffectKind.Getter)]
+        [DataRow("EmptyProperty", MethodEffectKind.Getter)]
+        public async Task AnalyzeMatchesLegacyArgumentAndEmptyWriteCases(string name, MethodEffectKind expected)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Box
+                {
+                    public int Value;
+                    public int Ignored { set { } }
+                }
+                public delegate void Callback(Box x, Box y);
+                public static class Calls
+                {
+                    private static int field;
+                    private static void Change(Box x, Box y) { x.Value = 1; }
+                    private static void Read(ref int value) { }
+                    public static void NamedOld(Box outside) { Callback d = new Callback(Change); d(y: new Box(), x: outside); }
+                    public static void NamedFresh(Box outside) { Callback d = new Callback(Change); d(y: outside, x: new Box()); }
+                    public static void EmptyRef() { Read(ref field); }
+                    public static void EmptyProperty(Box outside) { outside.Ignored = 1; }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == name).ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 4);
+            EffectAnalysisResult effects = new EffectAnalyzer().Analyze(catalog, roots, calls);
+            Assert.HasCount(2, effects.Methods);
+            Assert.IsTrue(effects.Methods.All(method => method.Kind == expected));
+        }
+
         // 一个根排除递归回边后，另一个根的同名递归仍不能借用它的返回证明。
         /// <summary>延迟条件先形成回边，再触发入口重查；只允许真实返回的根证明后序写入。</summary>
         [TestMethod]
