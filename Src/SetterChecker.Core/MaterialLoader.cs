@@ -148,7 +148,6 @@ namespace SetterChecker.Core
 
             return new MaterialSet(
                 projectRoot,
-                reportRoot,
                 sourceAssemblies,
                 external.Assemblies,
                 external.LookupPaths,
@@ -550,19 +549,15 @@ namespace SetterChecker.Core
                         .ToHashSet(StringComparer.OrdinalIgnoreCase)
                     : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            AddCandidate(
-                candidates,
-                Path.Combine(directory.FullName, $"{identity.Name}.dll"),
-                identity,
-                unityRuntime);
-            if (string.Equals(directory.Name, "Facades", StringComparison.OrdinalIgnoreCase)
-                && directory.Parent != null)
+            DirectoryInfo[] directories = string.Equals(directory.Name, "Facades", StringComparison.OrdinalIgnoreCase) && directory.Parent != null
+                ? new[] { directory, directory.Parent } : new[] { directory };
+            foreach (DirectoryInfo candidateDirectory in directories)
             {
-                AddCandidate(
-                    candidates,
-                    Path.Combine(directory.Parent.FullName, $"{identity.Name}.dll"),
-                    identity,
-                    unityRuntime);
+                string path = Path.Combine(candidateDirectory.FullName, $"{identity.Name}.dll");
+                if (File.Exists(path) && MatchesIdentity(path, identity, unityRuntime))
+                {
+                    candidates.Add(Path.GetFullPath(path));
+                }
             }
 
             if (unityRuntime != null)
@@ -598,19 +593,6 @@ namespace SetterChecker.Core
                         .Order(StringComparer.OrdinalIgnoreCase)
                         .ToArray(),
                     StringComparer.OrdinalIgnoreCase);
-        }
-
-        // 在候选文件存在时加入目标集合。
-        private static void AddCandidate(
-            ISet<string> candidates,
-            string path,
-            AssemblyName identity,
-            UnityRuntimeSelection? unityRuntime)
-        {
-            if (File.Exists(path) && MatchesIdentity(path, identity, unityRuntime))
-            {
-                candidates.Add(Path.GetFullPath(path));
-            }
         }
 
         // 检查候选文件是否符合类型转交记录中的完整程序集身份。
@@ -953,12 +935,9 @@ namespace SetterChecker.Core
                 .Where(node => node.GetProperty("Annotation").GetString()!.StartsWith("Csc ", StringComparison.Ordinal))
                 .Select(node => new
                 {
-                    Inputs = node.GetProperty("Inputs").EnumerateArray().Select(value => ResolvePath(projectRoot, value.GetString()!)).ToArray(),
                     Outputs = node.GetProperty("Outputs").EnumerateArray().Select(value => ResolvePath(projectRoot, value.GetString()!)).ToArray(),
-                }).Select(node => new
-                {
-                    node.Outputs,
-                    Response = node.Inputs.Single(path => path.EndsWith(".rsp", StringComparison.OrdinalIgnoreCase)),
+                    Response = node.GetProperty("Inputs").EnumerateArray().Select(value => ResolvePath(projectRoot, value.GetString()!))
+                        .Single(path => path.EndsWith(".rsp", StringComparison.OrdinalIgnoreCase)),
                 }).ToArray();
             if (!nodes.Any(node => string.Equals(node.Response, rootResponsePath, StringComparison.OrdinalIgnoreCase)))
             {

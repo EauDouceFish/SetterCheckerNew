@@ -1,3 +1,5 @@
+using Microsoft.CodeAnalysis;
+
 namespace SetterChecker.Core.Tests
 {
     /// <summary>
@@ -258,7 +260,7 @@ namespace SetterChecker.Core.Tests
             foreach (MethodBehavior body in result.Methods)
             {
                 var uses = body.Values.Where(value => value.OperandType != null).Select(value => (Type: value.OperandType!, Position: value.Point!.Value.BlockId))
-                    .Concat(body.Writes.Where(write => write.OperandType != null).Select(write => (Type: write.OperandType!, write.Position)))
+                    .Concat(body.Writes.Where(write => write.OperandType != null).Select(write => (Type: write.OperandType!, Position: write.Point.BlockId)))
                     .DistinctBy(use => use.Position).ToArray();
                 Assert.HasCount(expectedCount, uses);
                 foreach (var use in uses)
@@ -458,6 +460,38 @@ namespace SetterChecker.Core.Tests
             StringAssert.Contains(exception.Message, "ForwardTarget");
             StringAssert.Contains(exception.Message, "Version=0.0.0.0");
             StringAssert.Contains(exception.Message, project.ExternalAssemblyPath);
+        }
+
+        // 函数指针调用仍由实际指令读取报告未支持，不能变成一个没有目标的成功调用。
+        /// <summary>构造真实 calli 指令并通过行为读取的公开结果检查失败位置。</summary>
+        [TestMethod]
+        public async Task ReadAsyncKeepsUnsupportedFunctionPointerInstruction()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Calls { public static void Entry() { Target(); } private static void Target() { } }
+                """);
+            using (Mono.Cecil.ModuleDefinition module = Mono.Cecil.ModuleDefinition.ReadModule(project.ExternalAssemblyPath,
+                       new Mono.Cecil.ReaderParameters { InMemory = true }))
+            {
+                Mono.Cecil.TypeDefinition type = module.Types.Single(type => type.FullName == "ExternalSamples.Calls");
+                Mono.Cecil.MethodDefinition method = type.Methods.Single(method => method.Name == "Entry");
+                method.Body.Instructions.Clear();
+                method.Body.Instructions.Add(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Ldftn,
+                    type.Methods.Single(method => method.Name == "Target")));
+                method.Body.Instructions.Add(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Calli,
+                    new Mono.Cecil.CallSite(module.TypeSystem.Void)));
+                method.Body.Instructions.Add(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Ret));
+                module.Write(project.ExternalAssemblyPath);
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry target = catalog.Types.Where(type => type.AssemblyPath == project.ExternalAssemblyPath && type.Name == "Calls")
+                .SelectMany(catalog.GetMethods).Single(method => method.Name == "Entry");
+            AnalysisException failure = await Assert.ThrowsAsync<AnalysisException>(() =>
+                new BehaviorReader().ReadAsync(material, catalog, new[] { target }, 2));
+            StringAssert.Contains(failure.Message, target.Id);
+            StringAssert.Contains(failure.Message, "calli");
         }
 
         // 检查未实现的托管指令不会因固定栈数量而被当作普通计算。
@@ -925,8 +959,8 @@ namespace SetterChecker.Core.Tests
                 if (method.Name == "UseBox")
                 {
                     BehaviorWrite write = behavior.Writes.Single();
-                    Assert.AreEqual("System.Int32", write.Member!.FieldTypeId);
-                    Assert.AreEqual(write.Member.DeclaringTypeDefinitionId + "<System.Int32>", write.Member.DeclaringTypeIdentity.Text);
+                    Assert.AreEqual("System.Int32", catalog.ReadResolvedFieldType(write.Member!).Text);
+                    Assert.AreEqual(write.Member!.DeclaringTypeDefinitionId + "<System.Int32>", write.Member.DeclaringTypeIdentity.Text);
                     BehaviorMethodReference target = behavior.Calls.Single().Target;
                     CollectionAssert.AreEqual(
                         new[] { "System.Int32" },
@@ -1050,7 +1084,7 @@ namespace SetterChecker.Core.Tests
                 BehaviorArgument argument = call.Arguments[0];
                 BehaviorValue address = behavior.Values[argument.ValueId];
 
-                Assert.AreEqual(CatalogRefKind.Ref, argument.RefKind);
+                Assert.AreEqual(RefKind.Ref, argument.RefKind);
                 Assert.AreEqual(BehaviorValueKind.Address, address.Kind);
                 if (method.Name == "PassFieldByReference")
                 {
@@ -1369,7 +1403,7 @@ namespace SetterChecker.Core.Tests
                     call.ResultValueId.Value,
                     new HashSet<int>()));
 
-            Assert.IsTrue(inputCall.Position <= resultCall.Position);
+            Assert.IsTrue(inputCall.Point.BlockId <= resultCall.Point.BlockId);
             Assert.IsNotNull(inputCall.ReceiverValueId);
             Assert.IsNotNull(resultCall.ReceiverValueId);
             BehaviorValue inputReceiver = behavior.Values.Single(value => value.Id == inputCall.ReceiverValueId);
@@ -1609,7 +1643,7 @@ namespace SetterChecker.Core.Tests
                     .ToArray();
                 BehaviorValue[] closureReads = inner.Values.Where(value =>
                         value.Kind == BehaviorValueKind.FieldRead
-                        && closureWrites.Any(item => SameMember(item.Member!, value.Member!)))
+                        && closureWrites.Any(item => SameMember(catalog, item.Member!, value.Member!)))
                     .ToArray();
                 BehaviorWrite businessWrite = inner.Writes.Single(item =>
                     item.Member?.Name == "m_value");
@@ -1670,7 +1704,7 @@ namespace SetterChecker.Core.Tests
                     call.ReceiverValueId!.Value,
                     parameter);
                 BehaviorArgument output = call.Arguments.Single(argument =>
-                    argument.RefKind == CatalogRefKind.Out);
+                    argument.RefKind == RefKind.Out);
                 Assert.AreEqual(
                     BehaviorValueKind.Address,
                     behavior.Values[output.ValueId].Kind);
@@ -1792,7 +1826,7 @@ namespace SetterChecker.Core.Tests
                 Assert.AreEqual(before.InputValueIds.Single(), after.InputValueIds.Single());
                 Assert.AreEqual(BehaviorValueKind.Address, address.Kind, behavior.MethodId);
                 Assert.AreEqual(before.InputValueIds.Single(), address.InputValueIds.Single());
-                Assert.AreEqual(CatalogRefKind.Out, replace.Arguments.Single().RefKind);
+                Assert.AreEqual(RefKind.Out, replace.Arguments.Single().RefKind);
             }
         }
 
@@ -1863,10 +1897,10 @@ namespace SetterChecker.Core.Tests
                                 == function.Method!.DeclaringTypeDefinitionId)
                         .GroupBy(write =>
                             $"{write.Member!.DeclaringTypeDefinitionId}|{write.Member.Name}|"
-                                + write.Member.FieldTypeId,
+                                + catalog.ReadResolvedFieldType(write.Member).Text,
                             StringComparer.Ordinal)
                         .Single(group => group.Count() == 2);
-                BehaviorWrite[] writes = capturedField.OrderBy(write => write.Position).ToArray();
+                BehaviorWrite[] writes = capturedField.OrderBy(write => write.Point.BlockId).ToArray();
                 BehaviorCall constructor = outer.Calls.Single(call =>
                     call.Kind == BehaviorCallKind.ObjectCreation
                     && call.Arguments.Any(argument =>
@@ -1877,14 +1911,14 @@ namespace SetterChecker.Core.Tests
                             new HashSet<int>())));
                 BehaviorValue capturedRead = inner.Values.Single(value =>
                     value.Kind == BehaviorValueKind.FieldRead
-                    && SameMember(value.Member!, writes[0].Member!));
+                    && SameMember(catalog, value.Member!, writes[0].Member!));
                 BehaviorCall observation = inner.Calls.Single(call =>
                     call.Target.Name == "Observe");
 
                 AssertReachesAtPoint(outer, writes[0].ValueId, external.Id);
                 AssertReachesAtPoint(outer, writes[1].ValueId, created.Id);
-                Assert.IsTrue(writes[0].Position < constructor.Position);
-                Assert.IsTrue(constructor.Position < writes[1].Position);
+                Assert.IsTrue(writes[0].Point.BlockId < constructor.Point.BlockId);
+                Assert.IsTrue(constructor.Point.BlockId < writes[1].Point.BlockId);
                 AssertValueFlowsFrom(
                     inner,
                     observation.Arguments.Single().ValueId,
@@ -2244,7 +2278,7 @@ namespace SetterChecker.Core.Tests
                 .ToArray();
             MethodEntry sourceConstructor = catalog.Methods.Single(method =>
                 method.TypeName == "SourceSamples.Box<T>"
-                && method.Kind == CatalogMethodKind.Constructor);
+                && method.Kind == MethodKind.Constructor);
             TypeEntry managedBehaviorType = catalog.Types.Single(type =>
                 type.AssemblyPath == project.ExternalAssemblyPath
                 && type.FullName == "ExternalSamples.BehaviorSample");
@@ -2256,7 +2290,7 @@ namespace SetterChecker.Core.Tests
                 .OrderBy(method => method.Name, StringComparer.Ordinal)
                 .ToArray();
             MethodEntry managedConstructor = catalog.GetMethods(managedBoxType).Single(method =>
-                method.Kind == CatalogMethodKind.Constructor);
+                method.Kind == MethodKind.Constructor);
 
             MethodEntry[] methods = sourceAccessors
                 .Append(sourceConstructor)
@@ -2532,15 +2566,15 @@ namespace SetterChecker.Core.Tests
             foreach (MethodBehavior behavior in pairs["CatchInsideFinally"])
             {
                 BehaviorFlowEdge thrown = behavior.Blocks.SelectMany(block => block.Successors)
-                    .Single(edge => edge.Semantics == BehaviorFlowBranchSemantics.Throw);
+                    .Single(edge => edge.Semantics == Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics.Throw);
                 Assert.IsEmpty(thrown.FinallyBlockIds, behavior.MethodId);
                 BehaviorCall caught = behavior.Calls.Single(call => call.Target.Name == "Apply");
                 BehaviorCall final = behavior.Calls.Single(call => call.Target.Name == "WriteStatic");
                 BehaviorExceptionHandler catchRegion = behavior.ExceptionHandlers.Single(region =>
-                    region.Kind == BehaviorExceptionHandlerKind.Catch
+                    region.Kind == Mono.Cecil.Cil.ExceptionHandlerType.Catch
                     && ContainsBlock(region, caught.Point.BlockId));
                 BehaviorExceptionHandler finallyRegion = behavior.ExceptionHandlers.Single(region =>
-                    region.Kind == BehaviorExceptionHandlerKind.Finally
+                    region.Kind == Mono.Cecil.Cil.ExceptionHandlerType.Finally
                     && ContainsBlock(region, final.Point.BlockId));
                 Assert.IsTrue(catchRegion.TryStartBlockId < catchRegion.TryEndBlockId);
                 Assert.IsTrue(finallyRegion.TryStartBlockId <= catchRegion.HandlerStartBlockId
@@ -2575,10 +2609,10 @@ namespace SetterChecker.Core.Tests
                     .OrderBy(call => behavior.Values[call.Arguments.Single().ValueId].Reference)
                     .ToArray();
                 BehaviorExceptionHandler inner = behavior.ExceptionHandlers.Single(region =>
-                    region.Kind == BehaviorExceptionHandlerKind.Finally
+                    region.Kind == Mono.Cecil.Cil.ExceptionHandlerType.Finally
                     && ContainsBlock(region, writes[0].Point.BlockId));
                 BehaviorExceptionHandler outer = behavior.ExceptionHandlers.Single(region =>
-                    region.Kind == BehaviorExceptionHandlerKind.Finally
+                    region.Kind == Mono.Cecil.Cil.ExceptionHandlerType.Finally
                     && ContainsBlock(region, writes[1].Point.BlockId));
                 (BehaviorFlowBlock Block, BehaviorFlowEdge Edge) innerExit = behavior.Blocks
                     .SelectMany(block => block.Successors.Select(edge => (block, edge)))
@@ -2797,12 +2831,13 @@ namespace SetterChecker.Core.Tests
 
         // 比较跨函数行为中的同一个结构化字段身份。
         private static bool SameMember(
+            MethodCatalogResult catalog,
             BehaviorMemberReference first,
             BehaviorMemberReference second)
         {
             return first.DeclaringTypeDefinitionId == second.DeclaringTypeDefinitionId
                 && first.Name == second.Name
-                && first.FieldTypeId == second.FieldTypeId;
+                && catalog.ReadResolvedFieldType(first) == catalog.ReadResolvedFieldType(second);
         }
 
         // 核对一条字段写入事实中的当前对象和第一个参数来源。

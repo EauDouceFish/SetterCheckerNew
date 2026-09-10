@@ -21,7 +21,7 @@ namespace SetterChecker.Core
             int conflicts = methods.Count(method => method.Failure == "NoLogTrack 与 LogTrack 冲突");
             int unproved = methods.Count(method => method.Decision == null) - conflicts;
             var pending = (run.Calls?.PendingCalls ?? Array.Empty<PendingCall>()).GroupBy(call => new
-            { call.CallerMethodId, call.Call.Position, call.Failure, Target = call.Call.Target.Identity.Text })
+            { call.CallerMethodId, Position = call.Call.Point.BlockId, call.Failure, Target = call.Call.Target.Identity.Text })
                 .Select(group => new { group.Key.CallerMethodId, group.Key.Position, group.Key.Failure, group.Key.Target, Count = group.Count() }).ToArray();
             var proved = run.Annotations.Methods.Where(method => method.Actual != null && method.Decision != null).Select(method => method.Id).ToHashSet(StringComparer.Ordinal);
             var native = (run.Calls?.Calls ?? Array.Empty<ResolvedCall>()).SelectMany(call => call.Targets.Where(target =>

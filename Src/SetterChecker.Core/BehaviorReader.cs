@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using Microsoft.CodeAnalysis;
 using Cecil = Mono.Cecil;
 using Cil = Mono.Cecil.Cil;
 using OpCode = Mono.Cecil.Cil.OpCode;
@@ -130,9 +131,7 @@ namespace SetterChecker.Core
             MethodCatalogResult catalog,
             MethodEntry method)
         {
-            Cecil.IMetadataTokenProvider? provider = module.LookupToken(
-                new Cecil.MetadataToken((uint)method.MetadataToken));
-            if (provider is not Cecil.MethodDefinition definition)
+            if (module.LookupToken(method.MetadataToken) is not Cecil.MethodDefinition definition)
             {
                 throw new AnalysisException($"托管函数标记不是函数定义：{method.Id}");
             }
@@ -304,10 +303,10 @@ namespace SetterChecker.Core
                     this.m_method.Id,
                     MethodBodyKind.Executable,
                     this.m_values,
-                    this.m_assignments.Values.OrderBy(item => item.Position).ToArray(),
-                    this.m_writes.Values.OrderBy(item => item.Position).ToArray(),
-                    this.m_calls.Values.OrderBy(item => item.Position).ToArray(),
-                    this.m_returns.Values.OrderBy(item => item.Position).ToArray(),
+                    this.m_assignments.Values.OrderBy(item => item.Point.BlockId).ToArray(),
+                    this.m_writes.Values.OrderBy(item => item.Point.BlockId).ToArray(),
+                    this.m_calls.Values.OrderBy(item => item.Point.BlockId).ToArray(),
+                    this.m_returns.Values.OrderBy(item => item.Point.BlockId).ToArray(),
                     flow.Blocks,
                     flow.Handlers);
             }
@@ -320,14 +319,9 @@ namespace SetterChecker.Core
             {
                 BehaviorExceptionHandler[] handlers = body.ExceptionHandlers.Select(handler =>
                     new BehaviorExceptionHandler(
-                        handler.HandlerType switch
-                        {
-                            Cil.ExceptionHandlerType.Catch => BehaviorExceptionHandlerKind.Catch,
-                            Cil.ExceptionHandlerType.Filter => BehaviorExceptionHandlerKind.Filter,
-                            Cil.ExceptionHandlerType.Finally => BehaviorExceptionHandlerKind.Finally,
-                            Cil.ExceptionHandlerType.Fault => BehaviorExceptionHandlerKind.Fault,
-                            _ => throw new AnalysisException($"不支持的 Cecil 异常处理类型：{handler.HandlerType}"),
-                        },
+                        handler.HandlerType is Cil.ExceptionHandlerType.Catch or Cil.ExceptionHandlerType.Filter
+                            or Cil.ExceptionHandlerType.Finally or Cil.ExceptionHandlerType.Fault ? handler.HandlerType
+                            : throw new AnalysisException($"不支持的 Cecil 异常处理类型：{handler.HandlerType}"),
                         handler.TryStart.Offset,
                         handler.TryEnd?.Offset ?? body.CodeSize,
                         handler.HandlerStart.Offset,
@@ -345,7 +339,7 @@ namespace SetterChecker.Core
                         instruction.Operand is Cil.Instruction[] targets ? targets.Select(target => target.Offset).ToArray() : null)).ToArray();
                 int entryTarget = body.Instructions.Count == 0 ? body.CodeSize : body.Instructions[0].Offset;
                 BehaviorFlowBlock entry = new(-1, true,
-                    new[] { new BehaviorFlowEdge(entryTarget, BehaviorFlowBranchSemantics.Regular, Array.Empty<int>()) });
+                    new[] { new BehaviorFlowEdge(entryTarget, Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics.Regular, Array.Empty<int>()) });
                 bool exitReachable = instructionBlocks.Length == 0 || instructionBlocks.Any(block =>
                     block.IsReachable && block.Successors.Any(edge => edge.TargetBlockId == body.CodeSize));
                 BehaviorFlowBlock exit = new(body.CodeSize, exitReachable, Array.Empty<BehaviorFlowEdge>());
@@ -360,11 +354,11 @@ namespace SetterChecker.Core
                 IReadOnlyList<BehaviorExceptionHandler> handlers)
             {
                 // 按真实半开区间计算离开路径，嵌套 finally 从内到外执行。
-                BehaviorFlowEdge Edge(int? target, BehaviorFlowBranchSemantics semantics,
+                BehaviorFlowEdge Edge(int? target, Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics semantics,
                     bool runsFinally = false)
                 {
                     int[] finalizers = runsFinally && target.HasValue
-                        ? handlers.Where(handler => handler.Kind == BehaviorExceptionHandlerKind.Finally
+                        ? handlers.Where(handler => handler.Kind == Mono.Cecil.Cil.ExceptionHandlerType.Finally
                             && instruction.Offset >= handler.TryStartBlockId && instruction.Offset < handler.TryEndBlockId
                             && (target.Value < handler.TryStartBlockId || target.Value >= handler.TryEndBlockId))
                             .OrderBy(handler => handler.TryEndBlockId - handler.TryStartBlockId)
@@ -376,25 +370,25 @@ namespace SetterChecker.Core
 
                 if (instruction.OpCode.Code == Cil.Code.Ret)
                 {
-                    return new[] { Edge(exitBlockId, BehaviorFlowBranchSemantics.Return) };
+                    return new[] { Edge(exitBlockId, Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics.Return) };
                 }
                 if (instruction.OpCode.Code is Cil.Code.Throw or Cil.Code.Rethrow)
                 {
                     return new[] { Edge(null, instruction.OpCode.Code == Cil.Code.Throw
-                        ? BehaviorFlowBranchSemantics.Throw : BehaviorFlowBranchSemantics.Rethrow) };
+                        ? Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics.Throw : Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics.Rethrow) };
                 }
                 if (instruction.OpCode.Code == Cil.Code.Endfinally)
                 {
-                    return new[] { Edge(null, BehaviorFlowBranchSemantics.StructuredExceptionHandling) };
+                    return new[] { Edge(null, Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics.StructuredExceptionHandling) };
                 }
                 if (instruction.OpCode.Code == Cil.Code.Endfilter)
                 {
-                    BehaviorExceptionHandler handler = handlers.Single(item => item.Kind == BehaviorExceptionHandlerKind.Filter
+                    BehaviorExceptionHandler handler = handlers.Single(item => item.Kind == Mono.Cecil.Cil.ExceptionHandlerType.Filter
                         && instruction.Offset >= item.FilterStartBlockId && instruction.Offset < item.HandlerStartBlockId);
                     return new[]
                     {
-                        Edge(handler.HandlerStartBlockId, BehaviorFlowBranchSemantics.Regular),
-                        Edge(null, BehaviorFlowBranchSemantics.StructuredExceptionHandling),
+                        Edge(handler.HandlerStartBlockId, Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics.Regular),
+                        Edge(null, Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics.StructuredExceptionHandling),
                     };
                 }
 
@@ -406,7 +400,7 @@ namespace SetterChecker.Core
                     _ => instruction.Next == null ? Array.Empty<int>() : new[] { instruction.Next.Offset },
                 };
                 return targets.Distinct().Order().Select(target => Edge(target,
-                    BehaviorFlowBranchSemantics.Regular, instruction.OpCode.Code == Cil.Code.Leave)).ToArray();
+                    Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics.Regular, instruction.OpCode.Code == Cil.Code.Leave)).ToArray();
             }
 
             // 返回当前指令完成后可能继续执行的全部下一条指令。
@@ -511,10 +505,7 @@ namespace SetterChecker.Core
                 {
                     this.m_returns[offset] = new BehaviorReturn(
                         this.m_stack.Count == 0 ? null : this.m_stack.Pop(),
-                        offset)
-                    {
-                        Point = NextPoint(),
-                    };
+                        NextPoint());
 
                     return;
                 }
@@ -528,10 +519,7 @@ namespace SetterChecker.Core
                     int slotId = argument ? GetArgumentValueId(index) : GetLocalValueId(index);
                     if (code.Code is Cil.Code.Starg or Cil.Code.Stloc)
                     {
-                        this.m_assignments[offset] = new BehaviorAssignment(slotId, Pop(code, offset), offset)
-                        {
-                            Point = NextPoint(),
-                        };
+                        this.m_assignments[offset] = new BehaviorAssignment(slotId, Pop(code, offset), NextPoint());
                     }
                     else if (code.Code is Cil.Code.Ldarga or Cil.Code.Ldloca)
                     {
@@ -664,7 +652,12 @@ namespace SetterChecker.Core
                     return;
                 }
 
-                if (IsLoadElement(code))
+                // 判断一条指令是否从一维数组元素读取值。
+                if (code.Code is Cil.Code.Ldelem_Any or Cil.Code.Ldelem_I
+                    or Cil.Code.Ldelem_I1 or Cil.Code.Ldelem_I2 or Cil.Code.Ldelem_I4
+                    or Cil.Code.Ldelem_I8 or Cil.Code.Ldelem_U1 or Cil.Code.Ldelem_U2
+                    or Cil.Code.Ldelem_U4 or Cil.Code.Ldelem_R4 or Cil.Code.Ldelem_R8
+                    or Cil.Code.Ldelem_Ref)
                 {
                     int indexValueId = Pop(code, offset);
                     int arrayValueId = Pop(code, offset);
@@ -677,7 +670,11 @@ namespace SetterChecker.Core
                     return;
                 }
 
-                if (IsStoreElement(code))
+                // 判断一条指令是否把值写入一维数组元素。
+                if (code.Code is Cil.Code.Stelem_Any
+                    or Cil.Code.Stelem_I or Cil.Code.Stelem_I1 or Cil.Code.Stelem_I2
+                    or Cil.Code.Stelem_I4 or Cil.Code.Stelem_I8 or Cil.Code.Stelem_R4
+                    or Cil.Code.Stelem_R8 or Cil.Code.Stelem_Ref)
                 {
                     int valueId = Pop(code, offset);
                     int indexValueId = Pop(code, offset);
@@ -689,7 +686,11 @@ namespace SetterChecker.Core
                     return;
                 }
 
-                if (IsStoreIndirect(code) || code == OpCodes.Cpobj)
+                // 判断一条指令是否通过托管地址写入值。
+                if (code.Code is Cil.Code.Stind_I or Cil.Code.Stind_I1
+                    or Cil.Code.Stind_I2 or Cil.Code.Stind_I4 or Cil.Code.Stind_I8
+                    or Cil.Code.Stind_R4 or Cil.Code.Stind_R8 or Cil.Code.Stind_Ref
+                    or Cil.Code.Stobj or Cil.Code.Cpobj)
                 {
                     int valueId = Pop(code, offset);
                     int addressValueId = Pop(code, offset);
@@ -762,10 +763,9 @@ namespace SetterChecker.Core
             private void RecordWrite(BehaviorWriteKind kind, int? receiver, BehaviorMemberReference? member,
                 IReadOnlyList<int> indices, int value, int offset)
             {
-                this.m_writes[offset] = new BehaviorWrite(kind, receiver, member, indices, value, offset)
+                this.m_writes[offset] = new BehaviorWrite(kind, receiver, member, indices, value, NextPoint())
                 {
                     OperandType = this.m_currentOperandType,
-                    Point = NextPoint(),
                 };
             }
 
@@ -874,7 +874,13 @@ namespace SetterChecker.Core
                 int? receiverValueId = reference.HasInstance && code != OpCodes.Newobj
                     ? Pop(code, offset)
                     : null;
-                BehaviorCallKind kind = ReadCallKind(code, definition);
+                BehaviorCallKind kind = code.Code switch
+                {
+                    Cil.Code.Newobj => BehaviorCallKind.ObjectCreation,
+                    _ when definition.Name == "Invoke" && this.m_catalog.IsDelegateType(this.m_catalog.TypesById[definition.TypeId]) => BehaviorCallKind.Delegate,
+                    Cil.Code.Callvirt when definition.IsVirtual => BehaviorCallKind.Virtual,
+                    _ => BehaviorCallKind.Direct,
+                };
                 int? resultValueId = null;
 
                 if (code == OpCodes.Newobj || reference.Identity.ReturnType.Text != "System.Void")
@@ -910,10 +916,9 @@ namespace SetterChecker.Core
                     receiverValueId,
                     arguments,
                     resultValueId,
-                    offset)
+                    NextPoint())
                 {
                     ConstrainedReceiverType = constrainedType,
-                    Point = NextPoint(),
                 };
             }
 
@@ -958,55 +963,6 @@ namespace SetterChecker.Core
                 }
             }
 
-            // 按真实函数定义区分委托、可重写调用和普通直接调用。
-            private BehaviorCallKind ReadCallKind(
-                OpCode code,
-                MethodEntry definition)
-            {
-                if (code == OpCodes.Newobj)
-                {
-                    return BehaviorCallKind.ObjectCreation;
-                }
-
-                if (definition.Name == "Invoke"
-                    && this.m_catalog.IsDelegateType(this.m_catalog.TypesById[definition.TypeId]))
-                {
-                    return BehaviorCallKind.Delegate;
-                }
-
-                return code == OpCodes.Callvirt && definition.IsVirtual
-                    ? BehaviorCallKind.Virtual
-                    : BehaviorCallKind.Direct;
-            }
-
-            // 判断一条指令是否把值写入一维数组元素。
-            private static bool IsStoreElement(OpCode code)
-            {
-                return code.Code is Cil.Code.Stelem_Any
-                    or Cil.Code.Stelem_I or Cil.Code.Stelem_I1 or Cil.Code.Stelem_I2
-                    or Cil.Code.Stelem_I4 or Cil.Code.Stelem_I8 or Cil.Code.Stelem_R4
-                    or Cil.Code.Stelem_R8 or Cil.Code.Stelem_Ref;
-            }
-
-            // 判断一条指令是否从一维数组元素读取值。
-            private static bool IsLoadElement(OpCode code)
-            {
-                return code.Code is Cil.Code.Ldelem_Any or Cil.Code.Ldelem_I
-                    or Cil.Code.Ldelem_I1 or Cil.Code.Ldelem_I2 or Cil.Code.Ldelem_I4
-                    or Cil.Code.Ldelem_I8 or Cil.Code.Ldelem_U1 or Cil.Code.Ldelem_U2
-                    or Cil.Code.Ldelem_U4 or Cil.Code.Ldelem_R4 or Cil.Code.Ldelem_R8
-                    or Cil.Code.Ldelem_Ref;
-            }
-
-            // 判断一条指令是否通过托管地址写入值。
-            private static bool IsStoreIndirect(OpCode code)
-            {
-                return code.Code is Cil.Code.Stind_I or Cil.Code.Stind_I1
-                    or Cil.Code.Stind_I2 or Cil.Code.Stind_I4 or Cil.Code.Stind_I8
-                    or Cil.Code.Stind_R4 or Cil.Code.Stind_R8 or Cil.Code.Stind_Ref
-                    or Cil.Code.Stobj;
-            }
-
             // 为当前对象或参数槽建立可复用的根值编号。
             private int GetArgumentValueId(int argumentIndex)
             {
@@ -1037,7 +993,7 @@ namespace SetterChecker.Core
                     this.m_values[valueId] = this.m_values[valueId] with
                     {
                         ParameterIndex = parameterIndex,
-                        IsManagedReferenceSlot = parameter.RefKind != CatalogRefKind.None,
+                        IsManagedReferenceSlot = parameter.RefKind != RefKind.None,
                     };
                 }
 
@@ -1152,43 +1108,11 @@ namespace SetterChecker.Core
         int Order);
 
     /// <summary>
-    /// 区分控制流边的执行含义。
-    /// </summary>
-    public enum BehaviorFlowBranchSemantics
-    {
-        /// <summary>普通控制流转移。</summary>
-        Regular,
-        /// <summary>函数返回。</summary>
-        Return,
-        /// <summary>结构化异常处理内部转移。</summary>
-        StructuredExceptionHandling,
-        /// <summary>抛出异常。</summary>
-        Throw,
-        /// <summary>重新抛出当前异常。</summary>
-        Rethrow,
-    }
-
-    /// <summary>
-    /// 区分编译文件中的异常处理子句。
-    /// </summary>
-    public enum BehaviorExceptionHandlerKind
-    {
-        /// <summary>异常筛选区域。</summary>
-        Filter,
-        /// <summary>catch 区域。</summary>
-        Catch,
-        /// <summary>finally 区域。</summary>
-        Finally,
-        /// <summary>IL fault 区域。</summary>
-        Fault,
-    }
-
-    /// <summary>
     /// 保存控制流转移及必须执行的 finally 入口。
     /// </summary>
     public sealed record BehaviorFlowEdge(
         int? TargetBlockId,
-        BehaviorFlowBranchSemantics Semantics,
+        Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics Semantics,
         IReadOnlyList<int> FinallyBlockIds);
 
     /// <summary>
@@ -1205,7 +1129,7 @@ namespace SetterChecker.Core
     /// 按元数据顺序保存异常处理子句；所有范围均为包含起点、不含终点的指令区间。
     /// </summary>
     public sealed record BehaviorExceptionHandler(
-        BehaviorExceptionHandlerKind Kind,
+        Mono.Cecil.Cil.ExceptionHandlerType Kind,
         int TryStartBlockId,
         int TryEndBlockId,
         int HandlerStartBlockId,
@@ -1268,7 +1192,7 @@ namespace SetterChecker.Core
     }
 
     /// <summary>
-    /// 区分函数体中的静态、虚、构造、委托和函数指针调用形式。
+    /// 区分函数体中已读取的静态、虚、构造和委托调用形式。
     /// </summary>
     public enum BehaviorCallKind
     {
@@ -1280,8 +1204,6 @@ namespace SetterChecker.Core
         ObjectCreation,
         /// <summary>调用委托的 Invoke。</summary>
         Delegate,
-        /// <summary>调用函数指针。</summary>
-        FunctionPointer,
     }
 
     /// <summary>
@@ -1331,11 +1253,7 @@ namespace SetterChecker.Core
     public sealed record BehaviorAssignment(
         int TargetValueId,
         int ValueId,
-        int Position)
-    {
-        /// <summary>赋值发生的执行位置。</summary>
-        public required BehaviorFlowPoint Point { get; init; }
-    }
+        BehaviorFlowPoint Point);
 
     /// <summary>
     /// 保存类型的实际身份、定义身份和构造类型实参。
@@ -1356,13 +1274,12 @@ namespace SetterChecker.Core
     }
 
     /// <summary>
-    /// 保存字段的声明类型、名称和字段类型，不依赖显示字符串解析。
+    /// 保存字段的声明身份和元数据位置，字段类型由目录统一查询。
     /// </summary>
     public sealed record BehaviorMemberReference(
         TypeIdentityTemplate DeclaringTypeIdentity,
         string DeclaringTypeDefinitionId,
-        string Name,
-        string FieldTypeId)
+        string Name)
     {
         /// <summary>当前函数内容中字段引用的原始标记，用于还原完整类型来源。</summary>
         public int ReferenceMetadataToken { get; init; }
@@ -1387,11 +1304,8 @@ namespace SetterChecker.Core
         BehaviorMemberReference? Member,
         IReadOnlyList<int> IndexValueIds,
         int ValueId,
-        int Position)
+        BehaviorFlowPoint Point)
     {
-        /// <summary>写入发生的执行位置。</summary>
-        public required BehaviorFlowPoint Point { get; init; }
-
         /// <summary>原写入指令的类型操作数；合成反射写入不伪造此项。</summary>
         public BehaviorTypeReference? OperandType { get; init; }
 
@@ -1404,7 +1318,7 @@ namespace SetterChecker.Core
     /// </summary>
     public sealed record BehaviorArgument(
         int ValueId,
-        CatalogRefKind RefKind);
+        RefKind RefKind);
 
     /// <summary>
     /// 保存调用目标的完整签名、泛型实参和实例调用形态。
@@ -1439,13 +1353,10 @@ namespace SetterChecker.Core
         int? ReceiverValueId,
         IReadOnlyList<BehaviorArgument> Arguments,
         int? ResultValueId,
-        int Position)
+        BehaviorFlowPoint Point)
     {
         /// <summary>虚调用受限到的实际值类型。</summary>
         public BehaviorTypeReference? ConstrainedReceiverType { get; init; }
-
-        /// <summary>调用发生的执行位置。</summary>
-        public required BehaviorFlowPoint Point { get; init; }
     }
 
     /// <summary>
@@ -1453,11 +1364,7 @@ namespace SetterChecker.Core
     /// </summary>
     public sealed record BehaviorReturn(
         int? ValueId,
-        int Position)
-    {
-        /// <summary>返回或 yield 发生的执行位置。</summary>
-        public required BehaviorFlowPoint Point { get; init; }
-    }
+        BehaviorFlowPoint Point);
 
     /// <summary>
     /// 保存平台调用所声明的原生库和入口名称。

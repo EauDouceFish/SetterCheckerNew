@@ -248,13 +248,29 @@ namespace SetterChecker.Core.Tests
         // 最后一次反射绑定也要触发路径更新。
         /// <summary>最后一个反射调用只补充值事实时，也必须据此排除不可达写入。</summary>
         [TestMethod]
-        public async Task RunRefinesAfterLastReflectionBinding()
+        [DataRow("Flag", 0, false)]
+        [DataRow("Flag", 1, true)]
+        [DataRow("Other", 0, false)]
+        public async Task RunRefinesAfterLastReflectionBinding(string field, int flag, bool setter)
         {
             using TestProject project = TestProject.CreateSingleAssembly();
-            project.WriteRootSource("public sealed class Box { public int Flag; } public static class Calls { private static int state; public static void Entry() { var box = new Box(); int value = (int)typeof(Box).GetField(\"Flag\").GetValue(box); if (value != 0) state = 1; } }");
+            project.WriteRootSource("""
+                public sealed class Box { public int Flag; public double Other; }
+                public static class Calls
+                {
+                    private static int state;
+                    public static void Entry()
+                    {
+                        var box = new Box { Flag = FLAG };
+                        string name = "FIELD";
+                        int value = (int)typeof(Box).GetField(name).GetValue(box);
+                        if (value != 0) state = 1;
+                    }
+                }
+                """.Replace("FIELD", field).Replace("FLAG", flag.ToString(System.Globalization.CultureInfo.InvariantCulture)));
             AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
-            Assert.IsTrue(run.Complete);
-            Assert.AreEqual(MethodEffectKind.Getter, run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+            Assert.IsTrue(run.Complete, run.Failure + JsonSerializer.Serialize(run.Annotations));
+            Assert.AreEqual(setter ? MethodEffectKind.Setter : MethodEffectKind.Getter, run.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
         }
 
         // 装箱后的零是非空对象，不能当成数值零排除真实写入。

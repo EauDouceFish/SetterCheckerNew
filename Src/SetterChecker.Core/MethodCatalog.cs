@@ -81,7 +81,12 @@ namespace SetterChecker.Core
                     {
                         if (sourceTypes != null && sourceTypes.Remove(metadata.DocumentationId, out INamedTypeSymbol? symbol))
                         {
-                            TypeEntry sourceType = CreateSourceType(symbol, metadata);
+                            TypeEntry sourceType = metadata with
+                            {
+                                Id = metadata.LogicalId,
+                                FullName = symbol.OriginalDefinition.ToDisplayString(s_typeDisplayFormat),
+                                SourceSymbol = symbol.OriginalDefinition,
+                            };
                             allTypes.Add(sourceType);
                             sourceMethodParts.Add(ReadSourceTypeMethods(context!, symbol, sourceType, ReadManagedTypeMethods(metadata, module)));
                         }
@@ -188,19 +193,6 @@ namespace SetterChecker.Core
             return id[..nameStart] + name + arity + suffix;
         }
 
-        // 把源码位置和标签附加到 Cecil 已读取的类型事实。
-        private static TypeEntry CreateSourceType(INamedTypeSymbol type, TypeEntry metadata)
-        {
-            INamedTypeSymbol definition = type.OriginalDefinition;
-
-            return metadata with
-            {
-                Id = metadata.LogicalId,
-                FullName = definition.ToDisplayString(s_typeDisplayFormat),
-                SourceSymbol = definition,
-            };
-        }
-
         // 读取一个源码类型直接声明的全部函数。
         private static IReadOnlyList<MethodEntry> ReadSourceTypeMethods(SourceCatalogContext context,
             INamedTypeSymbol symbol, TypeEntry sourceType, IReadOnlyList<MethodEntry> metadataMethods)
@@ -213,18 +205,12 @@ namespace SetterChecker.Core
             List<MethodEntry> result = new(metadataMethods.Count);
             foreach (MethodEntry metadata in metadataMethods)
             {
-                if (sourceMethods.Remove(metadata.DocumentationId, out IMethodSymbol? source))
-                {
-                    result.Add(CreateSourceMethod(source, sourceType, context, metadata));
-                }
-                else
-                {
-                    result.Add(metadata with
+                result.Add(sourceMethods.Remove(metadata.DocumentationId, out IMethodSymbol? source)
+                    ? CreateSourceMethod(source, sourceType, context, metadata) : metadata with
                     {
                         TypeId = sourceType.Id,
                         TypeName = sourceType.FullName,
                     });
-                }
             }
 
             IMethodSymbol? missing = sourceMethods.Values.FirstOrDefault(method =>
@@ -256,8 +242,8 @@ namespace SetterChecker.Core
                     $"源码函数与元数据参数数量不一致：{metadata.LogicalId}");
             }
 
-            CatalogMethodKind kind = definition.MethodKind == MethodKind.Destructor
-                ? CatalogMethodKind.Destructor
+            MethodKind kind = definition.MethodKind == MethodKind.Destructor
+                ? MethodKind.Destructor
                 : metadata.Kind;
 
             return metadata with
@@ -280,16 +266,16 @@ namespace SetterChecker.Core
         // 判断源码函数是否属于最终标签统计范围。
         private static bool IsReportable(
             IMethodSymbol method,
-            CatalogMethodKind kind,
+            MethodKind kind,
             string? sourcePath,
             SourceCatalogContext context)
         {
-            bool allowedKind = kind is CatalogMethodKind.Ordinary
-                or CatalogMethodKind.PropertySetter
-                or CatalogMethodKind.EventAdder
-                or CatalogMethodKind.EventRemover
-                or CatalogMethodKind.Operator
-                or CatalogMethodKind.Conversion;
+            bool allowedKind = kind is MethodKind.Ordinary
+                or MethodKind.PropertySet
+                or MethodKind.EventAdd
+                or MethodKind.EventRemove
+                or MethodKind.UserDefinedOperator
+                or MethodKind.Conversion;
             string namespaceName = method.ContainingNamespace.ToDisplayString();
 
             return context.Material.IsReportAssembly
@@ -608,14 +594,14 @@ namespace SetterChecker.Core
                     type,
                     method switch
                     {
-                        { IsGetter: true } => CatalogMethodKind.PropertyGetter,
-                        { IsSetter: true } => CatalogMethodKind.PropertySetter,
-                        { IsAddOn: true } => CatalogMethodKind.EventAdder,
-                        { IsRemoveOn: true } => CatalogMethodKind.EventRemover,
-                        { IsConstructor: true, IsStatic: true } => CatalogMethodKind.StaticConstructor,
-                        { IsConstructor: true } => CatalogMethodKind.Constructor,
-                        { Name: "op_Implicit" or "op_Explicit" or "op_CheckedExplicit" } => CatalogMethodKind.Conversion,
-                        _ => method.Name.StartsWith("op_", StringComparison.Ordinal) ? CatalogMethodKind.Operator : CatalogMethodKind.Ordinary,
+                        { IsGetter: true } => MethodKind.PropertyGet,
+                        { IsSetter: true } => MethodKind.PropertySet,
+                        { IsAddOn: true } => MethodKind.EventAdd,
+                        { IsRemoveOn: true } => MethodKind.EventRemove,
+                        { IsConstructor: true, IsStatic: true } => MethodKind.StaticConstructor,
+                        { IsConstructor: true } => MethodKind.Constructor,
+                        { Name: "op_Implicit" or "op_Explicit" or "op_CheckedExplicit" } => MethodKind.Conversion,
+                        _ => method.Name.StartsWith("op_", StringComparison.Ordinal) ? MethodKind.UserDefinedOperator : MethodKind.Ordinary,
                     }))
                 .ToArray();
         }
@@ -624,7 +610,7 @@ namespace SetterChecker.Core
         private static MethodEntry CreateManagedMethod(
             Cecil.MethodDefinition method,
             TypeEntry type,
-            CatalogMethodKind kind)
+            MethodKind kind)
         {
             MethodIdentityTemplate identity = ManagedMethodDefinitionIdentity(method);
             ParameterEntry[] parameters = method.Parameters.Select((parameter, index) =>
@@ -736,7 +722,7 @@ namespace SetterChecker.Core
         }
 
         // 读取 Cecil 参数的引用传递方式。
-        internal static CatalogRefKind ReadManagedRefKind(Cecil.ParameterDefinition parameter)
+        internal static RefKind ReadManagedRefKind(Cecil.ParameterDefinition parameter)
         {
             Cecil.TypeReference type = parameter.ParameterType;
             while (type is Cecil.IModifierType modifier)
@@ -746,15 +732,15 @@ namespace SetterChecker.Core
 
             if (type is not Cecil.ByReferenceType)
             {
-                return CatalogRefKind.None;
+                return RefKind.None;
             }
 
             if (parameter.IsOut)
             {
-                return CatalogRefKind.Out;
+                return RefKind.Out;
             }
 
-            return parameter.IsIn ? CatalogRefKind.In : CatalogRefKind.Ref;
+            return parameter.IsIn ? RefKind.In : RefKind.Ref;
         }
 
         // 建立一个 Cecil 函数引用的实际身份。
@@ -1000,55 +986,11 @@ namespace SetterChecker.Core
         internal string? DispatchFailure { get; init; }
     }
 
-    /// <summary>表示函数在源码或托管文件中的种类。</summary>
-    public enum CatalogMethodKind
-    {
-        /// <summary>普通命名函数。</summary>
-        Ordinary,
-        /// <summary>对象构造函数。</summary>
-        Constructor,
-        /// <summary>静态构造函数。</summary>
-        StaticConstructor,
-        /// <summary>属性读取函数。</summary>
-        PropertyGetter,
-        /// <summary>属性写入函数。</summary>
-        PropertySetter,
-        /// <summary>事件添加函数。</summary>
-        EventAdder,
-        /// <summary>事件移除函数。</summary>
-        EventRemover,
-        /// <summary>运算符函数。</summary>
-        Operator,
-        /// <summary>类型转换函数。</summary>
-        Conversion,
-        /// <summary>局部函数。</summary>
-        LocalFunction,
-        /// <summary>匿名函数。</summary>
-        AnonymousFunction,
-        /// <summary>析构函数。</summary>
-        Destructor,
-        /// <summary>其他编译器函数。</summary>
-        Other,
-    }
-
-    /// <summary>表示函数参数的传递方式。</summary>
-    public enum CatalogRefKind
-    {
-        /// <summary>按值传递。</summary>
-        None,
-        /// <summary>可读写引用传递。</summary>
-        Ref,
-        /// <summary>输出引用传递。</summary>
-        Out,
-        /// <summary>只读引用传递。</summary>
-        In,
-    }
-
     /// <summary>保存一个函数参数的名称、类型和传递方式。</summary>
     public sealed record ParameterEntry(
         string Name,
         string TypeId,
-        CatalogRefKind RefKind)
+        RefKind RefKind)
     {
         internal TypeIdentityTemplate TypeIdentity { get; init; } =
             new TypeIdentityTemplate(TypeId);
@@ -1121,7 +1063,7 @@ namespace SetterChecker.Core
         string Name,
         string ReturnTypeId,
         IReadOnlyList<ParameterEntry> Parameters,
-        CatalogMethodKind Kind,
+        MethodKind Kind,
         string? SourcePath,
         int Line,
         bool IsReportable,
@@ -1645,7 +1587,8 @@ namespace SetterChecker.Core
         }
 
         // 从字段原始引用还原实际声明类型，并代入字段所属类的构造参数。
-        internal TypeIdentityTemplate ReadResolvedFieldType(BehaviorMemberReference reference)
+        /// <summary>按真实程序集和声明实参查询字段类型，与行为分析使用同一份事实。</summary>
+        public TypeIdentityTemplate ReadResolvedFieldType(BehaviorMemberReference reference)
         {
             return this.m_resolvedFieldTypes.GetOrAdd((reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken), key =>
             {
@@ -1794,7 +1737,7 @@ namespace SetterChecker.Core
             ReadInheritedTypes(type, includeInterfaces: includeInterfaces);
         }
 
-        // 补齐候选关系材料；多个真实载体均保留，实际调用再要求唯一实现。
+        // 补齐候选关系；同世代的完整接口检查也证明基类完整，实际调用仍要求唯一载体。
         internal void RequireClosedDispatchIndex(bool includeInterfaces)
         {
             lock (this.m_loadedTypeLock)
@@ -1826,8 +1769,8 @@ namespace SetterChecker.Core
                     }
                     this.m_dispatchAssembliesClosed = true;
                 }
-                while (!this.m_dispatchGenerations.TryGetValue(includeInterfaces, out int completed)
-                    || completed != this.m_typeGeneration)
+                while (this.m_dispatchGenerations.GetValueOrDefault(includeInterfaces, -1) != this.m_typeGeneration
+                    && (includeInterfaces || this.m_dispatchGenerations.GetValueOrDefault(true, -1) != this.m_typeGeneration))
                 {
                     int generation = this.m_typeGeneration;
                     foreach (TypeEntry type in this.m_types)
@@ -1912,17 +1855,11 @@ namespace SetterChecker.Core
             Cecil.FieldReference field,
             string referringAssemblyPath)
         {
-            TypeIdentityTemplate[] declaringArguments = MethodCatalog.ReadManagedTypeArguments(
-                field.DeclaringType).ToArray();
-            TypeIdentityTemplate fieldType = MethodCatalog.ManagedTypeIdentity(
-                field.FieldType).Substitute(declaringArguments);
-
             TypeIdentityTemplate declaringType = MethodCatalog.ManagedTypeIdentity(field.DeclaringType);
             return new BehaviorMemberReference(
                 declaringType,
                 MethodCatalog.ManagedNamedTypeDefinitionId(field.DeclaringType.GetElementType()),
-                field.Name,
-                fieldType.Text)
+                field.Name)
             {
                 ReferenceMetadataToken = field.MetadataToken.ToInt32(),
                 KnownDeclaringTypeId = ReadKnownTypeId(field.DeclaringType, referringAssemblyPath),

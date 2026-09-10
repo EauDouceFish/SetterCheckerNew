@@ -134,7 +134,6 @@ namespace SetterChecker.Core
     /// </summary>
     public sealed record MaterialSet(
         string ProjectRoot,
-        string ReportRoot,
         IReadOnlyList<SourceAssemblyMaterial> SourceAssemblies,
         IReadOnlyList<ExternalAssemblyMaterial> ExternalAssemblies,
         IReadOnlyList<string> AssemblyLookupPaths,

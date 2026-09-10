@@ -124,7 +124,7 @@ namespace SetterChecker.Core
                 && !proofs.ContainsKey(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId)))
             {
                 Propagate(call.CallerInstanceId, new WriteSubject(null, call.Failure ?? "等待确定调用目标：" + call.Call.Target.Identity.Text),
-                    new EffectEvidence(new[] { call.CallerMethodId }, call.Call.Position, string.Empty));
+                    new EffectEvidence(new[] { call.CallerMethodId }, call.Call.Point.BlockId, string.Empty));
             }
             foreach (var failure in unsettled)
             {
@@ -139,7 +139,7 @@ namespace SetterChecker.Core
                              write.ReceiverValueId is int receiver && body.Values[receiver].Kind is not (BehaviorValueKind.CurrentInstance or BehaviorValueKind.Parameter) ? 1 : 0))
                          .TakeWhile(_ => !proofs.ContainsKey(instance.RootId)))
                 {
-                    EffectEvidence evidence = new(new[] { instance.MethodId }, write.Position, write.Member?.Name ?? write.Kind.ToString());
+                    EffectEvidence evidence = new(new[] { instance.MethodId }, write.Point.BlockId, write.Member?.Name ?? write.Kind.ToString());
                     foreach (WriteSubject subject in write.ReceiverValueId == null ? ReadStaticWriteSubjects(instance, write)
                                  : ReadWriteSubjects(catalog, resolution, new BehaviorValueReference(instance.MethodId, write.ReceiverValueId.Value, instance.Id), instance.RootId,
                                      pathProof, (new BehaviorValueReference(instance.MethodId, write.ReceiverValueId.Value, instance.Id), write.Point, write), pathConditions.Contains(instance.RootId)))
@@ -204,14 +204,14 @@ namespace SetterChecker.Core
                     }
                     catch (AnalysisException exception)
                     {
-                        boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Position, exception.Message));
+                        boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Point.BlockId, exception.Message));
                         continue;
                     }
                     foreach (var site in sites.TakeWhile(_ => proof == null))
                     {
                         if (!resolution.ValueSources.HasClosedPrefix(instanceId, site.Point, closedPrefixes, conditionFailures: unsettled))
                         {
-                            boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Position, "返回位置之前的调用尚未证明可以正常返回"));
+                            boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Point.BlockId, "返回位置之前的调用尚未证明可以正常返回"));
                             continue;
                         }
                         BehaviorValueReference reference = site.Reference;
@@ -228,7 +228,7 @@ namespace SetterChecker.Core
                                     var selected = pathProof.ReadSelectedOriginsAtPoint(instanceId, returnedOrigins, instanceId, returned.Point, current, site.Point, normalReturn: true);
                                     if (!selected.Complete)
                                     {
-                                        boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Position, "单次经过循环不能排除其它迭代返回新对象"));
+                                        boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Point.BlockId, "单次经过循环不能排除其它迭代返回新对象"));
                                     }
                                     returnedOrigins = selected.Origins;
                                 }
@@ -244,7 +244,7 @@ namespace SetterChecker.Core
                                         && catalog.ResolveTypeDefinition(origin.Value.Type) is TypeEntry type
                                         && !type.IsCompilerGenerated && businessAssemblies.Contains(type.AssemblyPath))
                                     {
-                                        proof = new EffectEvidence(new[] { root.Id }, returned.Position, "返回新建业务对象或包含它的容器");
+                                        proof = new EffectEvidence(new[] { root.Id }, returned.Point.BlockId, "返回新建业务对象或包含它的容器");
                                         break;
                                     }
                                     else if (origin.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray)
@@ -254,7 +254,7 @@ namespace SetterChecker.Core
                                             (origin.Reference, origin.ReturnPath),
                                         };
                                         foreach (BehaviorValueReference member in resolution.ValueSources.ReadContainerValues(current, origin, returned.Point,
-                                            failure => boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Position, failure)), site.Point,
+                                            failure => boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Point.BlockId, failure)), site.Point,
                                             pathConditions.Contains(instanceId) ? pathProof : null))
                                         {
                                             returnedObjects.Enqueue((member, ancestors));
@@ -262,13 +262,13 @@ namespace SetterChecker.Core
                                     }
                                     else if (origin.Value.Kind == BehaviorValueKind.CallResult)
                                     {
-                                        throw new AnalysisException($"返回对象来源尚未闭合：{root.Id} @ {returned.Position}");
+                                        throw new AnalysisException($"返回对象来源尚未闭合：{root.Id} @ {returned.Point.BlockId}");
                                     }
                                 }
                             }
                             catch (AnalysisException exception)
                             {
-                                boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Position, exception.Message));
+                                boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Point.BlockId, exception.Message));
                             }
                         }
                     }
@@ -294,16 +294,17 @@ namespace SetterChecker.Core
             MethodCatalogResult catalog, CallTargetResolutionResult resolution, BehaviorValueReference reference, int instanceId,
             ValueSourceIndex.IntegerPathProof pathProof, (BehaviorValueReference Receiver, BehaviorFlowPoint Point, BehaviorWrite Write)? witness, bool hasPathConditions)
         {
-            Queue<BehaviorValueReference> pending = new(new[] { reference });
-            HashSet<BehaviorValueReference> visited = new();
+            Queue<(BehaviorValueReference Reference, bool ThroughReference)> pending = new(new[] { (reference, false) });
+            HashSet<(BehaviorValueReference, bool)> visited = new();
             bool complete = true;
             bool publishedSubject = false;
-            while (pending.TryDequeue(out BehaviorValueReference current))
+            while (pending.TryDequeue(out var query))
             {
-                if (!visited.Add(current))
+                if (!visited.Add(query))
                 {
                     continue;
                 }
+                BehaviorValueReference current = query.Reference;
                 IReadOnlyList<ValueOrigin>? origins = null;
                 string? failure = null;
                 try
@@ -349,7 +350,7 @@ namespace SetterChecker.Core
                             || origin.Value.Reference?.StartsWith("local:", StringComparison.Ordinal) == true:
                             break;
                         case BehaviorValueKind.Conversion when origin.Value.Reference == "box"
-                            && !CallTargetResolver.IsReferenceType(catalog, origin.Value.Type!.Id, resolution.ValueSources):
+                            && !query.ThroughReference && !CallTargetResolver.IsReferenceType(catalog, origin.Value.Type!.Id, resolution.ValueSources):
                             break;
                         case BehaviorValueKind.Conversion:
                         case BehaviorValueKind.FieldRead:
@@ -357,7 +358,10 @@ namespace SetterChecker.Core
                         case BehaviorValueKind.Address:
                             foreach (int input in origin.Value.InputValueIds.Take(1))
                             {
-                                pending.Enqueue(origin.Reference with { ValueId = input });
+                                bool throughReference = query.ThroughReference || origin.Value.Kind == BehaviorValueKind.FieldRead
+                                    && CallTargetResolver.IsReferenceType(catalog, resolution.ValueSources.GetInstance(origin.Reference.InstanceId)
+                                        .Substitute(catalog.ReadResolvedFieldType(origin.Value.Member!)).Text, resolution.ValueSources);
+                                pending.Enqueue((origin.Reference with { ValueId = input }, throughReference));
                             }
                             break;
                         case BehaviorValueKind.NewObject:

@@ -1,4 +1,5 @@
 using SetterChecker.Core;
+using Microsoft.CodeAnalysis;
 
 namespace SetterChecker.Core.Tests
 {
@@ -43,7 +44,7 @@ namespace SetterChecker.Core.Tests
             MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
             MethodEntry method = catalog.Methods.Single(method => method.Name == "Read");
-            Assert.AreEqual(CatalogRefKind.In, method.Parameters[0].RefKind);
+            Assert.AreEqual(RefKind.In, method.Parameters[0].RefKind);
             Assert.IsTrue(method.IsReportable);
             Assert.AreEqual(2, method.Parameters.Count);
         }
@@ -186,7 +187,7 @@ namespace SetterChecker.Core.Tests
 
             foreach (TypeEntry type in types)
             {
-                MethodEntry[] getters = result.GetMethods(type).Where(method => method.Kind == CatalogMethodKind.PropertyGetter).ToArray();
+                MethodEntry[] getters = result.GetMethods(type).Where(method => method.Kind == MethodKind.PropertyGet).ToArray();
                 Assert.HasCount(2, getters);
                 Assert.IsFalse(getters.Single(method => method.IsPublic).IsVirtual);
                 TypeEntry contract = result.Types.Single(item => item.FullName is "SourceSamples.IView<T>" or "ExternalSamples.IView<T>"
@@ -436,7 +437,7 @@ namespace SetterChecker.Core.Tests
             MethodEntry baseChange = result.GetMethods(baseType).Single(method => method.Name == "Change");
             MethodEntry derivedChange = result.GetMethods(derivedType).Single(method => method.Name == "Change");
             MethodEntry genericEcho = result.GetMethods(genericType).Single(method => method.Name == "Echo");
-            CatalogMethodKind[] accessors = result.GetMethods(accessorType)
+            MethodKind[] accessors = result.GetMethods(accessorType)
                 .Where(method => method.Name.Contains("Value", StringComparison.Ordinal)
                     || method.Name.Contains("Changed", StringComparison.Ordinal))
                 .Select(method => method.Kind)
@@ -460,10 +461,10 @@ namespace SetterChecker.Core.Tests
             CollectionAssert.AreEquivalent(
                 new[]
                 {
-                    CatalogMethodKind.PropertyGetter,
-                    CatalogMethodKind.PropertySetter,
-                    CatalogMethodKind.EventAdder,
-                    CatalogMethodKind.EventRemover,
+                    MethodKind.PropertyGet,
+                    MethodKind.PropertySet,
+                    MethodKind.EventAdd,
+                    MethodKind.EventRemove,
                 },
                 accessors);
             Assert.AreEqual(intContract.ReturnTypeId, publicRead.ReturnTypeId);
@@ -1182,7 +1183,7 @@ namespace SetterChecker.Core.Tests
             MethodEntry destructor = catalog.Methods.Single(method =>
                 method.TypeName == "SourceSamples.Finalizable" && method.Name == "Finalize");
 
-            Assert.AreEqual(CatalogMethodKind.Destructor, destructor.Kind);
+            Assert.AreEqual(MethodKind.Destructor, destructor.Kind);
             Assert.IsFalse(destructor.IsReportable);
         }
 

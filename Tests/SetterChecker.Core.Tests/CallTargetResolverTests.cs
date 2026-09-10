@@ -427,7 +427,7 @@ namespace SetterChecker.Core.Tests
             foreach (MethodEntry root in roots)
             {
                 ResolvedCall[] observations = result.Calls.Where(call => call.CallerMethodId == root.Id && call.Call.Target.Name == "Observe")
-                    .OrderBy(call => call.Call.Position).ToArray();
+                    .OrderBy(call => call.Call.Point.BlockId).ToArray();
                 ValueOrigin first = result.ValueSources.GetCallOrigins(observations[0].Targets.Single().Arguments.Single().Single()).Single();
                 ValueOrigin last = result.ValueSources.GetCallOrigins(observations[1].Targets.Single().Arguments.Single().Single()).Single();
                 Assert.AreEqual(BehaviorValueKind.Constant, first.Value.Kind);
@@ -826,7 +826,7 @@ namespace SetterChecker.Core.Tests
             foreach (MethodEntry root in roots)
             {
                 ResolvedCall[] uses = result.Calls.Where(call => call.CallerMethodId == root.Id && call.Call.Kind == BehaviorCallKind.Delegate)
-                    .OrderBy(call => call.Call.Position).ToArray();
+                    .OrderBy(call => call.Call.Point.BlockId).ToArray();
                 Assert.HasCount(2, uses);
                 CollectionAssert.AreEqual(new[] { "Before", "After" }, uses.Select(call => result.Methods
                     .Single(method => method.Id == call.Targets.Single().MethodId).Name).ToArray());

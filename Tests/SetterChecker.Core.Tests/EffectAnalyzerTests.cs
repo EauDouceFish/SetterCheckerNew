@@ -4,6 +4,332 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 赋值右侧的除法必须正常完成；除零之前已发生的写入仍然保留。
+        /// <summary>实际执行 DLL 核对异常与状态，再对照源码和 DLL 的分析结论。</summary>
+        [TestMethod]
+        [DataRow(false, 0)]
+        [DataRow(true, 0)]
+        [DataRow(false, 2)]
+        public async Task AnalyzeChecksDivisionBeforePublishingWrite(bool writesFirst, int divisor)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Calls
+                {
+                    private static int state;
+                    public static void Entry() { BEFORE int divisor = DIVISOR; state = 10 / divisor; }
+                }
+                """.Replace("BEFORE", writesFirst ? "state = 1;" : string.Empty)
+                .Replace("DIVISOR", divisor.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+            System.Runtime.Loader.AssemblyLoadContext execution = new(null, isCollectible: true);
+            try
+            {
+                using FileStream bytes = File.OpenRead(project.ExternalAssemblyPath);
+                Type actual = execution.LoadFromStream(bytes).GetType("ExternalSamples.Calls", throwOnError: true)!;
+                if (divisor == 0)
+                {
+                    var thrown = Assert.ThrowsExactly<System.Reflection.TargetInvocationException>(() => actual.GetMethod("Entry")!.Invoke(null, null));
+                    Assert.IsInstanceOfType<DivideByZeroException>(thrown.InnerException);
+                }
+                else
+                {
+                    actual.GetMethod("Entry")!.Invoke(null, null);
+                }
+                Assert.AreEqual(divisor != 0 ? 5 : writesFirst ? 1 : 0,
+                    actual.GetField("state", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.GetValue(null));
+            }
+            finally
+            {
+                execution.Unload();
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            MethodEffectKind expected = writesFirst || divisor != 0 ? MethodEffectKind.Setter : MethodEffectKind.Getter;
+            foreach (MethodEffect method in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(expected, method.Kind, method.MethodId);
+            }
+        }
+
+        // 区分整数除法的正常结果、除零、带符号溢出和不抛出的浮点除零。
+        /// <summary>实际执行不同位宽的除法，并核对直接赋值和子调用之后的写入。</summary>
+        [TestMethod]
+        [DataRow("int", "int.MinValue", "-1", false, "OverflowException")]
+        [DataRow("long", "long.MinValue", "-1", true, "OverflowException")]
+        [DataRow("uint", "uint.MaxValue", "0", false, "DivideByZeroException")]
+        [DataRow("ulong", "ulong.MaxValue", "0", true, "DivideByZeroException")]
+        [DataRow("int", "-10", "3", true, "")]
+        [DataRow("long", "long.MinValue", "1", false, "")]
+        [DataRow("uint", "uint.MaxValue", "uint.MaxValue", true, "")]
+        [DataRow("ulong", "ulong.MaxValue", "ulong.MaxValue", false, "")]
+        [DataRow("float", "10", "0", false, "")]
+        [DataRow("double", "0", "0", true, "")]
+        public async Task AnalyzeChecksDivisionKindsAndCallContinuation(string type, string dividend, string divisor, bool throughCall, string exceptionName)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Calls
+                {
+                    private static TYPE quotient;
+                    private static int state;
+                    private static TYPE Divide() { TYPE left = LEFT; TYPE right = RIGHT; return left / right; }
+                    public static void Entry() { BODY state = 3; }
+                }
+                """.Replace("BODY", throughCall ? "Divide();" : "TYPE left = LEFT; TYPE right = RIGHT; quotient = left / right;")
+                .Replace("TYPE", type).Replace("LEFT", dividend).Replace("RIGHT", divisor));
+            System.Runtime.Loader.AssemblyLoadContext execution = new(null, isCollectible: true);
+            try
+            {
+                using FileStream bytes = File.OpenRead(project.ExternalAssemblyPath);
+                Type actual = execution.LoadFromStream(bytes).GetType("ExternalSamples.Calls", throwOnError: true)!;
+                if (exceptionName.Length != 0)
+                {
+                    var thrown = Assert.ThrowsExactly<System.Reflection.TargetInvocationException>(() => actual.GetMethod("Entry")!.Invoke(null, null));
+                    Assert.AreEqual(exceptionName, thrown.InnerException!.GetType().Name);
+                }
+                else
+                {
+                    actual.GetMethod("Entry")!.Invoke(null, null);
+                }
+                Assert.AreEqual(exceptionName.Length == 0 ? 3 : 0,
+                    actual.GetField("state", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.GetValue(null));
+            }
+            finally
+            {
+                execution.Unload();
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(entry => entry.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            MethodEffectKind expected = exceptionName.Length == 0 ? MethodEffectKind.Setter : MethodEffectKind.Getter;
+            foreach (MethodEffect method in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(expected, method.Kind, method.MethodId);
+            }
+        }
+
+        // 浮点类型穿过参数、算术和返回值仍保持正常除法语义。
+        /// <summary>浮点除法可以产生无穷或非数值，不阻断后续真实写入。</summary>
+        [TestMethod]
+        [DataRow("value / value")]
+        [DataRow("(value + 1) / (value - 1)")]
+        [DataRow("Read(value) / 0")]
+        [DataRow("((double)integer) / 0")]
+        [DataRow("shared / shared")]
+        public async Task AnalyzeKeepsFloatingDivisionFromActualOperands(string expression)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Calls
+                {
+                    private static double result;
+                    private static double Read(double value) => value;
+                    public static void Entry(double value, int integer) { double shared = value + 1; result = EXPRESSION; }
+                }
+                """.Replace("EXPRESSION", expression));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEffect method in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(MethodEffectKind.Setter, method.Kind, method.MethodId);
+            }
+        }
+
+        // 运算类型正确并不代表取操作数成功，字段访问和拆箱仍需真实执行。
+        /// <summary>实际 DLL 的前序异常与源码、DLL 的写入证明分别核对。</summary>
+        [TestMethod]
+        [DataRow("Box box = null; value = 10.0 / box.Value;", "NullReferenceException")]
+        [DataRow("Box box = new Box(); value = 10.0 / box.Value;", "")]
+        [DataRow("object boxed = 1.0f; value = 10.0 / (double)boxed;", "InvalidCastException")]
+        [DataRow("object boxed = 1.0; value = 10.0 / (double)boxed;", "")]
+        [DataRow("object boxed = Code.One; value = (int)boxed;", "")]
+        [DataRow("object boxed = 1; value = (int)(Code)boxed;", "")]
+        [DataRow("object boxed = 1L; value = (int)(Code)boxed;", "InvalidCastException")]
+        [DataRow("object boxed = 1; value = Read<int>(boxed);", "")]
+        [DataRow("object boxed = Code.One; if ((int)boxed != 1) return; value = 1;", "")]
+        [DataRow("object boxed = 1u; value = (int)(Code)boxed;", "InvalidCastException")]
+        [DataRow("object boxed = Other.One; value = (int)(Code)boxed;", "")]
+        [DataRow("object boxed = new Cell<string>(); _ = (Cell<int>)boxed; value = 1;", "InvalidCastException")]
+        [DataRow("object boxed = new Cell<int>(); _ = (Cell<int>)boxed; value = 1;", "")]
+        public async Task AnalyzeChecksOperandAccessBeforeFloatingWrite(string body, string exceptionName)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public enum Code { One = 1 }
+                public enum Other { One = 1 }
+                public struct Cell<T> { }
+                public class Box { public double Value; }
+                public static class Calls
+                {
+                    private static double value;
+                    private static int state;
+                    private static T Read<T>(object input) => (T)input;
+                    public static void Entry() { BODY state = 3; }
+                }
+                """.Replace("BODY", body));
+            System.Runtime.Loader.AssemblyLoadContext execution = new(null, isCollectible: true);
+            try
+            {
+                using FileStream bytes = File.OpenRead(project.ExternalAssemblyPath);
+                Type actual = execution.LoadFromStream(bytes).GetType("ExternalSamples.Calls", throwOnError: true)!;
+                if (exceptionName.Length != 0)
+                {
+                    var thrown = Assert.ThrowsExactly<System.Reflection.TargetInvocationException>(() => actual.GetMethod("Entry")!.Invoke(null, null));
+                    Assert.AreEqual(exceptionName, thrown.InnerException!.GetType().Name);
+                }
+                else
+                {
+                    actual.GetMethod("Entry")!.Invoke(null, null);
+                }
+                Assert.AreEqual(exceptionName.Length == 0 ? 3 : 0,
+                    actual.GetField("state", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.GetValue(null));
+            }
+            finally
+            {
+                execution.Unload();
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEffect method in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(exceptionName.Length == 0 ? MethodEffectKind.Setter : MethodEffectKind.Getter, method.Kind, method.MethodId);
+            }
+        }
+
+        // 反射返回的盒子有独立身份；字段选择、盒内引用和静态修改不能互相混用。
+        /// <summary>按实际字段选型及修改对象核对源码和 DLL 的公开分析结果。</summary>
+        [TestMethod]
+        [DataRow("choice", MethodEffectKind.Getter)]
+        [DataRow("static", MethodEffectKind.Setter)]
+        [DataRow("static-reference", MethodEffectKind.Setter)]
+        [DataRow("own", MethodEffectKind.Getter)]
+        [DataRow("external", MethodEffectKind.Setter)]
+        [DataRow("global", MethodEffectKind.Setter)]
+        [DataRow("same-type", MethodEffectKind.Setter)]
+        [DataRow("replace-box", MethodEffectKind.Getter)]
+        [DataRow("replace-source", MethodEffectKind.Setter)]
+        public async Task AnalyzeReflectedBoxUsesOwnStorage(string scenario, MethodEffectKind expected)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public interface IRun { void Run(); }
+                public class Target { public int Value; }
+                public struct A : IRun { public int Value; public Target Target; public void Run() { WRITE } }
+                public struct B { }
+                public class Holder { public A Left; public A Other; public B Right; }
+                public static class Calls
+                {
+                    public static int State;
+                    public static A Shared;
+                    public static void Entry(bool flag, Holder holder) { BODY }
+                }
+                """.Replace("WRITE", scenario == "global" ? "Calls.State = 1;"
+                    : scenario == "replace-box" ? "Target = new Target(); Target.Value++;"
+                    : scenario is "external" or "same-type" or "replace-source" or "static-reference" ? "Target.Value++;" : "Value++;")
+                .Replace("BODY", scenario switch
+                {
+                    "choice" => "var field = flag ? typeof(Holder).GetField(\"Left\") : typeof(Holder).GetField(\"Right\"); object item = field.GetValue(new Holder()); if (flag && item is B) State = 1;",
+                    "static" => "object item = typeof(Calls).GetField(\"Shared\").GetValue(null); if (item is A) State = 1;",
+                    "static-reference" => "((IRun)typeof(Calls).GetField(\"Shared\").GetValue(null)).Run();",
+                    "same-type" => "var field = flag ? typeof(Holder).GetField(\"Left\") : typeof(Holder).GetField(\"Other\"); ((IRun)field.GetValue(holder)).Run();",
+                    "replace-source" => "var local = new Holder(); local.Left = holder.Left; var item = (IRun)typeof(Holder).GetField(\"Left\").GetValue(local); local.Left = new A(); item.Run();",
+                    _ => "((IRun)typeof(Holder).GetField(\"Left\").GetValue(holder)).Run();",
+                }));
+            System.Runtime.Loader.AssemblyLoadContext execution = new(null, isCollectible: true);
+            try
+            {
+                using FileStream bytes = File.OpenRead(project.ExternalAssemblyPath);
+                System.Reflection.Assembly assembly = execution.LoadFromStream(bytes);
+                Type callsType = assembly.GetType("ExternalSamples.Calls", throwOnError: true)!;
+                Type holderType = assembly.GetType("ExternalSamples.Holder", throwOnError: true)!;
+                Type targetType = assembly.GetType("ExternalSamples.Target", throwOnError: true)!;
+                Type valueType = assembly.GetType("ExternalSamples.A", throwOnError: true)!;
+                foreach (bool flag in new[] { false, true })
+                {
+                    object holder = Activator.CreateInstance(holderType)!;
+                    object target = Activator.CreateInstance(targetType)!;
+                    object value = Activator.CreateInstance(valueType)!;
+                    valueType.GetField("Target")!.SetValue(value, target);
+                    holderType.GetField("Left")!.SetValue(holder, value);
+                    holderType.GetField("Other")!.SetValue(holder, value);
+                    callsType.GetField("State")!.SetValue(null, 0);
+                    callsType.GetField("Shared")!.SetValue(null, value);
+                    callsType.GetMethod("Entry")!.Invoke(null, new[] { (object)flag, holder });
+                    bool changed = (int)callsType.GetField("State")!.GetValue(null)! != 0
+                        || (int)targetType.GetField("Value")!.GetValue(target)! != 0;
+                    Assert.AreEqual(expected == MethodEffectKind.Setter, changed, scenario + ":" + flag);
+                    Assert.AreEqual(0, valueType.GetField("Value")!.GetValue(holderType.GetField("Left")!.GetValue(holder)));
+                }
+            }
+            finally
+            {
+                execution.Unload();
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEffect method in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(expected, method.Kind, method.MethodId);
+            }
+        }
+
+        // 接口可作为泛型实参，空输入不依赖存在一个可构造的引用类型实现。
+        /// <summary>接口实参允许空值及装箱结构体，而 new 约束不能拼接不同类型参数。</summary>
+        [TestMethod]
+        [DataRow("none")]
+        [DataRow("struct")]
+        [DataRow("new")]
+        public async Task AnalyzeKeepsGenericNullInputs(string scenario)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public interface IRun { void Run(); }
+                IMPLEMENTATIONS
+                public static class Calls
+                {
+                    public static int State;
+                    public static void Entry<T>(T first, T second) where T : IRun CONSTRAINT
+                    { BODY }
+                }
+                """.Replace("IMPLEMENTATIONS", scenario == "none" ? string.Empty
+                    : "public struct Writer : IRun { public void Run() { Calls.State = 1; } } public sealed class Quiet : IRun { public void Run() { } }")
+                .Replace("CONSTRAINT", scenario == "new" ? ", new()" : string.Empty)
+                .Replace("BODY", scenario switch
+                {
+                    "struct" => "if ((object)first == null) second.Run();",
+                    "new" => "if ((object)first == null && second is Writer) State = 1;",
+                    _ => "if ((object)first == null) State = 1;",
+                }));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2, requireCompleteCalls: false);
+            if (scenario == "new")
+            {
+                foreach (MethodEntry root in roots)
+                {
+                    Assert.Contains("类型参数", Assert.ThrowsExactly<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls)).Message);
+                }
+                return;
+            }
+            Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(method => method.Kind == MethodEffectKind.Setter));
+        }
+
         // 同一入口中的连续条件调用共用前序执行事实，不同入口和调用实参保持独立。
         /// <summary>源码与 DLL 的矛盾条件仍为 Getter，换实参后的合法修改仍为 Setter。</summary>
         [TestMethod]
@@ -3370,7 +3696,7 @@ namespace SetterChecker.Core.Tests
             foreach (ResolvedCall previous in partial.Calls)
             {
                 Assert.AreSame(previous, complete.Calls.Single(call => call.CallerInstanceId == previous.CallerInstanceId
-                    && call.Call.Position == previous.Call.Position));
+                    && call.Call.Point.BlockId == previous.Call.Point.BlockId));
             }
             Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, complete).Methods.All(method => method.Kind == MethodEffectKind.Setter));
         }
