@@ -6,6 +6,32 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class ReportWriterTests
     {
+        // 已有修改证据不取消请求取消的效力，补齐调用前后都必须响应取消。
+        /// <summary>结束进度回调取消任务后抛出取消异常，同一工具实例可以重新分析。</summary>
+        [TestMethod]
+        [DataRow(1)]
+        [DataRow(2)]
+        public async Task RunCancelsAfterResolvingKnownSetter(int completedPhase)
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("public static class Calls { private static int state; public static void Entry() { state = 1; Quiet(); } private static void Quiet() { } }");
+            SetterChecker checker = new();
+            using CancellationTokenSource cancellation = new();
+            int completed = 0;
+            await Assert.ThrowsAsync<OperationCanceledException>(() => checker.AnalyzeAsync(
+                new MaterialRequest(project.AssemblyDefinitionPath, 2), cancellation.Token, progress: message =>
+                {
+                    if (message.StartsWith("调用分析结束：", StringComparison.Ordinal) && ++completed == completedPhase)
+                    {
+                        cancellation.Cancel();
+                    }
+                }));
+            Assert.AreEqual(completedPhase, completed);
+            AnalysisRun retried = await checker.AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            Assert.IsTrue(retried.Complete);
+            Assert.AreEqual(MethodEffectKind.Setter, retried.Annotations.Methods.Single(method => method.Name == "Entry").Actual);
+        }
+
         // 编辑器连续发起验证时整轮排队，排队文本仍属于发起请求的时刻。
         /// <summary>同一工具实例的两轮工作不叠加并行额度，也不读取后续修改的文本字典。</summary>
         [TestMethod]

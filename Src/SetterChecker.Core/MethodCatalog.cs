@@ -1209,6 +1209,11 @@ namespace SetterChecker.Core
         /// <summary>类型或转交别名新增时，使依赖这些事实的本次路径检查重新执行。</summary>
         internal int SemanticGeneration => this.m_semanticGeneration;
 
+        // 只保存同一目录事实下的真实实现选择，不缓存每次调用的对象与参数。
+        internal ConcurrentDictionary<(int Generation, string Receiver, string Arguments, string Query, string QueryArguments), ResolvedMethodDefinition>
+            MethodTargets
+        { get; } = new();
+
         /// <summary>全部源码和托管类型。</summary>
         public IReadOnlyList<TypeEntry> Types
         {

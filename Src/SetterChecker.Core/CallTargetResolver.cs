@@ -52,6 +52,17 @@ namespace SetterChecker.Core
                 sources.MarkChangedMethods(behaviors.Keys.ToHashSet(StringComparer.Ordinal));
             }
             HashSet<int> bindingRoots = new();
+            long lastProgress = -1000;
+
+            // 最多每秒发布一次工作量，结束时始终给出完整数量。
+            void PublishProgress(bool finished = false)
+            {
+                if (progress != null && (finished || stopwatch.ElapsedMilliseconds - lastProgress >= 1000))
+                {
+                    progress($"{(finished ? "调用分析结束" : "调用分析")}：函数体 {behaviors.Count}，已连接 {calls.Count}，待处理 {waiting.Count + deferred.Count}，耗时 {stopwatch.Elapsed.TotalSeconds:F1} 秒。");
+                    lastProgress = stopwatch.ElapsedMilliseconds;
+                }
+            }
 
             // 发布同一份调用和值来源快照，尚未解析的调用独立保存。
             CallTargetResolutionResult ReadResult()
@@ -108,7 +119,7 @@ namespace SetterChecker.Core
                     provenGetters.Remove(sources.GetInstance(root).MethodId);
                 }
                 bindingRoots.UnionWith(recheckRoots);
-                progress?.Invoke($"本轮重新检查 {recheckRoots.Count} 个入口的执行条件。");
+                PublishProgress();
                 HashSet<int> changedRoots = recheckRoots.Count == 0 ? new() : sources.RefineReachability(frozenRoots, recheckRoots, jobs, cancellationToken);
                 if (changedRoots.Count != 0)
                 {
@@ -124,12 +135,10 @@ namespace SetterChecker.Core
                     discovered.ExceptWith(invalidated);
                     pending = sources.Instances.Where(instance => changedRoots.Contains(instance.RootId)).ToArray();
                     discovered.UnionWith(pending.Select(instance => instance.Id));
-                    progress?.Invoke($"路径收缩后保留 {retained.Count} 个固定直调绑定，重新检查对象内容与执行条件。");
                     continue;
                 }
                 waiting.RemoveAll(item => !sources.IsReachable(item.Instance.Id, item.Call.Point.BlockId));
                 deferred.RemoveAll(item => !sources.IsReachable(item.CallerInstanceId, item.Call.Point.BlockId));
-                progress?.Invoke($"已读取 {behaviors.Count} 个函数体，已连接 {calls.Count} 个调用，待处理 {waiting.Count} 个调用。");
                 if (waiting.Count == 0)
                 {
                     if (sources.HasChangedRoots(frozenRoots))
@@ -167,13 +176,11 @@ namespace SetterChecker.Core
                         }
                     }
                     proofs = proofs with { Methods = proofs.Methods.Concat(reused).OrderBy(method => method.MethodId, StringComparer.Ordinal).ToArray() };
-                    progress?.Invoke($"本轮复用 {reused.Length} 个未变化的只读结论。");
                     reportProgress?.Invoke(current, proofs);
                     foreach (MethodEffect method in proofs.Methods.Where(method => method.Kind == MethodEffectKind.Setter))
                     {
                         provenSetters.TryAdd(sources.RootInstances[method.MethodId].Id, method.Evidence!);
                     }
-                    progress?.Invoke($"已有 {provenSetters.Count} 个入口取得确定的修改证据；总入口 {roots.Count} 个。");
                     waiting.RemoveAll(item =>
                     {
                         if (!provenSetters.ContainsKey(item.Instance.RootId))
@@ -365,6 +372,8 @@ namespace SetterChecker.Core
             }
 
             stopwatch.Stop();
+            PublishProgress(finished: true);
+            cancellationToken.ThrowIfCancellationRequested();
             return ReadResult();
         }
 
@@ -598,19 +607,27 @@ namespace SetterChecker.Core
                             { Selection = multipleTypes ? (receiver.Single(), type) : (arguments[0].Single(), name) });
                             continue;
                         }
-                        var matches = catalog.ReadInheritedTypes(reflectedType, reflectedArguments, includeInterfaces: false)
-                            .Prepend(new MethodCatalogResult.InheritedTypeRelation(reflectedType, reflectedArguments, false, false, 0))
-                            .SelectMany(parent => catalog.GetMethods(parent.Definition).Where(method => (parent.Depth == 0 || !method.IsStatic)
-                                && method.Kind is not (MethodKind.Constructor or MethodKind.StaticConstructor)
-                                && method.IsPublic && method.Name == name.Value.Reference).Select(method => (Method: method, Owner: parent))).ToArray();
-                        if (matches.Length != 1)
+                        var key = (catalog.SemanticGeneration, reflectedType.Id,
+                            string.Concat(reflectedArguments.Select(argument => $"{argument.Text.Length}:{argument.Text}")),
+                            "reflection:" + name.Value.Reference, string.Empty);
+                        if (!catalog.MethodTargets.TryGetValue(key, out ResolvedMethodDefinition? selected))
                         {
-                            throw new AnalysisException($"反射函数查找没有唯一结果：{reflectedType.FullName}.{name.Value.Reference}");
+                            var matches = catalog.ReadInheritedTypes(reflectedType, reflectedArguments, includeInterfaces: false)
+                                .Prepend(new MethodCatalogResult.InheritedTypeRelation(reflectedType, reflectedArguments, false, false, 0))
+                                .SelectMany(parent => catalog.GetMethods(parent.Definition).Where(method => (parent.Depth == 0 || !method.IsStatic)
+                                    && method.Kind is not (MethodKind.Constructor or MethodKind.StaticConstructor)
+                                    && method.IsPublic && method.Name == name.Value.Reference).Select(method => (Method: method, Owner: parent))).ToArray();
+                            if (matches.Length != 1)
+                            {
+                                throw new AnalysisException($"反射函数查找没有唯一结果：{reflectedType.FullName}.{name.Value.Reference}");
+                            }
+                            selected = new ResolvedMethodDefinition(matches[0].Method, matches[0].Owner.TypeArguments);
+                            catalog.MethodTargets.TryAdd(key, selected);
                         }
                         members.Add(new ValueOrigin(resultReference, body.Values[resultReference.ValueId] with
                         {
                             Kind = BehaviorValueKind.Function,
-                            Method = catalog.ReadMethodReference(matches[0].Method, matches[0].Owner.TypeArguments),
+                            Method = catalog.ReadMethodReference(selected.Method, selected.DeclaringTypeArguments),
                         })
                         { Selection = multipleTypes ? (receiver.Single(), type) : (arguments[0].Single(), name) });
                     }
@@ -1017,71 +1034,7 @@ namespace SetterChecker.Core
                         continue;
                     }
 
-                    MethodCatalogResult.InheritedTypeRelation[] hierarchy = catalog.ReadInheritedTypes(candidate, typeArguments, declaringType.IsInterface)
-                        .Prepend(new MethodCatalogResult.InheritedTypeRelation(candidate, typeArguments, false, true, 0))
-                        .ToArray();
-                    MethodCatalogResult.InheritedTypeRelation[] contractRelations = hierarchy.Where(relation =>
-                            relation.IsInterface && relation.Definition.Id == declaringType.Id)
-                        .ToArray();
-                    MethodCatalogResult.InheritedTypeRelation[] exactContractRelations = contractRelations.Where(
-                            relation => relation.TypeArguments.Select(type => type.Text).SequenceEqual(
-                                contract.DeclaringTypeArguments.Select(type => type.Text), StringComparer.Ordinal))
-                        .ToArray();
-                    ResolvedMethodDefinition[] implementationContracts = declaringType.IsInterface
-                        ? (exactContractRelations.Length == 0 ? contractRelations.Where(relation =>
-                                AreInterfaceArgumentsCompatible(
-                                    catalog,
-                                    declaringType,
-                                    relation.TypeArguments,
-                                    contract.DeclaringTypeArguments))
-                            : exactContractRelations).Select(relation => contract with
-                            {
-                                DeclaringTypeArguments = relation.TypeArguments,
-                            }).DistinctBy(item => string.Join(",", item.DeclaringTypeArguments.Select(type => type.Text)), StringComparer.Ordinal).ToArray()
-                        : new[] { contract };
-                    var interfaceOwners = !declaringType.IsInterface ? new Dictionary<ResolvedMethodDefinition, IReadOnlySet<string>>()
-                        : implementationContracts.ToDictionary(item => item, item =>
-                    {
-                        int introductionDepth = hierarchy.Where(relation => !relation.IsInterface
-                            && catalog.ReadInheritedTypes(relation.Definition, relation.TypeArguments).Any(parent =>
-                                parent.CanImplementInterface && parent.Definition.Id == item.Method.TypeId
-                                && TypeArgumentsMatch(parent.TypeArguments, item.DeclaringTypeArguments)))
-                            .Select(relation => relation.Depth).DefaultIfEmpty(int.MaxValue).Min();
-                        return (IReadOnlySet<string>)hierarchy.Where(relation => !relation.IsInterface && relation.Depth > introductionDepth)
-                            .Select(relation => relation.Definition.Id).ToHashSet(StringComparer.Ordinal);
-                    });
-                    ResolvedMethodDefinition? selected = null;
-                    foreach (var relation in hierarchy.Where(relation => !relation.IsInterface).OrderBy(relation => relation.Depth))
-                    {
-                        MethodEntry[] matches = catalog.GetMethods(relation.Definition).Where(method =>
-                            implementationContracts.Any(implementationContract => IsImplementation(
-                                catalog,
-                                method,
-                                relation.TypeArguments,
-                                implementationContract,
-                                requireMatchingReturn: declaringType.IsInterface,
-                                interfaceOwners.GetValueOrDefault(implementationContract)))).ToArray();
-                        if (matches.Length > 1)
-                        {
-                            throw new AnalysisException($"同一接收类型存在多个调用实现：{candidate.Id} => {contract.Method.Id}");
-                        }
-
-                        if (matches.Length == 1)
-                        {
-                            selected = new ResolvedMethodDefinition(matches[0], relation.TypeArguments);
-                            break;
-                        }
-                    }
-
-                    selected ??= FindDefaultInterfaceImplementation(
-                        catalog,
-                        candidate,
-                        hierarchy,
-                        implementationContracts);
-                    if (selected == null || selected.Method.IsAbstract)
-                    {
-                        throw new AnalysisException($"具体接收类型未找到可执行实现：{candidate.Id} => {contract.Method.Id}");
-                    }
+                    ResolvedMethodDefinition selected = ResolveImplementation(catalog, contract, candidate, typeArguments);
 
                     selections.Add((selected, candidate, typeArguments, parameters));
                 }
@@ -1118,6 +1071,89 @@ namespace SetterChecker.Core
             return result.Values.OrderBy(target => target.Method.Id, StringComparer.Ordinal)
                 .ThenBy(target => string.Join(",", target.DeclaringTypeArguments.Select(type => type.Text)), StringComparer.Ordinal)
                 .ToArray();
+        }
+
+        // 相同构造类型与接口槽只选择一次实现，调用对象和参数仍由调用点绑定。
+        private static ResolvedMethodDefinition ResolveImplementation(
+            MethodCatalogResult catalog, ResolvedMethodDefinition contract,
+            TypeEntry candidate, IReadOnlyList<TypeIdentityTemplate> typeArguments)
+        {
+            var key = (catalog.SemanticGeneration, candidate.Id,
+                string.Concat(typeArguments.Select(argument => $"{argument.Text.Length}:{argument.Text}")),
+                "virtual:" + contract.Method.Id, string.Concat(contract.DeclaringTypeArguments.Select(argument => $"{argument.Text.Length}:{argument.Text}")));
+            if (catalog.MethodTargets.TryGetValue(key, out ResolvedMethodDefinition? known))
+            {
+                return known;
+            }
+
+            TypeEntry declaringType = catalog.TypesById[contract.Method.TypeId];
+            MethodCatalogResult.InheritedTypeRelation[] hierarchy = catalog.ReadInheritedTypes(candidate, typeArguments, declaringType.IsInterface)
+                .Prepend(new MethodCatalogResult.InheritedTypeRelation(candidate, typeArguments, false, true, 0))
+                .ToArray();
+            MethodCatalogResult.InheritedTypeRelation[] contractRelations = hierarchy.Where(relation =>
+                    relation.IsInterface && relation.Definition.Id == declaringType.Id)
+                .ToArray();
+            MethodCatalogResult.InheritedTypeRelation[] exactContractRelations = contractRelations.Where(
+                    relation => relation.TypeArguments.Select(type => type.Text).SequenceEqual(
+                        contract.DeclaringTypeArguments.Select(type => type.Text), StringComparer.Ordinal))
+                .ToArray();
+            ResolvedMethodDefinition[] implementationContracts = declaringType.IsInterface
+                ? (exactContractRelations.Length == 0 ? contractRelations.Where(relation =>
+                        AreInterfaceArgumentsCompatible(
+                            catalog,
+                            declaringType,
+                            relation.TypeArguments,
+                            contract.DeclaringTypeArguments))
+                    : exactContractRelations).Select(relation => contract with
+                    {
+                        DeclaringTypeArguments = relation.TypeArguments,
+                    }).DistinctBy(item => string.Join(",", item.DeclaringTypeArguments.Select(type => type.Text)), StringComparer.Ordinal).ToArray()
+                : new[] { contract };
+            var interfaceOwners = !declaringType.IsInterface ? new Dictionary<ResolvedMethodDefinition, IReadOnlySet<string>>()
+                : implementationContracts.ToDictionary(item => item, item =>
+            {
+                int introductionDepth = hierarchy.Where(relation => !relation.IsInterface
+                    && catalog.ReadInheritedTypes(relation.Definition, relation.TypeArguments).Any(parent =>
+                        parent.CanImplementInterface && parent.Definition.Id == item.Method.TypeId
+                        && TypeArgumentsMatch(parent.TypeArguments, item.DeclaringTypeArguments)))
+                    .Select(relation => relation.Depth).DefaultIfEmpty(int.MaxValue).Min();
+                return (IReadOnlySet<string>)hierarchy.Where(relation => !relation.IsInterface && relation.Depth > introductionDepth)
+                    .Select(relation => relation.Definition.Id).ToHashSet(StringComparer.Ordinal);
+            });
+            ResolvedMethodDefinition? selected = null;
+            foreach (var relation in hierarchy.Where(relation => !relation.IsInterface).OrderBy(relation => relation.Depth))
+            {
+                MethodEntry[] matches = catalog.GetMethods(relation.Definition).Where(method =>
+                    implementationContracts.Any(implementationContract => IsImplementation(
+                        catalog,
+                        method,
+                        relation.TypeArguments,
+                        implementationContract,
+                        requireMatchingReturn: declaringType.IsInterface,
+                        interfaceOwners.GetValueOrDefault(implementationContract)))).ToArray();
+                if (matches.Length > 1)
+                {
+                    throw new AnalysisException($"同一接收类型存在多个调用实现：{candidate.Id} => {contract.Method.Id}");
+                }
+
+                if (matches.Length == 1)
+                {
+                    selected = new ResolvedMethodDefinition(matches[0], relation.TypeArguments);
+                    break;
+                }
+            }
+
+            selected ??= FindDefaultInterfaceImplementation(
+                catalog,
+                candidate,
+                hierarchy,
+                implementationContracts);
+            if (selected == null || selected.Method.IsAbstract)
+            {
+                throw new AnalysisException($"具体接收类型未找到可执行实现：{candidate.Id} => {contract.Method.Id}");
+            }
+            catalog.MethodTargets.TryAdd(key, selected);
+            return selected;
         }
 
         // 共用已有继承索引列出实际候选类型，不重复扫描全部类型。

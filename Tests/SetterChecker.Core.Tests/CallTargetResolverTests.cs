@@ -6,6 +6,70 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class CallTargetResolverTests
     {
+        // 同一目标反复调用时，旧对象和临时新对象仍各自保留实际参数。
+        /// <summary>接口、委托和反射复用目标后不混淆修改对象，源码与 DLL 结论一致。</summary>
+        [TestMethod]
+        [DataRow("interface")]
+        [DataRow("delegate")]
+        [DataRow("reflection")]
+        public async Task ResolveAsyncKeepsRepeatedTargetArgumentsSeparate(string kind)
+        {
+            string call = kind switch
+            {
+                "interface" => "((IWork)worker).Apply(box);",
+                "delegate" => "new System.Action<Box>(worker.Apply)(box);",
+                _ => "typeof(Worker).GetMethod(\"Apply\").Invoke(worker, new object[] { box });",
+            };
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Box { public int Value; }
+                public interface IWork { void Apply(Box box); }
+                public sealed class Worker : IWork { public void Apply(Box box) { box.Value = 1; } }
+                public static class Calls
+                {
+                    public static void Existing(Worker worker, Box box) { CALLS }
+                    public static void Fresh(Worker worker) { Box box = new Box(); CALLS }
+                }
+                """.Replace("CALLS", string.Concat(Enumerable.Repeat(call, 12))));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name is "Existing" or "Fresh").ToArray();
+            Assert.HasCount(4, roots);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs);
+                Assert.IsEmpty(calls.PendingCalls);
+                foreach (MethodEffect effect in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+                {
+                    Assert.AreEqual(roots.Single(root => root.Id == effect.MethodId).Name == "Existing"
+                        ? MethodEffectKind.Setter : MethodEffectKind.Getter, effect.Kind, effect.MethodId);
+                }
+            }
+        }
+
+        // 对外进度只报告阶段与工作量，不把内部每轮重算过程刷到控制台。
+        /// <summary>简短进度保留最终待处理数量，且不改变实际调用与行为结论。</summary>
+        [TestMethod]
+        public async Task ResolveAsyncReportsCompactProgress()
+        {
+            using TestProject project = TestProject.CreateSingleAssembly();
+            project.WriteRootSource("public static class Calls { private static int state; public static void Entry() => A(); private static void A() => B(); private static void B() { state = 1; } }");
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Methods.Where(method => method.Name == "Entry").ToArray();
+            List<string> progress = new();
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2, progress: progress.Add);
+
+            Assert.IsNotEmpty(progress);
+            Assert.IsTrue(progress.All(message => message.StartsWith("调用分析：", StringComparison.Ordinal)
+                || message.StartsWith("调用分析结束：", StringComparison.Ordinal)), string.Join("\n", progress));
+            StringAssert.Contains(progress[^1], "待处理 0");
+            StringAssert.Contains(progress[^1], "耗时");
+            Assert.IsEmpty(calls.PendingCalls);
+            Assert.AreEqual(MethodEffectKind.Setter, new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.Single().Kind);
+        }
+
         // 保留普通连接不等于完成其初始化证明，递归回边也仍须重新绑定。
         /// <summary>剪枝后的初始化失败不被隐藏，递归关系在恢复分析后保持完整。</summary>
         [TestMethod]
@@ -45,8 +109,6 @@ namespace SetterChecker.Core.Tests
             {
                 List<string> progress = new();
                 CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, progress: progress.Add);
-                Assert.IsTrue(progress.Any(message => message.StartsWith("路径收缩后保留 ", StringComparison.Ordinal)
-                    && !message.StartsWith("路径收缩后保留 0 ", StringComparison.Ordinal)), string.Join("\n", progress));
                 foreach (bool resume in new[] { false, true })
                 {
                     if (resume)
@@ -116,8 +178,6 @@ namespace SetterChecker.Core.Tests
             {
                 List<string> progress = new();
                 CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, progress: progress.Add);
-                Assert.IsTrue(progress.Any(message => message.StartsWith("路径收缩后保留 ", StringComparison.Ordinal)
-                    && !message.StartsWith("路径收缩后保留 0 ", StringComparison.Ordinal)), string.Join("\n", progress));
                 foreach (MethodEffect result in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
                 {
                     Assert.AreEqual(writes ? MethodEffectKind.Setter : MethodEffectKind.Getter, result.Kind);
@@ -174,7 +234,6 @@ namespace SetterChecker.Core.Tests
                 CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs,
                     requireCompleteCalls: false, progress: progress.Add, reportProgress: (snapshot, _) =>
                         Assert.AreEqual(snapshot.Calls.Count, snapshot.Calls.Select(call => (call.CallerInstanceId, call.Call.Point)).Distinct().Count()));
-                Assert.IsTrue(progress.Any(message => message.StartsWith($"路径收缩后保留 {(construction ? 16 : 14)} ", StringComparison.Ordinal)), string.Join("\n", progress));
                 foreach (bool resume in new[] { false, true })
                 {
                     if (resume)
@@ -276,7 +335,6 @@ namespace SetterChecker.Core.Tests
                             Assert.AreEqual(MethodEffectKind.Getter, proofs.Methods.Single(method => method.MethodId == root.Id).Kind);
                         }
                     });
-                Assert.IsTrue(progress.Any(message => message == "本轮复用 2 个未变化的只读结论。"), string.Join("\n", progress));
                 foreach (bool resume in new[] { false, true })
                 {
                     if (resume)
@@ -681,7 +739,7 @@ namespace SetterChecker.Core.Tests
             await Assert.ThrowsAsync<OperationCanceledException>(() => new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs,
                 cancellation.Token, progress: message =>
                 {
-                    if (!started && message.StartsWith("本轮重新检查", StringComparison.Ordinal))
+                    if (!started && message.StartsWith("调用分析：", StringComparison.Ordinal))
                     {
                         started = true;
                         cancellation.CancelAfter(TimeSpan.FromMilliseconds(20));
@@ -812,7 +870,6 @@ namespace SetterChecker.Core.Tests
             MethodEntry[] roots = catalog.Methods.Where(method => method.Name is "Entry" or "Quiet").ToArray();
             List<string> progress = new();
             CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2, progress: progress.Add);
-            Assert.Contains("本轮重新检查 1 个入口的执行条件。", progress);
             EffectAnalysisResult effects = new EffectAnalyzer().Analyze(catalog, roots, calls);
             Assert.AreEqual(MethodEffectKind.Setter, effects.Methods.Single(method => method.MethodId == roots.Single(root => root.Name == "Entry").Id).Kind);
             Assert.AreEqual(MethodEffectKind.Getter, effects.Methods.Single(method => method.MethodId == roots.Single(root => root.Name == "Quiet").Id).Kind);
@@ -1395,19 +1452,14 @@ namespace SetterChecker.Core.Tests
             MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
             MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
-            List<string> batches = new();
             using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(10));
 
             CallTargetResolutionResult result = await new CallTargetResolver().ResolveAsync(
-                material, catalog, roots, 2, deadline.Token, progress: batches.Add);
+                material, catalog, roots, 2, deadline.Token);
 
             Assert.HasCount(2, roots);
-            CollectionAssert.AreEqual(new[]
-            {
-                "已读取 2 个函数体，已连接 0 个调用，待处理 8 个调用。",
-                "已读取 4 个函数体，已连接 2 个调用，待处理 6 个调用。",
-                "已读取 10 个函数体，已连接 8 个调用，待处理 0 个调用。",
-            }, batches.Where(message => message.StartsWith("已读取", StringComparison.Ordinal)).ToArray());
+            Assert.HasCount(10, result.Behaviors.Methods);
+            Assert.HasCount(8, result.Calls);
             Assert.IsEmpty(result.PendingCalls);
             foreach (MethodEntry root in roots)
             {

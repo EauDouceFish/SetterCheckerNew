@@ -43,6 +43,16 @@ namespace SetterChecker.Core
                 string? failure = null;
                 int reportedProofs = -1;
                 System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
+
+                // 同一轮补齐调用后只重查未定行为，已有真实修改证据不用于标签追踪判断。
+                EffectAnalysisResult ReadEffects()
+                {
+                    Dictionary<int, EffectEvidence> proven = effects.Methods.Where(method => method.Kind == MethodEffectKind.Setter)
+                        .ToDictionary(method => calls!.ValueSources.RootInstances[method.MethodId].Id, method => method.Evidence!);
+
+                    return new EffectAnalyzer().AnalyzeAvailable(catalog, roots, calls!, false, cancellationToken, frozenSetters: proven);
+                }
+
                 // 进度和最终交付共用标签处理与报告数据，未证明项目始终保留失败。
                 AnalysisRun ReadRun(bool isInProgress = false)
                 {
@@ -72,12 +82,12 @@ namespace SetterChecker.Core
                                 reportedProofs = proofs.Methods.Count;
                             }
                         }).ConfigureAwait(false);
-                    effects = new EffectAnalyzer().AnalyzeAvailable(catalog, roots, calls, false, cancellationToken);
+                    effects = ReadEffects();
                     if (calls.PendingCalls.Count != 0)
                     {
                         calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, request.Jobs,
                             cancellationToken, requireCompleteCalls: false, previous: calls, progress: progress).ConfigureAwait(false);
-                        effects = new EffectAnalyzer().AnalyzeAvailable(catalog, roots, calls, false, cancellationToken);
+                        effects = ReadEffects();
                     }
                 }
                 catch (AnalysisException exception)
