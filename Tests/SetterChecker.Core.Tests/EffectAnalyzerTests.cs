@@ -1459,6 +1459,115 @@ namespace SetterChecker.Core.Tests
             }
         }
 
+        // 提前发现未读取的函数体不能保留已覆盖的旧值，补读之后仍须重新分析条件。
+        /// <summary>源码与 DLL 在单路、四路和继续分析时保持相同的字段读取与写入结论。</summary>
+        [TestMethod]
+        [DataRow("none", true)]
+        [DataRow("zero", false)]
+        [DataRow("one", true)]
+        [DataRow("conditional", true)]
+        [DataRow("finally_zero", false)]
+        [DataRow("return_read", true)]
+        [DataRow("nested_finally_zero", false)]
+        [DataRow("helper_finally_zero", false)]
+        public async Task AnalyzeRevisitsStorageAfterReadingPendingBodies(string variant, bool setter)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Holder { public int Value; }
+                public static class Calls
+                {
+                    public static void Entry(Holder outside, bool flag)
+                    {
+                        var holder = new Holder();
+                        PREPARE
+                        if (READ == 1) outside.Value = 1;
+                    }
+                    private static void Pending(Holder holder) { Forward(holder); }
+                    private static void Forward(Holder holder) { holder.Value = 1; }
+                    private static int Read(Holder holder) => holder.Value;
+                    private static void Clear(Holder holder) { try { Pending(holder); } finally { holder.Value = 0; } }
+                }
+                """.Replace("PREPARE", variant switch
+            {
+                "zero" => "Pending(holder); holder.Value = 0;",
+                "one" => "Pending(holder); holder.Value = 1;",
+                "conditional" => "if (flag) Pending(holder);",
+                "finally_zero" => "try { Pending(holder); } finally { holder.Value = 0; }",
+                "nested_finally_zero" => "try { try { Pending(holder); } finally { holder.Value = 1; } } finally { holder.Value = 0; }",
+                "helper_finally_zero" => "Clear(holder);",
+                _ => "Pending(holder);",
+            }).Replace("READ", variant == "return_read" ? "Read(holder)" : "holder.Value"));
+            System.Reflection.Assembly runtime = System.Reflection.Assembly.Load(File.ReadAllBytes(project.ExternalAssemblyPath));
+            foreach (bool flag in new[] { false, true })
+            {
+                object outside = Activator.CreateInstance(runtime.GetType("ExternalSamples.Holder")!)!;
+                runtime.GetType("ExternalSamples.Calls")!.GetMethod("Entry")!.Invoke(null, new[] { outside, (object)flag });
+                Assert.AreEqual(setter && (variant != "conditional" || flag) ? 1 : 0, outside.GetType().GetField("Value")!.GetValue(outside));
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs);
+                foreach (bool resume in new[] { false, true })
+                {
+                    if (resume)
+                    {
+                        calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, previous: calls);
+                    }
+                    Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(method =>
+                        method.Kind == (setter ? MethodEffectKind.Setter : MethodEffectKind.Getter)));
+                }
+            }
+        }
+
+        // 正常退出之外的 finally 写入仍存在，不得从正常路径无写入推断 Getter。
+        /// <summary>保留直接写入、清理函数回调和嵌套清理的异常入口。</summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public async Task AnalyzeKeepsExceptionalFinallyWrites(bool helper, bool nested)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Holder { public int Value; }
+                public static class Calls
+                {
+                    public static void Entry(Holder outside)
+                    {
+                        BODY
+                    }
+                    private static void Write(Holder holder) { holder.Value = 1; }
+                }
+                """.Replace("BODY", nested
+                    ? "try { try { throw null; } finally { } } finally { WRITE }"
+                    : "try { throw null; } finally { WRITE }")
+                .Replace("WRITE", helper ? "Write(outside);" : "outside.Value = 1;"));
+            System.Reflection.Assembly runtime = System.Reflection.Assembly.Load(File.ReadAllBytes(project.ExternalAssemblyPath));
+            object outside = Activator.CreateInstance(runtime.GetType("ExternalSamples.Holder")!)!;
+            var thrown = Assert.ThrowsExactly<System.Reflection.TargetInvocationException>(() =>
+                runtime.GetType("ExternalSamples.Calls")!.GetMethod("Entry")!.Invoke(null, new[] { outside }));
+            Assert.IsInstanceOfType<NullReferenceException>(thrown.InnerException);
+            Assert.AreEqual(1, outside.GetType().GetField("Value")!.GetValue(outside));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, requireCompleteCalls: false);
+                foreach (MethodEntry root in roots)
+                {
+                    Assert.ThrowsExactly<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls));
+                }
+            }
+        }
+
         // 连续序列化不能指数展开历史查询，也不能漏掉公共静态开关的初始化。
         /// <summary>复刻 KFBWriter 默认值过滤，局部对象写入不使尚未闭合的静态初始化消失。</summary>
         [TestMethod]
@@ -1492,6 +1601,7 @@ namespace SetterChecker.Core.Tests
             Assert.HasCount(2, roots);
             System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
             CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 4);
+            Console.WriteLine($"static-read-benchmark count={count} resolutionMs={watch.Elapsed.TotalMilliseconds:F3}");
             foreach (MethodEntry root in roots)
             {
                 Assert.Contains("初始化写入", Assert.ThrowsExactly<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls)).Message);

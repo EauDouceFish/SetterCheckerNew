@@ -392,7 +392,7 @@ namespace SetterChecker.Core
             }
             if (!complete && !publishedSubject)
             {
-                yield return new WriteSubject(reference, pathProof.ExecutionFailure ?? "单次经过循环未取得旧对象写入见证，不能据此排除其它迭代", witness);
+                yield return new WriteSubject(reference, pathProof.ExecutionFailure ?? "尚有未覆盖的执行路径，不能排除其中的旧对象写入", witness);
             }
         }
 

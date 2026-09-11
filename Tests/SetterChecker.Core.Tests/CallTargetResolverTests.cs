@@ -9,13 +9,14 @@ namespace SetterChecker.Core.Tests
         // 保留普通连接不等于完成其初始化证明，递归回边也仍须重新绑定。
         /// <summary>剪枝后的初始化失败不被隐藏，递归关系在恢复分析后保持完整。</summary>
         [TestMethod]
-        [DataRow(false)]
-        [DataRow(true)]
-        public async Task ResolveAsyncRetainedBindingsKeepInitializationAndRecursionChecks(bool recursive)
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        public async Task ResolveAsyncRetainedBindingsKeepInitializationAndRecursionChecks(bool recursive, bool construction)
         {
             using TestProject project = TestProject.CreateWithCallTargets("""
                 namespace Samples;
-                public static class Initialized
+                public sealed class Initialized
                 {
                     public static int Value;
                     static Initialized() { Value=Read(); }
@@ -36,7 +37,7 @@ namespace SetterChecker.Core.Tests
                     private static bool GateB() => false;
                     private static void Cycle() { Cycle(); }
                 }
-                """.Replace("ACTION", recursive ? "Cycle();" : "Initialized.Touch();"));
+                """.Replace("ACTION", recursive ? "Cycle();" : construction ? "new Initialized();" : "Initialized.Touch();"));
             MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
             MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
@@ -135,16 +136,24 @@ namespace SetterChecker.Core.Tests
         // 延迟条件收缩一条分支时，无关直调的固定目标不应整树重复连接。
         /// <summary>保留仍可达的普通绑定，删除不可达写入，恢复分析及不同并行额度的结果一致。</summary>
         [TestMethod]
-        public async Task ResolveAsyncRetainsDirectBindingsWhenAPathShrinks()
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task ResolveAsyncRetainsDirectBindingsWhenAPathShrinks(bool construction)
         {
             using TestProject project = TestProject.CreateWithCallTargets("""
                 namespace Samples;
                 public sealed class Data { public int Value; }
+                public sealed class Quiet
+                {
+                    public Quiet() { First(); }
+                    private void First() { Second(); }
+                    private void Second() { }
+                }
                 public static class Calls
                 {
                     public static void Entry(Data outside)
                     {
-                        QuietA();
+                        QUIET
                         if (GateA()) outside.Value=1;
                     }
                     private static void QuietA() => QuietB();
@@ -155,7 +164,7 @@ namespace SetterChecker.Core.Tests
                     private static bool GateC() => GateD();
                     private static bool GateD() => false;
                 }
-                """);
+                """.Replace("QUIET", construction ? "new Quiet();" : "QuietA();"));
             MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
             MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
@@ -165,8 +174,7 @@ namespace SetterChecker.Core.Tests
                 CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs,
                     requireCompleteCalls: false, progress: progress.Add, reportProgress: (snapshot, _) =>
                         Assert.AreEqual(snapshot.Calls.Count, snapshot.Calls.Select(call => (call.CallerInstanceId, call.Call.Point)).Distinct().Count()));
-                Assert.IsTrue(progress.Any(message => message.StartsWith("路径收缩后保留 ", StringComparison.Ordinal)
-                    && !message.StartsWith("路径收缩后保留 0 ", StringComparison.Ordinal)), string.Join("\n", progress));
+                Assert.IsTrue(progress.Any(message => message.StartsWith($"路径收缩后保留 {(construction ? 16 : 14)} ", StringComparison.Ordinal)), string.Join("\n", progress));
                 foreach (bool resume in new[] { false, true })
                 {
                     if (resume)
@@ -174,8 +182,60 @@ namespace SetterChecker.Core.Tests
                         calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, previous: calls);
                     }
                     Assert.IsEmpty(calls.PendingCalls);
-                    Assert.AreEqual(14, calls.Calls.Count);
+                    Assert.AreEqual(construction ? 16 : 14, calls.Calls.Count);
                     Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(method => method.Kind == MethodEffectKind.Getter));
+                }
+            }
+        }
+
+        // 保留构造绑定不保留其字段内容或委托目标，构造参数仍按收缩后的路径重新求取。
+        /// <summary>不同输入快照保有独立对象，普通创建和显式委托创建均核对真实 DLL 运行。</summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public async Task ResolveAsyncRecomputesRetainedConstructorInputs(bool writes, bool useDelegate)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                using System;
+                namespace Samples;
+                public sealed class Data { public int Value; public void Write() { Value=1; } }
+                public sealed class Holder { public Data Item; public Holder(Data item) { Item=item; } }
+                public static class Calls
+                {
+                    public static void Entry(Data outside)
+                    {
+                        Data selected = outside;
+                        if (!GateA()) selected = new Data();
+                        OPERATION
+                    }
+                    private static bool GateA() => GateB();
+                    private static bool GateB() => GateC();
+                    private static bool GateC() => GATE;
+                }
+                """.Replace("GATE", writes ? "true" : "false").Replace("OPERATION", useDelegate
+                    ? "var call = new Action(selected.Write); call();"
+                    : "var first = new Holder(selected); var second = new Holder(new Data()); second.Item.Value=2; first.Item.Value=1;"));
+            System.Reflection.Assembly runtime = System.Reflection.Assembly.Load(File.ReadAllBytes(project.ExternalAssemblyPath));
+            object outside = Activator.CreateInstance(runtime.GetType("ExternalSamples.Data")!)!;
+            runtime.GetType("ExternalSamples.Calls")!.GetMethod("Entry")!.Invoke(null, new[] { outside });
+            Assert.AreEqual(writes ? 1 : 0, outside.GetType().GetField("Value")!.GetValue(outside));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs);
+                foreach (bool resume in new[] { false, true })
+                {
+                    if (resume)
+                    {
+                        calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, previous: calls);
+                    }
+                    Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(method =>
+                        method.Kind == (writes ? MethodEffectKind.Setter : MethodEffectKind.Getter)));
+                    Assert.AreEqual(calls.Calls.Count, calls.Calls.Select(call => (call.CallerInstanceId, call.Call.Point)).Distinct().Count());
                 }
             }
         }
