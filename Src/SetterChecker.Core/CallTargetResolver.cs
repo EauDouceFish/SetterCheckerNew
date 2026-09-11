@@ -2071,7 +2071,7 @@ namespace SetterChecker.Core
         }
 
         // 拆出数组、引用、指针或可变参数后缀，继续匹配它包住的类型。
-        private static bool TryReadTypeSuffix(string text, out string body, out string suffix)
+        internal static bool TryReadTypeSuffix(string text, out string body, out string suffix)
         {
             string? found = text.EndsWith("...", StringComparison.Ordinal) ? "..."
                 : text.EndsWith('&') ? "&"
@@ -2324,6 +2324,7 @@ namespace SetterChecker.Core
         private IntegerPathProof? m_activeIntegerProof;
         private readonly Dictionary<string, (long Value, int Bits)?> m_initializedArrayLengths = new(StringComparer.Ordinal);
         private readonly Dictionary<string, (bool Independent, ValueSourceIndex? Values)> m_initializations = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, (MethodEntry Method, MethodBehavior Body)[]> m_entryPreparations = new(StringComparer.Ordinal);
         private readonly Dictionary<(BehaviorMemberReference Member, int Instance), (TypeEntry Type, TypeIdentityTemplate[] Arguments)> m_memberTypes = new();
         private long m_integerCycles;
         private readonly Dictionary<BehaviorValueReference, IReadOnlyList<ValueOrigin>> m_runtimeValues = new();
@@ -3362,6 +3363,8 @@ namespace SetterChecker.Core
             private Func<ValueOrigin, SelectedValue>? m_readRuntimeLabel;
             private readonly Dictionary<string, int> m_typeLabels = new(StringComparer.Ordinal);
             private readonly Dictionary<string, (Microsoft.Z3.BitVecExpr Value, Microsoft.Z3.BoolExpr IsNull, HashSet<string> Types)> m_typeInputs = new(StringComparer.Ordinal);
+            private (BehaviorValueReference Receiver, string TypeId, Microsoft.Z3.BoolExpr Domain,
+                IReadOnlyDictionary<string, Microsoft.Z3.BoolExpr> Fields)? m_preparedEntry;
 
             // 同一冻结批次共用公式环境，库内部保持单线程。
             public IntegerPathProof(ValueSourceIndex sources, IReadOnlySet<int> reentered, bool firstInvocationOnly)
@@ -3400,6 +3403,7 @@ namespace SetterChecker.Core
                 this.m_readRuntimeLabel = null;
                 this.m_typeLabels.Clear();
                 this.m_typeInputs.Clear();
+                this.m_preparedEntry = null;
             }
 
             // 数值分支、引用分支和强转都可能使子调用无法正常完成。
@@ -4236,7 +4240,8 @@ namespace SetterChecker.Core
             private Microsoft.Z3.BoolExpr ReadTypeDomains()
             {
                 return this.m_context.MkAnd(this.m_typeInputs.Values.Select(input =>
-                    this.m_context.MkOr(input.IsNull, ReadTypeChoices(input.Value, input.Types))).ToArray());
+                    this.m_context.MkOr(input.IsNull, ReadTypeChoices(input.Value, input.Types)))
+                    .Append(this.m_preparedEntry?.Domain ?? this.m_true).ToArray());
             }
 
             // 参数类型来自本次实际调用签名，其余值使用已读取的真实类型。
@@ -4284,7 +4289,71 @@ namespace SetterChecker.Core
                 return ReadAcyclic(reference, known, new(), ReadInputs, (_, inputs) => inputs.All(input => known[input]));
             }
 
-            // 原存储倒查落到根入口后，公开可写字段才作为尚未给定的实际输入。
+            // 一个对象的所有入口字段共用一次完整准备，候选不能按字段自由拼接。
+            private Microsoft.Z3.BoolExpr ReadPreparedEntryField(StorageLocation location, TypeEntry type)
+            {
+                if (!this.m_buildWriteWitness || location.Receiver is not BehaviorValueReference receiver || location.InputPath != null
+                    || this.m_sources.IsRootValueSlot(location) || type.IsValueType || type.IsAbstract || type.IsExplicitLayout || type.GenericParameters.Count != 0
+                    || this.m_sources.GetInstance(receiver.InstanceId).ParentId != 0
+                    || this.m_sources.GetCallOrigins(receiver) is not [{ Value.Kind: BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance } entry]
+                    || ReadOriginType(entry) != type.Id)
+                {
+                    throw new AnalysisException("字段入口前的合法准备状态尚未闭合");
+                }
+                if (this.m_preparedEntry == null)
+                {
+                    Microsoft.Z3.BitVecExpr choice = this.m_context.MkBVConst("entryPreparation", 32);
+                    List<Microsoft.Z3.BoolExpr> alternatives = new();
+                    Dictionary<string, List<Microsoft.Z3.BoolExpr>> fields = new(StringComparer.Ordinal);
+                    foreach (var preparation in this.m_sources.ReadEntryPreparations(type))
+                    {
+                        Microsoft.Z3.BoolExpr selected = this.m_context.MkEq(choice, this.m_context.MkBV(alternatives.Count, 32));
+                        Microsoft.Z3.BoolExpr condition = selected;
+                        foreach (BehaviorWrite write in preparation.Body.Writes.GroupBy(write => write.Member!.Name).Select(group => group.Last()))
+                        {
+                            string fieldType = this.m_sources.m_catalog.ReadResolvedFieldType(write.Member!).Text;
+                            string? integerType = this.m_sources.ReadEntryIntegerType(fieldType);
+                            if (integerType == null)
+                            {
+                                continue;
+                            }
+                            uint bits = integerType is "System.Int64" or "System.UInt64" ? 64u : 32u;
+                            BehaviorValue input = ReadPreparationInput(preparation.Body, write.ValueId);
+                            Microsoft.Z3.BitVecExpr value = input.Kind == BehaviorValueKind.Constant
+                                ? this.m_context.MkBV(input.Reference!, bits)
+                                : this.m_context.MkBVConst($"entryArgument{preparation.Method.Id}:{input.ParameterIndex}:{bits}", bits);
+                            if (input.Kind == BehaviorValueKind.Parameter)
+                            {
+                                condition = JoinConditions(condition, ReadIntegerDomain(value,
+                                    CallTargetResolver.ReadIntegerType(this.m_sources.m_catalog, preparation.Method.Parameters[input.ParameterIndex!.Value].TypeIdentity.Text)));
+                            }
+                            StorageLocation target = location with { Member = type.Id + "<>::" + write.Member!.Name, ValueType = fieldType };
+                            Microsoft.Z3.BitVecExpr stored = this.m_context.MkBVConst($"fFalse_{bits}_{ReadStorageLocationKey(new[] { target })}", bits);
+                            SelectedValue loaded = ReadIntegerLoad(new SelectedValue(value, this.m_true), integerType);
+                            condition = JoinConditions(condition, this.m_context.MkEq(stored, loaded.Expression));
+                            if (!fields.TryGetValue(target.Member, out List<Microsoft.Z3.BoolExpr>? writers))
+                            {
+                                writers = new();
+                                fields.Add(target.Member, writers);
+                            }
+                            writers.Add(selected);
+                        }
+                        alternatives.Add(condition);
+                    }
+                    this.m_preparedEntry = (receiver, type.Id, MergeConditions(alternatives),
+                        fields.ToDictionary(pair => pair.Key, pair => MergeConditions(pair.Value), StringComparer.Ordinal));
+                }
+                var state = this.m_preparedEntry.Value;
+                if (state.Receiver != receiver || state.TypeId != type.Id)
+                {
+                    throw new AnalysisException("多个入口对象的准备历史关联尚未闭合");
+                }
+                this.m_witnessHasExcludedPaths = true;
+                return state.Fields.GetValueOrDefault(location.Member)
+                    ?? throw new AnalysisException("没有找到该字段可正常完成的公开准备过程");
+            }
+
+            // 入口字段沿实际存储倒查；私有字段只使用受限的合法前史正见证。
             private SelectedValue ReadInputField(ValueOrigin origin, uint bits, bool readNullness, IReadOnlyList<ValueOrigin>? receivers = null)
             {
                 if (origin.Value.Member == null || origin.Value.InputValueIds.Count > 1)
@@ -4304,7 +4373,7 @@ namespace SetterChecker.Core
                 (TypeEntry type, _) = this.m_sources.ReadMemberType(origin.Value.Member, this.m_sources.GetInstance(origin.Reference.InstanceId));
                 var field = this.m_sources.m_catalog.GetFields(type).Single(value => value.Name == origin.Value.Member.Name);
                 string? integerType = readNullness ? null : CallTargetResolver.ReadIntegerType(this.m_sources.m_catalog, locations[0].ValueType);
-                if (!field.IsPublic || field.IsStatic != isStatic || field.IsInitOnly || field.IsLiteral
+                if (field.IsStatic != isStatic || field.IsInitOnly || field.IsLiteral || !field.IsPublic && (isStatic || readNullness)
                     || !readNullness && integerType is not ("System.Boolean" or "System.Char" or "System.Byte" or "System.SByte"
                         or "System.Int16" or "System.UInt16" or "System.Int32" or "System.UInt32" or "System.Int64" or "System.UInt64"))
                 {
@@ -4312,10 +4381,14 @@ namespace SetterChecker.Core
                 }
                 Microsoft.Z3.BitVecExpr value = this.m_context.MkBVConst($"f{readNullness}_{bits}_{ReadStorageLocationKey(locations)}", bits);
                 Microsoft.Z3.BoolExpr valid = this.m_true;
+                if (!field.IsPublic)
+                {
+                    valid = ReadPreparedEntryField(locations[0], type);
+                }
                 if (!isStatic && !this.m_sources.IsRootValueSlot(locations[0]))
                 {
                     SelectedValue nonNull = ReadValue(locations[0].Receiver!.Value, true);
-                    valid = JoinConditions(nonNull.Condition, this.m_context.MkNot(this.m_context.MkEq(nonNull.Expression, this.m_context.MkBV(0, 32))));
+                    valid = JoinConditions(valid, JoinConditions(nonNull.Condition, this.m_context.MkNot(this.m_context.MkEq(nonNull.Expression, this.m_context.MkBV(0, 32)))));
                 }
                 if (readNullness)
                 {
@@ -5502,6 +5575,69 @@ namespace SetterChecker.Core
             }
             this.m_initializedArrayLengths.Add(key, result);
             return result;
+        }
+
+        // 只收录完整的公开直线设置；引用仅允许私有字段中的恒等复制，不推断其内容。
+        private (MethodEntry Method, MethodBehavior Body)[] ReadEntryPreparations(TypeEntry type)
+        {
+            if (this.m_entryPreparations.TryGetValue(type.Id, out var known))
+            {
+                return known;
+            }
+            var fields = this.m_catalog.GetFields(type).ToDictionary(field => field.Name);
+            List<(MethodEntry, MethodBehavior)> result = new();
+            foreach (MethodEntry method in this.m_catalog.GetMethods(type).Where(method => method.IsPublic && !method.IsStatic && !method.IsAbstract
+                && (!method.IsVirtual || method.IsFinal) && method.GenericArity == 0 && method.ReturnTypeId == "System.Void"
+                && method.Kind is MethodKind.Ordinary or MethodKind.PropertySet && method.Parameters.All(parameter => parameter.RefKind == RefKind.None)))
+            {
+                MethodBehavior body = this.m_catalog.ReadMethodBehavior(method);
+                if (body.BodyKind != MethodBodyKind.Executable || body.Failure != null || body.Assignments.Count != 0
+                    || body.ExceptionHandlers.Count != 0 || body.Calls.Count != 0 || body.Returns.Count != 1
+                    || body.Blocks.Any(block => block.ConditionValueId != null || block.Successors.Count > 1
+                        || block.Successors.Any(edge => edge.TargetBlockId <= block.Id || edge.Semantics is not (Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics.Regular
+                            or Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics.Return)))
+                    || body.Values.Any(value => ReadPreparationInput(body, value.Id).Kind is not (BehaviorValueKind.CurrentInstance or BehaviorValueKind.Parameter or BehaviorValueKind.Constant)))
+                {
+                    continue;
+                }
+                if (body.Writes.Count != 0 && body.Writes.All(write => write.Kind == BehaviorWriteKind.Field && write.ReceiverValueId is int receiver
+                    && ReadPreparationInput(body, receiver).Kind == BehaviorValueKind.CurrentInstance && write.Member is { } member
+                    && member.DeclaringTypeDefinitionId == type.LogicalId && fields.TryGetValue(member.Name, out var field) && !field.IsStatic && !field.IsInitOnly
+                    && ReadPreparationInput(body, write.ValueId) is var input && input.Kind is BehaviorValueKind.Constant or BehaviorValueKind.Parameter
+                    && (ReadEntryIntegerType(this.m_catalog.ReadResolvedFieldType(member).Text) != null
+                        && (input.Kind == BehaviorValueKind.Constant && input.Reference != null && input.Type != null
+                            && ReadEntryIntegerType(input.Type.Id) != null
+                            || input.Kind == BehaviorValueKind.Parameter && ReadEntryIntegerType(method.Parameters[input.ParameterIndex!.Value].TypeIdentity.Text) != null)
+                        || field.IsPrivate && !field.FieldType.IsValueType && (input.Kind == BehaviorValueKind.Constant && input.Reference == null
+                            || input.Kind == BehaviorValueKind.Parameter && method.Parameters[input.ParameterIndex!.Value].TypeIdentity.Text == this.m_catalog.ReadResolvedFieldType(member).Text))))
+                {
+                    result.Add((method, body));
+                }
+            }
+            var preparations = result.ToArray();
+            this.m_entryPreparations.Add(type.Id, preparations);
+            return preparations;
+        }
+
+        // 直线设置不允许改写参数或局部槽，因此槽读取直接指向原始输入。
+        private static BehaviorValue ReadPreparationInput(MethodBehavior body, int valueId)
+        {
+            BehaviorValue value = body.Values[valueId];
+            return value.Kind == BehaviorValueKind.SlotRead && value.InputValueIds.Count == 1
+                && body.Values[value.InputValueIds[0]].Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance
+                ? body.Values[value.InputValueIds[0]] : value;
+        }
+
+        // 准备过程仅对已有整数模型可表示的字段建立约束。
+        private string? ReadEntryIntegerType(string type)
+        {
+            if (CallTargetResolver.TryReadTypeSuffix(type, out _, out _))
+            {
+                return null;
+            }
+            string? integer = type.StartsWith('A') ? CallTargetResolver.ReadIntegerType(this.m_catalog, type) : type;
+            return integer is "System.Boolean" or "System.Char" or "System.Byte" or "System.SByte" or "System.Int16"
+                or "System.UInt16" or "System.Int32" or "System.UInt32" or "System.Int64" or "System.UInt64" ? integer : null;
         }
 
         // 共用初始化事实准入，外部调用、外部读取及跨类型写入都不能冒充独立初始化。

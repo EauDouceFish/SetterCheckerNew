@@ -4,6 +4,262 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 入口前状态只用于证明根内真实写入，同次设置的字段和参数不能自由拼接。
+        /// <summary>公开准备函数建立合法私有状态；新对象、异常准备和不一致字段不借用该证明。</summary>
+        [TestMethod]
+        [DataRow("enabled", "Setter")]
+        [DataRow("correlated", "Unproved")]
+        [DataRow("empty", "Getter")]
+        [DataRow("fresh", "Getter")]
+        [DataRow("private", "Unproved")]
+        [DataRow("throwing", "Unproved")]
+        [DataRow("parameter-reassigned", "Unproved")]
+        [DataRow("separate-preparations", "Unproved")]
+        public async Task AnalyzeUsesOneCompletePublicPreparationForEntryState(string variant, string expected)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Reader
+                {
+                    private bool enabled;
+                    private int left;
+                    private int right;
+                    private byte[] buffer;
+                    public int Value;
+                    ACCESS void Prepare(int number, byte[] bytes)
+                    {
+                        enabled = true;
+                        PARAMETER
+                        left = number;
+                        right = RIGHT;
+                        buffer = bytes;
+                        EXIT
+                    }
+                    public bool Enabled() => enabled;
+                    public bool Different() => left != right;
+                    ALTERNATIVE
+                }
+                public static class Calls
+                {
+                    public static void Entry(Reader input) { ENTRY }
+                }
+                """.Replace("ACCESS", variant == "private" ? "private" : "public")
+                .Replace("EXIT", variant == "throwing" ? "throw null;" : string.Empty)
+                .Replace("PARAMETER", variant == "parameter-reassigned" ? "number = 0;" : string.Empty)
+                .Replace("RIGHT", variant == "parameter-reassigned" ? "1" : "number")
+                .Replace("ALTERNATIVE", variant == "separate-preparations" ? "public void Other(int number) { enabled = false; left = number; right = 0; }" : string.Empty)
+                .Replace("ENTRY", variant switch
+                {
+                    "empty" => string.Empty,
+                    "fresh" => "var reader = new Reader(); if (reader.Enabled()) input.Value = 1;",
+                    "correlated" => "if (input.Different()) input.Value = 1;",
+                    "parameter-reassigned" => "if (input.Enabled() && !input.Different()) input.Value = 1;",
+                    "separate-preparations" => "if (input.Enabled() && input.Different()) input.Value = 1;",
+                    _ => "if (input.Enabled()) input.Value = 1;",
+                }));
+            System.Reflection.Assembly runtime = System.Reflection.Assembly.Load(File.ReadAllBytes(project.ExternalAssemblyPath));
+            object input = Activator.CreateInstance(runtime.GetType("ExternalSamples.Reader")!)!;
+            if (variant != "private")
+            {
+                if (variant == "throwing")
+                {
+                    Assert.ThrowsExactly<System.Reflection.TargetInvocationException>(() => input.GetType().GetMethod("Prepare")!.Invoke(input, new object[] { 7, new byte[] { 0 } }));
+                }
+                else
+                {
+                    input.GetType().GetMethod("Prepare")!.Invoke(input, new object[] { 7, new byte[] { 0 } });
+                }
+            }
+            runtime.GetType("ExternalSamples.Calls")!.GetMethod("Entry")!.Invoke(null, new[] { input });
+            Assert.AreEqual(variant is "enabled" or "throwing" ? 1 : 0, input.GetType().GetField("Value")!.GetValue(input));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                CallTargetResolutionResult? calls = null;
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, previous: calls);
+                    foreach (MethodEntry root in roots)
+                    {
+                        if (expected == "Unproved")
+                        {
+                            Assert.ThrowsExactly<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls));
+                        }
+                        else
+                        {
+                            Assert.AreEqual(expected, new EffectAnalyzer().Analyze(catalog, new[] { root }, calls).Methods.Single().Kind.ToString());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 抽象类型没有任何真实实现时，公开设置方法不能凭空生成接收对象。
+        /// <summary>空的实现范围不能作为私有字段状态的修改见证。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task AnalyzeEntryPreparationRequiresConcreteReceiver(bool inherited)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                DECLARATION
+                {
+                    private bool enabled;
+                    public void Prepare() { enabled = true; }
+                    public bool Enabled() => enabled;
+                }
+                DERIVED
+                public sealed class Data { public int Value; }
+                public static class Calls
+                {
+                    public static void Entry(Reader input, Data target) { if (input.Enabled()) target.Value = 1; }
+                }
+                """.Replace("DECLARATION", inherited ? "public class BaseReader" : "public abstract class Reader")
+                .Replace("DERIVED", inherited ? "public abstract class Reader : BaseReader { }" : string.Empty));
+            System.Reflection.Assembly runtime = System.Reflection.Assembly.Load(File.ReadAllBytes(project.ExternalAssemblyPath));
+            object target = Activator.CreateInstance(runtime.GetType("ExternalSamples.Data")!)!;
+            Assert.ThrowsExactly<System.Reflection.TargetInvocationException>(() => runtime.GetType("ExternalSamples.Calls")!
+                .GetMethod("Entry")!.Invoke(null, new[] { null, target }));
+            Assert.AreEqual(0, target.GetType().GetField("Value")!.GetValue(target));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs);
+                foreach (MethodEntry root in roots)
+                {
+                    Assert.ThrowsExactly<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls));
+                }
+            }
+        }
+
+        // 准备函数明确清空的引用不能在根内被假定存在合法写入目标。
+        /// <summary>私有数值状态见证不补造私有引用的对象身份。</summary>
+        [TestMethod]
+        public async Task AnalyzeEntryPreparationDoesNotInventPrivateReference()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public sealed class Reader
+                {
+                    private bool enabled;
+                    private Data target;
+                    public void Prepare() { enabled = true; target = null; }
+                    public void Touch() { if (enabled) target.Value = 1; }
+                }
+                public static class Calls { public static void Entry(Reader input) { input.Touch(); } }
+                """);
+            System.Reflection.Assembly runtime = System.Reflection.Assembly.Load(File.ReadAllBytes(project.ExternalAssemblyPath));
+            object input = Activator.CreateInstance(runtime.GetType("ExternalSamples.Reader")!)!;
+            input.GetType().GetMethod("Prepare")!.Invoke(input, null);
+            System.Reflection.TargetInvocationException failure = Assert.ThrowsExactly<System.Reflection.TargetInvocationException>(() => runtime.GetType("ExternalSamples.Calls")!
+                .GetMethod("Entry")!.Invoke(null, new[] { input }));
+            Assert.IsInstanceOfType<NullReferenceException>(failure.InnerException);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs);
+                foreach (MethodEntry root in roots)
+                {
+                    Assert.ThrowsExactly<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls));
+                }
+            }
+        }
+
+        // 复刻 KFBReader 的完整字节绑定和整数前缀读取，验证旧读取器游标的修改。
+        /// <summary>准备过程中的枚举、长整数和私有引用不妨碍证明随后真实发生的游标写入。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task AnalyzeKfbReaderPreparedByteModeWritesExistingCursor(bool multiByte)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public enum KFBWireType { None = -1, Variant = 0 }
+                public sealed class Reader
+                {
+                    private System.IO.BinaryReader m_reader;
+                    private byte[] m_buffer;
+                    private int m_offset, m_position, m_length, m_currentFieldNumber, m_depth;
+                    private long m_byteBlockEnd;
+                    private KFBWireType m_currentWireType;
+                    private bool m_isByteMode;
+                    public int Cursor => m_position;
+                    public void BindBytes(byte[] data, int offset, int length)
+                    {
+                        m_buffer = data;
+                        m_offset = offset;
+                        m_position = offset;
+                        m_length = length;
+                        m_currentWireType = KFBWireType.None;
+                        m_currentFieldNumber = 0;
+                        m_byteBlockEnd = long.MaxValue;
+                        m_depth = 0;
+                        m_isByteMode = true;
+                        m_reader = null;
+                    }
+                    public int ReadPrefix()
+                    {
+                        if (m_isByteMode) return Read7BitEncodedIntBytes();
+                        return 0;
+                    }
+                    private int Read7BitEncodedIntBytes()
+                    {
+                        int count = 0;
+                        int shift = 0;
+                        byte b;
+                        do
+                        {
+                            if (shift == 35)
+                                throw new System.FormatException("Bad 7-bit encoded int");
+                            b = m_buffer[m_position++];
+                            count |= (b & 0x7F) << shift;
+                            shift += 7;
+                        } while ((b & 0x80) != 0);
+                        return count;
+                    }
+                }
+                public static class Calls
+                {
+                    public static int Entry(Reader input) { return input.ReadPrefix(); }
+                }
+                """);
+            System.Reflection.Assembly runtime = System.Reflection.Assembly.Load(File.ReadAllBytes(project.ExternalAssemblyPath));
+            object input = Activator.CreateInstance(runtime.GetType("ExternalSamples.Reader")!)!;
+            byte[] bytes = multiByte ? new byte[] { 0x80, 1 } : new byte[] { 0 };
+            input.GetType().GetMethod("BindBytes")!.Invoke(input, new object[] { bytes, 0, bytes.Length });
+            Assert.AreEqual(0, input.GetType().GetProperty("Cursor")!.GetValue(input));
+            object? result = runtime.GetType("ExternalSamples.Calls")!.GetMethod("Entry")!.Invoke(null, new[] { input });
+            Assert.AreEqual(multiByte ? 128 : 0, result);
+            Assert.AreEqual(bytes.Length, input.GetType().GetProperty("Cursor")!.GetValue(input));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                CallTargetResolutionResult? calls = null;
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, previous: calls);
+                    foreach (MethodEntry root in roots)
+                    {
+                        Assert.AreEqual("Setter", new EffectAnalyzer().Analyze(catalog, new[] { root }, calls).Methods.Single().Kind.ToString());
+                    }
+                }
+            }
+        }
+
         // 泛型辅助函数取得成员后，写回的引用仍属于实际传入的对象。
         /// <summary>反射与普通读取共用实际构造类型和对象来源，不能把新外壳里的旧对象误判为新对象。</summary>
         [TestMethod]

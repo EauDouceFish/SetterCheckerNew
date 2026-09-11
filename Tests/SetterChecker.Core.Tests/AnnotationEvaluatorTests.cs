@@ -4,6 +4,71 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class AnnotationEvaluatorTests
     {
+        // 入口前合法状态与当前调用分开，准备函数的标签不影响本次独立写入。
+        /// <summary>准备过程既不虚增调用告警，也不覆盖根内后续清除状态和可信豁免。</summary>
+        [TestMethod]
+        [DataRow(false, "bare")]
+        [DataRow(true, "bare")]
+        [DataRow(false, "reason")]
+        [DataRow(true, "reason")]
+        [DataRow(false, "class")]
+        [DataRow(true, "class")]
+        public async Task RunSeparatesEntryPreparationFromCurrentTracking(bool external, string annotation)
+        {
+            string library = """
+                namespace KH { public class NoLogTrackAttribute : System.Attribute { public NoLogTrackAttribute(string reason = "") { } } }
+                namespace Samples
+                {
+                    CLASS
+                    public sealed class Reader
+                    {
+                        private bool enabled;
+                        public int Value;
+                        METHOD public void Prepare() { enabled = true; }
+                        [KH.NoLogTrack("内部状态清除")] public void Clear() { enabled = false; }
+                        public bool Enabled => enabled;
+                    }
+                }
+                """.Replace("CLASS", annotation == "class" ? "[KH.NoLogTrack]" : string.Empty)
+                .Replace("METHOD", annotation == "bare" ? "[KH.NoLogTrack]" : annotation == "reason" ? "[KH.NoLogTrack(\"准备状态\")]" : string.Empty);
+            using TestProject project = external ? TestProject.CreateWithCallTargets(library) : TestProject.CreateSingleAssembly();
+            project.WriteRootSource((external ? string.Empty : library) + """
+                public static class Calls
+                {
+                    public static void Entry(Samples.Reader input) { if (input.Enabled) input.Value = 1; }
+                    public static void Empty(Samples.Reader input) { }
+                    public static void AfterClear(Samples.Reader input) { input.Clear(); if (input.Enabled) input.Value = 1; }
+                    public static void AfterPrepare(Samples.Reader input) { input.Prepare(); if (input.Enabled) input.Value = 1; }
+                }
+                """);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                AnalysisRun run = await new SetterChecker().AnalyzeAsync(new MaterialRequest(project.AssemblyDefinitionPath, jobs));
+                Assert.IsTrue(run.Complete);
+                AnnotationMethod entry = run.Annotations.Methods.Single(method => method.Class == "Calls" && method.Name == "Entry");
+                Assert.AreEqual(MethodEffectKind.Setter, entry.Actual);
+                Assert.AreEqual("ShouldTrack", entry.Decision);
+                AnnotationMethod empty = run.Annotations.Methods.Single(method => method.Class == "Calls" && method.Name == "Empty");
+                Assert.AreEqual(MethodEffectKind.Getter, empty.Actual);
+                Assert.AreEqual("NoLogTrack", empty.Decision);
+                AnnotationMethod cleared = run.Annotations.Methods.Single(method => method.Class == "Calls" && method.Name == "AfterClear");
+                Assert.AreEqual(MethodEffectKind.Setter, cleared.Actual);
+                Assert.AreEqual("NoLogTrack", cleared.Decision);
+                AnnotationMethod prepared = run.Annotations.Methods.Single(method => method.Class == "Calls" && method.Name == "AfterPrepare");
+                Assert.AreEqual(MethodEffectKind.Setter, prepared.Actual);
+                Assert.AreEqual("ShouldTrack", prepared.Decision);
+                if (!external)
+                {
+                    AnnotationMethod preparation = run.Annotations.Methods.Single(method => method.Name == "Prepare");
+                    Assert.AreEqual(MethodEffectKind.Setter, preparation.Actual);
+                    Assert.AreEqual(annotation == "class" ? "NLTClass" : "NoLogTrack", preparation.Decision);
+                    Assert.AreEqual(annotation == "bare", preparation.MissingReason);
+                    Assert.IsFalse(preparation.WarningPaths.Any(path => path.Contains(entry.Id) || path.Contains(empty.Id) || path.Contains(cleared.Id)));
+                    Assert.AreEqual(annotation == "bare", preparation.WarningPaths.Any(path => path.Contains(prepared.Id)));
+                }
+            }
+        }
+
         // 复刻 KH 校验和生成属性：外层避免重复日志，实际字段写入由内层记录。
         /// <summary>源码和 DLL 都保留真实写入，可信豁免仅阻断追踪，裸标签仍提示补充原因。</summary>
         [TestMethod]
