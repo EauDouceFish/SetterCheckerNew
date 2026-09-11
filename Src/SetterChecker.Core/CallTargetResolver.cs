@@ -41,6 +41,9 @@ namespace SetterChecker.Core
                 .Select(call => (behaviors[call.CallerMethodId], call.Call, sources.GetInstance(call.CallerInstanceId))).ToList() ?? new();
             List<PendingCall> deferred = new();
             Dictionary<int, EffectEvidence> provenSetters = new();
+            Dictionary<string, MethodEffect> provenGetters = new(StringComparer.Ordinal);
+            HashSet<string?> businessAssemblies = roots.Select(root => root.AssemblyPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            int getterGeneration = -1;
             Dictionary<(int InstanceId, int Position), string> failures = previous?.PendingCalls.Where(call => call.Failure != null)
                 .ToDictionary(call => (call.CallerInstanceId, call.Call.Point.BlockId), call => call.Failure!) ?? new();
             BehaviorReader reader = new();
@@ -99,6 +102,10 @@ namespace SetterChecker.Core
 
                 HashSet<int> frozenRoots = provenSetters.Keys.ToHashSet();
                 HashSet<int> recheckRoots = sources.TakeChangedRoots(frozenRoots);
+                foreach (int root in recheckRoots)
+                {
+                    provenGetters.Remove(sources.GetInstance(root).MethodId);
+                }
                 bindingRoots.UnionWith(recheckRoots);
                 progress?.Invoke($"本轮重新检查 {recheckRoots.Count} 个入口的执行条件。");
                 HashSet<int> changedRoots = recheckRoots.Count == 0 ? new() : sources.RefineReachability(frozenRoots, recheckRoots, jobs, cancellationToken);
@@ -132,7 +139,32 @@ namespace SetterChecker.Core
                 if (!requireCompleteCalls && previous == null && waiting.Count != 0)
                 {
                     CallTargetResolutionResult current = ReadResult();
-                    EffectAnalysisResult proofs = new EffectAnalyzer().AnalyzeAvailable(catalog, roots, current, false, cancellationToken, provenSetters);
+                    int generation = catalog.SemanticGeneration;
+                    if (getterGeneration != generation)
+                    {
+                        provenGetters.Clear();
+                        getterGeneration = generation;
+                    }
+                    MethodEffect[] reused = provenGetters.Values.ToArray();
+                    EffectAnalysisResult proofs = new EffectAnalyzer().AnalyzeAvailable(catalog,
+                        roots.Where(root => !provenGetters.ContainsKey(root.Id)).ToArray(), current, false, cancellationToken,
+                        provenSetters, businessAssemblies: businessAssemblies);
+                    if (generation != catalog.SemanticGeneration)
+                    {
+                        provenGetters.Clear();
+                        reused = Array.Empty<MethodEffect>();
+                    }
+                    else
+                    {
+                        HashSet<int> pendingRoots = current.PendingCalls.Select(call => sources.GetInstance(call.CallerInstanceId).RootId).ToHashSet();
+                        foreach (MethodEffect method in proofs.Methods.Where(method => method.Kind == MethodEffectKind.Getter
+                            && !pendingRoots.Contains(sources.RootInstances[method.MethodId].Id)))
+                        {
+                            provenGetters.Add(method.MethodId, method);
+                        }
+                    }
+                    proofs = proofs with { Methods = proofs.Methods.Concat(reused).OrderBy(method => method.MethodId, StringComparer.Ordinal).ToArray() };
+                    progress?.Invoke($"本轮复用 {reused.Length} 个未变化的只读结论。");
                     reportProgress?.Invoke(current, proofs);
                     foreach (MethodEffect method in proofs.Methods.Where(method => method.Kind == MethodEffectKind.Setter))
                     {
@@ -477,23 +509,30 @@ namespace SetterChecker.Core
                 List<ValueOrigin> members = new();
                 foreach (ValueOrigin type in types)
                 {
+                    TypeIdentityTemplate shape = sources.GetInstance(type.Reference.InstanceId).Substitute(catalog.ReadResolvedTypeIdentity(type.Value.Type!));
+                    if (TryReadTypeSuffix(shape.Text, out _, out _))
+                    {
+                        throw new AnalysisException($"反射成员的类型形状尚未闭合：{shape.Text}");
+                    }
                     TypeEntry reflectedType = catalog.ResolveTypeDefinition(type.Value.Type!);
                     catalog.RequireClosedHierarchy(reflectedType);
-                    if (reflectedType.GenericParameters.Count != 0 && declaration.Method.Name != "GetField")
+                    TypeIdentityTemplate[] reflectedArguments = catalog.ReadResolvedTypeArguments(type.Value.Type!)
+                        .Select(sources.GetInstance(type.Reference.InstanceId).Substitute).ToArray();
+                    if (reflectedArguments.Length != reflectedType.GenericParameters.Count || reflectedArguments.Any(argument => argument.HasUnspecifiedParameter || ContainsTypeParameter(argument.Text)))
                     {
-                        throw new AnalysisException($"反射构造类型实参尚未闭合：{reflectedType.Id}");
+                        throw new AnalysisException($"反射成员的实际构造参数尚未闭合：{reflectedType.FullName}");
                     }
                     foreach (ValueOrigin name in names)
                     {
                         if (declaration.Method.Name == "GetProperty")
                         {
-                            var properties = catalog.ReadInheritedTypes(reflectedType, includeInterfaces: false)
-                                .Prepend(new MethodCatalogResult.InheritedTypeRelation(reflectedType, Array.Empty<TypeIdentityTemplate>(), false, false, 0))
+                            var properties = catalog.ReadInheritedTypes(reflectedType, reflectedArguments, includeInterfaces: false)
+                                .Prepend(new MethodCatalogResult.InheritedTypeRelation(reflectedType, reflectedArguments, false, false, 0))
                                 .OrderBy(parent => parent.Depth).SelectMany(parent => catalog.GetProperties(parent.Definition)
                                     .Where(property => property.Name == name.Value.Reference
                                         && (property.GetMethod?.IsPublic == true || property.SetMethod?.IsPublic == true)
                                         && (parent.Definition.Id == reflectedType.Id || (property.GetMethod ?? property.SetMethod).IsStatic == false))
-                                    .Select(property => (Property: property, Owner: parent.Definition,
+                                    .Select(property => (Property: property, Owner: parent,
                                         Signature: ReadPropertySignature(catalog, property, parent))))
                                 .DistinctBy(property => property.Signature).ToArray();
                             if (properties.Length != 1 || properties[0].Property.HasParameters)
@@ -501,24 +540,22 @@ namespace SetterChecker.Core
                                 throw new AnalysisException($"反射属性查找或索引实参尚未闭合：{reflectedType.FullName}.{name.Value.Reference}");
                             }
                             var property = properties[0];
+                            // 属性访问器保留选中继承层的实参，不把泛型声明参数当成实际参数。
+                            BehaviorMethodReference? ReadAccessor(Mono.Cecil.MethodDefinition? accessor)
+                            {
+                                return accessor == null ? null : catalog.ReadMethodReference(catalog.GetMethods(property.Owner.Definition)
+                                    .Single(method => method.MetadataToken == accessor.MetadataToken.ToInt32()), property.Owner.TypeArguments);
+                            }
                             members.Add(new ValueOrigin(resultReference, body.Values[resultReference.ValueId] with
                             {
                                 Kind = BehaviorValueKind.Function,
-                                Property = new BehaviorPropertyReference(property.Property.GetMethod == null ? null
-                                        : catalog.ReadManagedMethodReference(property.Property.GetMethod, property.Owner.AssemblyPath!),
-                                    property.Property.SetMethod == null ? null
-                                        : catalog.ReadManagedMethodReference(property.Property.SetMethod, property.Owner.AssemblyPath!)),
-                            }));
+                                Property = new BehaviorPropertyReference(ReadAccessor(property.Property.GetMethod), ReadAccessor(property.Property.SetMethod)),
+                            })
+                            { Selection = multipleTypes ? (receiver.Single(), type) : (arguments[0].Single(), name) });
                             continue;
                         }
                         if (declaration.Method.Name == "GetField")
                         {
-                            TypeIdentityTemplate[] reflectedArguments = catalog.ReadResolvedTypeArguments(type.Value.Type!)
-                                .Select(sources.GetInstance(type.Reference.InstanceId).Substitute).ToArray();
-                            if (reflectedArguments.Length != reflectedType.GenericParameters.Count || reflectedArguments.Any(argument => argument.HasUnspecifiedParameter || ContainsTypeParameter(argument.Text)))
-                            {
-                                throw new AnalysisException($"反射字段的实际构造参数尚未闭合：{reflectedType.FullName}");
-                            }
                             BehaviorMemberReference[] fields = catalog.ReadInheritedTypes(reflectedType, reflectedArguments, includeInterfaces: false)
                                 .Where(parent => !flags.HasFlag(System.Reflection.BindingFlags.DeclaredOnly))
                                 .Prepend(new MethodCatalogResult.InheritedTypeRelation(reflectedType, reflectedArguments, false, false, 0))
@@ -556,11 +593,11 @@ namespace SetterChecker.Core
                             { Selection = multipleTypes ? (receiver.Single(), type) : (arguments[0].Single(), name) });
                             continue;
                         }
-                        MethodEntry[] matches = catalog.GetMethods(reflectedType)
-                            .Concat(catalog.ReadInheritedTypes(reflectedType).Where(parent => !parent.IsInterface)
-                                .SelectMany(parent => catalog.GetMethods(parent.Definition).Where(method => !method.IsStatic)))
-                            .Where(method => method.Kind is not (MethodKind.Constructor or MethodKind.StaticConstructor)
-                                && method.IsPublic && method.Name == name.Value.Reference).ToArray();
+                        var matches = catalog.ReadInheritedTypes(reflectedType, reflectedArguments, includeInterfaces: false)
+                            .Prepend(new MethodCatalogResult.InheritedTypeRelation(reflectedType, reflectedArguments, false, false, 0))
+                            .SelectMany(parent => catalog.GetMethods(parent.Definition).Where(method => (parent.Depth == 0 || !method.IsStatic)
+                                && method.Kind is not (MethodKind.Constructor or MethodKind.StaticConstructor)
+                                && method.IsPublic && method.Name == name.Value.Reference).Select(method => (Method: method, Owner: parent))).ToArray();
                         if (matches.Length != 1)
                         {
                             throw new AnalysisException($"反射函数查找没有唯一结果：{reflectedType.FullName}.{name.Value.Reference}");
@@ -568,8 +605,9 @@ namespace SetterChecker.Core
                         members.Add(new ValueOrigin(resultReference, body.Values[resultReference.ValueId] with
                         {
                             Kind = BehaviorValueKind.Function,
-                            Method = catalog.ReadMethodReference(matches[0]),
-                        }));
+                            Method = catalog.ReadMethodReference(matches[0].Method, matches[0].Owner.TypeArguments),
+                        })
+                        { Selection = multipleTypes ? (receiver.Single(), type) : (arguments[0].Single(), name) });
                     }
                 }
                 sources.BindRuntimeValue(resultReference, members);
@@ -784,7 +822,8 @@ namespace SetterChecker.Core
                         bindings.Add((candidate, new ResolvedCallTarget(candidate.Method.Id, member.Value.Method!,
                             candidate.Method.IsStatic ? Array.Empty<BehaviorValueReference>() : arguments[0],
                             suppliedArguments,
-                            candidate.DeclaringTypeArguments.Select(type => type.Text).ToArray())));
+                            candidate.DeclaringTypeArguments.Select(type => type.Text).ToArray())
+                        { TargetSelections = new[] { (receiver.Single(), member) } }));
                     }
                 }
                 if (bindings.Count > 0 && resolvedMembers != members.Count)
@@ -4661,7 +4700,7 @@ namespace SetterChecker.Core
                 int stopAtInstance, IReadOnlyList<ValueOrigin> origins)
             {
                 Dictionary<BehaviorValueReference, SelectedValue> labels = new();
-                Dictionary<BehaviorMemberReference, SelectedValue> runtimeLabels = new();
+                Dictionary<(BehaviorMemberReference? Field, BehaviorMethodReference? Method, BehaviorPropertyReference? Property), SelectedValue> runtimeLabels = new();
                 int nextLabel = 0;
                 Dictionary<(BehaviorValueReference Reference, bool Identity), SelectedValue> known = new();
                 HashSet<(BehaviorValueReference Reference, bool Identity)> active = new();
@@ -4680,16 +4719,22 @@ namespace SetterChecker.Core
                 // 同一个查找调用可产出不同成员，成员身份不能压成调用结果编号。
                 SelectedValue ReadRuntimeLeaf(ValueOrigin origin)
                 {
-                    if (origin.Value.Kind == BehaviorValueKind.FieldRead && !this.m_sources.m_runtimeValues.ContainsKey(origin.Reference)
+                    var member = (Field: origin.Value.Member, Method: (BehaviorMethodReference?)null, Property: (BehaviorPropertyReference?)null);
+                    if (origin.Value.Kind == BehaviorValueKind.Function && this.m_sources.m_runtimeValues.ContainsKey(origin.Reference)
+                        && (origin.Value.Method != null || origin.Value.Property != null))
+                    {
+                        member = (null, origin.Value.Property == null ? origin.Value.Method : null, origin.Value.Property);
+                    }
+                    else if (origin.Value.Kind == BehaviorValueKind.FieldRead && !this.m_sources.m_runtimeValues.ContainsKey(origin.Reference)
                         || origin.Value.Member == null || origin.Value.Kind != BehaviorValueKind.Function
                         && !(origin.Value.Kind == BehaviorValueKind.FieldRead && origin.Value.InputValueIds.Count == 0))
                     {
                         return ReadLeaf(origin.Reference);
                     }
-                    if (!runtimeLabels.TryGetValue(origin.Value.Member, out SelectedValue label))
+                    if (!runtimeLabels.TryGetValue(member, out SelectedValue label))
                     {
                         label = new SelectedValue(this.m_context.MkBV(nextLabel++, 32), this.m_true);
-                        runtimeLabels.Add(origin.Value.Member, label);
+                        runtimeLabels.Add(member, label);
                     }
                     return label;
                 }

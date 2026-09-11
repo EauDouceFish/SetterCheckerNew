@@ -4,6 +4,181 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class EffectAnalyzerTests
     {
+        // 泛型辅助函数取得成员后，写回的引用仍属于实际传入的对象。
+        /// <summary>反射与普通读取共用实际构造类型和对象来源，不能把新外壳里的旧对象误判为新对象。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task AnalyzeGenericHelperReflectionPreservesStoredObject(bool existing)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public sealed class Box<T> { public T Item; public void Put(T value) { Item=value; } }
+                public static class Calls
+                {
+                    public static void Entry(Data outside)
+                    {
+                        var box = new Box<Data>();
+                        Fill(box, INPUT);
+                        box.Item.Value = 1;
+                    }
+                    private static void Fill<T>(Box<T> box, T value)
+                    {
+                        typeof(Box<T>).GetMethod("Put").Invoke(box, new object[] { value });
+                    }
+                }
+                """.Replace("INPUT", existing ? "outside" : "new Data()"));
+            System.Reflection.Assembly runtime = System.Reflection.Assembly.Load(File.ReadAllBytes(project.ExternalAssemblyPath));
+            object outside = Activator.CreateInstance(runtime.GetType("ExternalSamples.Data")!)!;
+            runtime.GetType("ExternalSamples.Calls")!.GetMethod("Entry")!.Invoke(null, new[] { outside });
+            Assert.AreEqual(existing ? 1 : 0, outside.GetType().GetField("Value")!.GetValue(outside));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEffect result in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(existing ? MethodEffectKind.Setter : MethodEffectKind.Getter, result.Kind);
+            }
+        }
+
+        // 反射候选返回值和选择该成员的分支必须属于同一次执行。
+        /// <summary>不同类型与同类不同成员的选择都不能拼出不存在的写入路径。</summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(false, true)]
+        [DataRow(true, false)]
+        [DataRow(true, true)]
+        [DataRow(false, false, true)]
+        [DataRow(false, true, true)]
+        [DataRow(true, false, true)]
+        [DataRow(true, true, true)]
+        public async Task AnalyzeKeepsReflectedMemberReturnSelection(bool property, bool writes, bool sameType = false)
+        {
+            string source = """
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public static class First { public static object Read() => 1; public static object Number => 1; public static object Other() => 2; public static object Another => 2; }
+                public static class Second { public static object Read() => 2; public static object Number => 2; }
+                public static class Calls
+                {
+                    public static void Entry(bool flag, Data outside)
+                    {
+                        var selected = flag ? typeof(First) : typeof(Second);
+                        int value = (int)OPERATION;
+                        if (flag && value == EXPECTED) outside.Value=1;
+                    }
+                }
+                """.Replace("OPERATION", property ? "selected.GetProperty(\"Number\").GetValue(null)" : "selected.GetMethod(\"Read\").Invoke(null, null)")
+                .Replace("EXPECTED", writes ? "1" : "2");
+            if (sameType)
+            {
+                source = source.Replace("flag ? typeof(First) : typeof(Second)", "typeof(First)")
+                    .Replace("GetProperty(\"Number\")", "GetProperty(flag ? \"Number\" : \"Another\")")
+                    .Replace("GetMethod(\"Read\")", "GetMethod(flag ? \"Read\" : \"Other\")");
+            }
+            using TestProject project = TestProject.CreateWithCallTargets(source);
+            System.Reflection.Assembly runtime = System.Reflection.Assembly.Load(File.ReadAllBytes(project.ExternalAssemblyPath));
+            foreach (bool flag in new[] { false, true })
+            {
+                object outside = Activator.CreateInstance(runtime.GetType("ExternalSamples.Data")!)!;
+                runtime.GetType("ExternalSamples.Calls")!.GetMethod("Entry")!.Invoke(null, new[] { (object)flag, outside });
+                Assert.AreEqual(writes && flag ? 1 : 0, outside.GetType().GetField("Value")!.GetValue(outside));
+            }
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEffect result in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(writes ? MethodEffectKind.Setter : MethodEffectKind.Getter, result.Kind);
+            }
+        }
+
+        // 数组类型查成员不能误用其元素类型上同名的函数或属性。
+        /// <summary>不支持的类型形状明确失败，不能把实际会抛异常的调用证明成写入。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task AnalyzeRejectsElementMembersOfReflectedArray(bool property)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public class Box<T> { public T Value; public T Item { get=>Value; set=>Value=value; } public void Put(T value) { Value=value; } }
+                public static class Calls
+                {
+                    public static void Entry(Box<int> outside) { OPERATION; }
+                }
+                """.Replace("OPERATION", property ? "typeof(Box<int>[]).GetProperty(\"Item\").SetValue(outside, 7)"
+                    : "typeof(Box<int>[]).GetMethod(\"Put\").Invoke(outside, new object[] { 7 })"));
+            System.Reflection.Assembly runtime = System.Reflection.Assembly.Load(File.ReadAllBytes(project.ExternalAssemblyPath));
+            object outside = Activator.CreateInstance(runtime.GetType("ExternalSamples.Box`1")!.MakeGenericType(typeof(int)))!;
+            var failure = Assert.Throws<System.Reflection.TargetInvocationException>(() => runtime.GetType("ExternalSamples.Calls")!.GetMethod("Entry")!.Invoke(null, new[] { outside }));
+            Assert.IsInstanceOfType<NullReferenceException>(failure.InnerException);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            await Assert.ThrowsAsync<AnalysisException>(() => new CallTargetResolver().ResolveAsync(material, catalog, roots, 2));
+        }
+
+        // 构造类型反射保留实际类型参数，属性访问与普通函数仍读取同一份目标行为。
+        /// <summary>源码和DLL中的泛型类及继承成员按真实接收对象判断写入。</summary>
+        [TestMethod]
+        [DataRow("method", false, false)]
+        [DataRow("method", true, false)]
+        [DataRow("set", false, false)]
+        [DataRow("set", true, false)]
+        [DataRow("get", false, false)]
+        [DataRow("get", true, false)]
+        [DataRow("set", false, true)]
+        [DataRow("set", true, true)]
+        public async Task AnalyzeConstructedGenericReflectionMembers(string operation, bool external, bool inherited)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public class Box<T>
+                {
+                    public T Value;
+                    public T Item { get => Value; set => Value=value; }
+                    public void Put(T value) { Value=value; }
+                }
+                public sealed class Derived : Box<int> { }
+                public static class Calls
+                {
+                    public static void Entry(OWNER outside)
+                    {
+                        var receiver = RECEIVER;
+                        OPERATION;
+                    }
+                }
+                """.Replace("OWNER", inherited ? "Derived" : "Box<int>")
+                .Replace("RECEIVER", external ? "outside" : inherited ? "new Derived()" : "new Box<int>()")
+                .Replace("OPERATION", "typeof(" + (inherited ? "Derived" : "Box<int>") + ")" + (operation == "method"
+                    ? ".GetMethod(\"Put\").Invoke(receiver, new object[] { 7 })" : operation == "set"
+                    ? ".GetProperty(\"Item\").SetValue(receiver, 7)" : ".GetProperty(\"Item\").GetValue(receiver)")));
+            System.Reflection.Assembly runtime = System.Reflection.Assembly.Load(File.ReadAllBytes(project.ExternalAssemblyPath));
+            Type owner = inherited ? runtime.GetType("ExternalSamples.Derived")!
+                : runtime.GetType("ExternalSamples.Box`1")!.MakeGenericType(typeof(int));
+            object outside = Activator.CreateInstance(owner)!;
+            runtime.GetType("ExternalSamples.Calls")!.GetMethod("Entry")!.Invoke(null, new[] { outside });
+            Assert.AreEqual(external && operation != "get" ? 7 : 0, owner.GetField("Value")!.GetValue(outside));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 2));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 2);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods).Where(method => method.Name == "Entry").ToArray();
+            Assert.HasCount(2, roots);
+            CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, 2);
+            foreach (MethodEffect result in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+            {
+                Assert.AreEqual(external && operation != "get" ? MethodEffectKind.Setter : MethodEffectKind.Getter, result.Kind);
+            }
+            foreach (ResolvedCall call in calls.Calls.Where(call => call.Call.Target.Name == (operation == "method" ? "Invoke" : operation == "set" ? "SetValue" : "GetValue")))
+            {
+                Assert.AreEqual("System.Int32", call.Targets.Single().DeclaringTypeArguments.Single());
+            }
+        }
+
         // 类型分支选中的构造函数必须和同一路径绑定，泛型创建也保留真实构造参数。
         /// <summary>不同创建候选不能混用构造写入和对象身份。</summary>
         [TestMethod]

@@ -1368,6 +1368,9 @@ namespace SetterChecker.Core
         /// <summary>当前模块中的函数定义标记。</summary>
         public int? KnownMetadataToken { get; init; }
 
+        /// <summary>反射选中的实际声明类型；函数标记仍指向原始定义。</summary>
+        public TypeIdentityTemplate? BoundDeclaringType { get; init; }
+
         /// <summary>直接展示函数身份中的名称。</summary>
         public string Name => this.Identity.Name;
     }

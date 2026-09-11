@@ -1380,7 +1380,7 @@ namespace SetterChecker.Core
             bool searchInherited)
         {
             string key = $"{reference.TargetAssemblyIdentity}|{reference.ReferringAssemblyPath}|{reference.Identity.Text}"
-                + $"|{reference.ReferenceMetadataToken}|{reference.KnownDeclaringTypeId}|{reference.KnownMetadataToken}|{searchInherited}";
+                + $"|{reference.ReferenceMetadataToken}|{reference.KnownDeclaringTypeId}|{reference.KnownMetadataToken}|{reference.BoundDeclaringType?.Text}|{searchInherited}";
             return this.m_dispatchAssembliesClosed
                 ? this.m_methodDefinitions.GetOrAdd(key, _ => ReadMethodDefinition(reference, searchInherited))
                 : ReadMethodDefinition(reference, searchInherited);
@@ -1389,8 +1389,8 @@ namespace SetterChecker.Core
         // 按调用点的完整类型和函数签名找到唯一声明。
         private ResolvedMethodDefinition ReadMethodDefinition(BehaviorMethodReference reference, bool searchInherited)
         {
-            IReadOnlyList<TypeIdentityTemplate> arguments = ReadResolvedTypeArguments(
-                reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken);
+            IReadOnlyList<TypeIdentityTemplate> arguments = ReadDeclaringTypeArguments(
+                reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken, reference.BoundDeclaringType);
             TypeEntry[] declaringTypes = reference.KnownDeclaringTypeId == null
                 ? FindTypeDefinitions(reference.DeclaringTypeDefinitionId, reference.TargetAssemblyIdentity,
                     reference.ReferringAssemblyPath, loadMissing: true).ToArray()
@@ -1449,7 +1449,7 @@ namespace SetterChecker.Core
             bool searchInterfaces = type.IsInterface;
             foreach (IGrouping<int, InheritedTypeRelation> level in ReadInheritedTypes(
                          type,
-                         ReadResolvedTypeArguments(reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken),
+                         ReadDeclaringTypeArguments(reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken, reference.BoundDeclaringType),
                          includeInterfaces: searchInterfaces)
                      .Where(relation =>
                          relation.IsInterface == searchInterfaces).GroupBy(item => item.Depth)
@@ -1506,7 +1506,7 @@ namespace SetterChecker.Core
             IReadOnlyList<TypeIdentityTemplate> declarationArguments = typeArguments ?? Array.Empty<TypeIdentityTemplate>();
             IReadOnlyList<TypeIdentityTemplate> referenceArguments = typeArguments == null
                 ? Array.Empty<TypeIdentityTemplate>()
-                : ReadResolvedTypeArguments(reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken);
+                : ReadDeclaringTypeArguments(reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken, reference.BoundDeclaringType);
 
             return declaration.Parameters.Select(parameter => parameter.Substitute(declarationArguments).Text)
                     .SequenceEqual(target.Parameters.Select(parameter =>
@@ -1612,9 +1612,14 @@ namespace SetterChecker.Core
         // 原始引用与运行时构造字段共用实际类型实参，物理字段定义不会随构造参数复制。
         internal IReadOnlyList<TypeIdentityTemplate> ReadFieldTypeArguments(BehaviorMemberReference reference)
         {
-            return reference.BoundDeclaringType == null
-                ? ReadResolvedTypeArguments(reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken)
-                : CallTargetResolver.TryReadConstructedType(reference.BoundDeclaringType.Text, out _, out string[] arguments)
+            return ReadDeclaringTypeArguments(reference.ReferringAssemblyPath!, reference.ReferenceMetadataToken, reference.BoundDeclaringType);
+        }
+
+        // 字段与函数共用实际声明实参，反射构造身份不替换原始元数据标记。
+        private IReadOnlyList<TypeIdentityTemplate> ReadDeclaringTypeArguments(string path, int token, TypeIdentityTemplate? boundType)
+        {
+            return boundType == null ? ReadResolvedTypeArguments(path, token)
+                : CallTargetResolver.TryReadConstructedType(boundType.Text, out _, out string[] arguments)
                     ? arguments.Select(argument => new TypeIdentityTemplate(argument)).ToArray() : Array.Empty<TypeIdentityTemplate>();
         }
 
@@ -1831,10 +1836,20 @@ namespace SetterChecker.Core
         }
 
         // 使用 Cecil 读取托管调用点的函数引用。
-        internal BehaviorMethodReference ReadMethodReference(MethodEntry method)
+        internal BehaviorMethodReference ReadMethodReference(MethodEntry method, IReadOnlyList<TypeIdentityTemplate>? arguments = null)
         {
-            return ReadManagedMethodReference((Cecil.MethodDefinition)GetManagedModule(method.AssemblyPath!)
+            BehaviorMethodReference reference = ReadManagedMethodReference((Cecil.MethodDefinition)GetManagedModule(method.AssemblyPath!)
                 .LookupToken(method.MetadataToken), method.AssemblyPath!);
+            if (arguments == null)
+            {
+                return reference;
+            }
+            TypeIdentityTemplate type = CallTargetResolver.ConstructTypeIdentity(this.TypesById[method.TypeId], arguments);
+            return reference with
+            {
+                Identity = ReadResolvedMethodSignature(method.AssemblyPath!, method.MetadataToken).Instantiate(type, arguments),
+                BoundDeclaringType = type,
+            };
         }
 
         // 初始化事实仍使用同一函数体读取流程，不另写一套指令解释器。

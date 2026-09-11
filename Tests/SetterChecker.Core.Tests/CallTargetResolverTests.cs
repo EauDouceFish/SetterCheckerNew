@@ -6,6 +6,113 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class CallTargetResolverTests
     {
+        // 已闭合的只读入口与多轮补读入口并存，不必每轮重新证明前者。
+        /// <summary>只复用未变化的 Getter，后续发现的写入、恢复分析及并行额度不改变结论。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task ResolveAsyncReusesUnchangedGetterProofs(bool writes)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Calls
+                {
+                    private static int state;
+                    public static int ReadOnly() => 1;
+                    public static void Delayed() => First();
+                    private static void First() => Second();
+                    private static void Second() => Third();
+                    private static void Third() { WRITE }
+                }
+                """.Replace("WRITE", writes ? "state=1;" : string.Empty));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name == "Calls").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name is "ReadOnly" or "Delayed").ToArray();
+            Assert.HasCount(4, roots);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                List<string> progress = new();
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs,
+                    requireCompleteCalls: false, progress: progress.Add, reportProgress: (_, proofs) =>
+                    {
+                        Assert.AreEqual(proofs.Methods.Count, proofs.Methods.Select(method => method.MethodId).Distinct().Count());
+                        foreach (MethodEntry root in roots.Where(root => root.Name == "ReadOnly"))
+                        {
+                            Assert.AreEqual(MethodEffectKind.Getter, proofs.Methods.Single(method => method.MethodId == root.Id).Kind);
+                        }
+                    });
+                Assert.IsTrue(progress.Any(message => message == "本轮复用 2 个未变化的只读结论。"), string.Join("\n", progress));
+                foreach (bool resume in new[] { false, true })
+                {
+                    if (resume)
+                    {
+                        calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, previous: calls);
+                    }
+                    Assert.IsEmpty(calls.PendingCalls);
+                    foreach (MethodEffect effect in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+                    {
+                        Assert.AreEqual(writes && roots.Single(root => root.Id == effect.MethodId).Name == "Delayed"
+                            ? MethodEffectKind.Setter : MethodEffectKind.Getter, effect.Kind);
+                    }
+                }
+            }
+        }
+
+        // 筛掉已经证明的入口时，业务对象所属程序集仍来自完整的原始输入。
+        /// <summary>另一个程序集的只读根被复用后，返回该程序集新对象仍有创建证据。</summary>
+        [TestMethod]
+        public async Task ResolveAsyncKeepsBusinessAssembliesWhenReusingGetterProofs()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public static class Helper
+                {
+                    public static int ReadOnly() => 1;
+                    public static Data Create() => new Data();
+                }
+                """);
+            project.WriteRootSource("""
+                public static class Calls
+                {
+                    public static object Return() => Make();
+                    private static object Make() => ExternalSamples.Helper.Create();
+                    public static void Slow() => A();
+                    private static void A() => B();
+                    private static void B() => C();
+                    private static void C() => D();
+                    private static void D() => E();
+                    private static void E() => F();
+                    private static void F() => G();
+                    private static void G() => H();
+                    private static void H() { }
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = catalog.Types.Where(type => type.Name is "Calls" or "Helper").SelectMany(catalog.GetMethods)
+                .Where(method => method.Name is "Return" or "Slow" or "ReadOnly").ToArray();
+            Assert.HasCount(3, roots);
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                bool reportedCreation = false;
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs,
+                    requireCompleteCalls: false, reportProgress: (_, proofs) =>
+                    {
+                        MethodEffect? returned = proofs.Methods.SingleOrDefault(method => method.MethodId == roots.Single(root => root.Name == "Return").Id);
+                        if (returned != null)
+                        {
+                            Assert.AreEqual(MethodEffectKind.Setter, returned.Kind);
+                            reportedCreation = true;
+                        }
+                    });
+                Assert.IsTrue(reportedCreation);
+                Assert.AreEqual(MethodEffectKind.Setter, new EffectAnalyzer().Analyze(catalog, roots, calls).Methods
+                    .Single(method => method.MethodId == roots.Single(root => root.Name == "Return").Id).Kind);
+            }
+        }
+
         // 代理实现由独立启动入口注册，使用入口仍需沿统一接口关系找到真实方法。
         /// <summary>复刻 SetImpl 注册与后续代理调用，读取和写入实现分别对照源码与 DLL。</summary>
         [TestMethod]
