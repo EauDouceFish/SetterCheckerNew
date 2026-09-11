@@ -97,6 +97,7 @@ namespace SetterChecker.Core
                         }
                     }
                     waiting.AddRange(pending.SelectMany(instance => behaviors[instance.MethodId].Calls
+                        .Where(call => !sources.IsCallBound(instance.Id, call.Point))
                         .Select(call => (behaviors[instance.MethodId], call, instance))));
                 }
 
@@ -111,17 +112,19 @@ namespace SetterChecker.Core
                 HashSet<int> changedRoots = recheckRoots.Count == 0 ? new() : sources.RefineReachability(frozenRoots, recheckRoots, jobs, cancellationToken);
                 if (changedRoots.Count != 0)
                 {
-                    HashSet<int> invalidated = sources.ResetRoots(changedRoots);
+                    HashSet<int> invalidated = sources.ResetRoots(changedRoots, out IReadOnlyList<ResolvedCall> retained);
                     waiting.RemoveAll(item => invalidated.Contains(item.Instance.Id));
                     deferred.RemoveAll(item => invalidated.Contains(item.CallerInstanceId));
                     calls.RemoveAll(call => invalidated.Contains(call.CallerInstanceId));
+                    calls.AddRange(retained);
                     foreach (var key in failures.Keys.Where(key => invalidated.Contains(key.InstanceId)).ToArray())
                     {
                         failures.Remove(key);
                     }
                     discovered.ExceptWith(invalidated);
-                    pending = sources.RootInstances.Values.Where(instance => changedRoots.Contains(instance.Id)).ToArray();
+                    pending = sources.Instances.Where(instance => changedRoots.Contains(instance.RootId)).ToArray();
                     discovered.UnionWith(pending.Select(instance => instance.Id));
+                    progress?.Invoke($"路径收缩后保留 {retained.Count} 个固定直调绑定，重新检查对象内容与执行条件。");
                     continue;
                 }
                 waiting.RemoveAll(item => !sources.IsReachable(item.Instance.Id, item.Call.Point.BlockId));
@@ -204,6 +207,7 @@ namespace SetterChecker.Core
                     IReadOnlyList<(ResolvedMethodDefinition Definition, ResolvedCallTarget Binding)>? targets;
                     bool coversDeclaredReceivers = false;
                     bool completesWithoutTarget = false;
+                    bool metadataBinding = false;
                     Action? publishRuntimeValues = null;
                     List<MethodCallInstance?> recursiveInstances = new();
                     try
@@ -248,6 +252,7 @@ namespace SetterChecker.Core
                         }
                         else
                         {
+                            metadataBinding = call.Kind == BehaviorCallKind.Direct;
                             IReadOnlyList<ResolvedMethodDefinition> declarations;
                             if (call.Kind == BehaviorCallKind.Virtual && definition.Method.IsVirtual && !definition.Method.IsFinal)
                             {
@@ -324,7 +329,7 @@ namespace SetterChecker.Core
                         }
                     }
                     ResolvedCall resolved = new(behavior.MethodId, call, bindings)
-                    { CallerInstanceId = instance.Id, CoversDeclaredReceivers = coversDeclaredReceivers, CompletesWithoutTarget = completesWithoutTarget };
+                    { CallerInstanceId = instance.Id, CoversDeclaredReceivers = coversDeclaredReceivers, CompletesWithoutTarget = completesWithoutTarget, IsMetadataBinding = metadataBinding };
                     calls.Add(resolved);
                     sources.BindCall(resolved);
                     resolvedCalls.Add((instance.Id, item.Call.Point.BlockId));
@@ -5171,9 +5176,32 @@ namespace SetterChecker.Core
             }
         }
 
-        // 路径缩小时撤销受影响入口的派生事实；保留实例编号和已证路径，重新命中才激活子调用。
-        internal HashSet<int> ResetRoots(HashSet<int> roots)
+        // 路径缩小时撤销派生事实，仅沿仍可达的固定直调保留原绑定，不保留运行时效果。
+        internal HashSet<int> ResetRoots(HashSet<int> roots, out IReadOnlyList<ResolvedCall> retained)
         {
+            List<ResolvedCall> fixedCalls = new();
+            Queue<int> pending = new(roots.Order());
+            HashSet<int> active = new(roots);
+            while (pending.TryDequeue(out int caller))
+            {
+                foreach (ResolvedCall call in this.m_callsByCallerInstance.GetValueOrDefault(caller)?.Values ?? Enumerable.Empty<ResolvedCall>())
+                {
+                    if (!call.IsMetadataBinding || call.Targets.Count != 1 || !IsReachable(caller, call.Call.Point.BlockId))
+                    {
+                        continue;
+                    }
+                    MethodCallInstance target = GetInstance(call.Targets[0].InstanceId);
+                    if (target.ParentId != caller || target.InvocationPoint != call.Call.Point)
+                    {
+                        continue;
+                    }
+                    fixedCalls.Add(call);
+                    if (active.Add(target.Id))
+                    {
+                        pending.Enqueue(target.Id);
+                    }
+                }
+            }
             this.m_changedRoots.UnionWith(roots);
             HashSet<int> instances = this.Instances.Where(instance => roots.Contains(instance.RootId)).Select(instance => instance.Id).ToHashSet();
             this.m_reentries.RemoveWhere(call => instances.Contains(call.Caller));
@@ -5193,6 +5221,12 @@ namespace SetterChecker.Core
             {
                 this.m_memberTypes.Remove(key);
             }
+            this.m_inactiveInstances.ExceptWith(active);
+            foreach (ResolvedCall call in fixedCalls)
+            {
+                BindCall(call);
+            }
+            retained = fixedCalls;
             return instances;
         }
 
@@ -5719,6 +5753,12 @@ namespace SetterChecker.Core
             this.m_reentries.UnionWith(call.Targets.Where(target => GetInstance(target.InstanceId).ParentId != call.CallerInstanceId
                 || GetInstance(target.InstanceId).InvocationPoint != call.Call.Point).Select(target => (call.CallerInstanceId, call.Call.Point.BlockId, target.InstanceId)));
             this.m_changedRoots.Add(GetInstance(call.CallerInstanceId).RootId);
+        }
+
+        // 只查询原调用表中的连接事实，保留的直调不再次进入待连接队列。
+        internal bool IsCallBound(int instanceId, BehaviorFlowPoint point)
+        {
+            return this.m_callsByCallerInstance.GetValueOrDefault(instanceId)?.ContainsKey(point) == true;
         }
 
         // 返回值先按原指令定位调用点，再读取所属调用环境的绑定，不重复保存每个实例的结果表。
@@ -7428,6 +7468,9 @@ namespace SetterChecker.Core
 
         /// <summary>反射值或字段操作已按语义处理，可无普通目标继续；空接收对象调用不具备此事实。</summary>
         internal bool CompletesWithoutTarget { get; init; }
+
+        /// <summary>目标仅由普通直调元数据确定，没有使用对象内容或运行时成员选择。</summary>
+        internal bool IsMetadataBinding { get; init; }
     }
 
     /// <summary>暂未展开的真实调用，后续告警分析仍须证明它是否经过缺少原因的豁免函数。</summary>

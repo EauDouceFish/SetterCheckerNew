@@ -6,6 +6,180 @@ namespace SetterChecker.Core.Tests
     [TestClass]
     public sealed class CallTargetResolverTests
     {
+        // 保留普通连接不等于完成其初始化证明，递归回边也仍须重新绑定。
+        /// <summary>剪枝后的初始化失败不被隐藏，递归关系在恢复分析后保持完整。</summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task ResolveAsyncRetainedBindingsKeepInitializationAndRecursionChecks(bool recursive)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public static class Initialized
+                {
+                    public static int Value;
+                    static Initialized() { Value=Read(); }
+                    private static int Read() => 1;
+                    public static void Touch() { }
+                }
+                public static class Calls
+                {
+                    public static void Entry()
+                    {
+                        QuietA();
+                        if (GateA()) return;
+                        ACTION
+                    }
+                    private static void QuietA() => QuietB();
+                    private static void QuietB() { }
+                    private static bool GateA() => GateB();
+                    private static bool GateB() => false;
+                    private static void Cycle() { Cycle(); }
+                }
+                """.Replace("ACTION", recursive ? "Cycle();" : "Initialized.Touch();"));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                List<string> progress = new();
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, progress: progress.Add);
+                Assert.IsTrue(progress.Any(message => message.StartsWith("路径收缩后保留 ", StringComparison.Ordinal)
+                    && !message.StartsWith("路径收缩后保留 0 ", StringComparison.Ordinal)), string.Join("\n", progress));
+                foreach (bool resume in new[] { false, true })
+                {
+                    if (resume)
+                    {
+                        calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, previous: calls);
+                    }
+                    Assert.AreEqual(calls.Calls.Count, calls.Calls.Select(call => (call.CallerInstanceId, call.Call.Point)).Distinct().Count());
+                    if (recursive)
+                    {
+                        Assert.AreEqual(2, calls.Calls.Count(call => call.Targets.Any(target => target.MethodId == call.CallerMethodId)));
+                        Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(method => method.Kind == MethodEffectKind.Getter));
+                    }
+                    else
+                    {
+                        foreach (MethodEntry root in roots)
+                        {
+                            AnalysisException failure = Assert.Throws<AnalysisException>(() => new EffectAnalyzer().Analyze(catalog, new[] { root }, calls));
+                            StringAssert.Contains(failure.Message, "初始化");
+                        }
+                    }
+                }
+            }
+        }
+
+        // 固定目标可以保留，分支收缩后的新旧对象来源和反射名称必须重新求取。
+        /// <summary>相同调用点分别传入旧对象和新对象，或选择不同反射目标，不得沿用过期效果。</summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public async Task ResolveAsyncRecomputesInputsOfRetainedBindings(bool writes, bool reflection)
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public static class Targets
+                {
+                    public static void Read(Data value) { }
+                    public static void Write(Data value) { value.Value=1; }
+                }
+                public static class Calls
+                {
+                    public static void Entry(Data outside)
+                    {
+                        QuietA();
+                        OPERATION
+                    }
+                    private static void Forward(Data value) => Targets.Write(value);
+                    private static void QuietA() => QuietB();
+                    private static void QuietB() { }
+                    private static bool GateA() => GateB();
+                    private static bool GateB() => GateC();
+                    private static bool GateC() => GATE;
+                }
+                """.Replace("GATE", writes ? "true" : "false")
+                .Replace("OPERATION", reflection ? "typeof(Targets).GetMethod(GateA() ? \"Write\" : \"Read\").Invoke(null, new object[] { outside });"
+                    : "Data selected = outside; if (!GateA()) selected=new Data(); Forward(selected);"));
+            System.Reflection.Assembly runtime = System.Reflection.Assembly.Load(File.ReadAllBytes(project.ExternalAssemblyPath));
+            object outside = Activator.CreateInstance(runtime.GetType("ExternalSamples.Data")!)!;
+            runtime.GetType("ExternalSamples.Calls")!.GetMethod("Entry")!.Invoke(null, new[] { outside });
+            Assert.AreEqual(writes ? 1 : 0, outside.GetType().GetField("Value")!.GetValue(outside));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                List<string> progress = new();
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, progress: progress.Add);
+                Assert.IsTrue(progress.Any(message => message.StartsWith("路径收缩后保留 ", StringComparison.Ordinal)
+                    && !message.StartsWith("路径收缩后保留 0 ", StringComparison.Ordinal)), string.Join("\n", progress));
+                foreach (MethodEffect result in new EffectAnalyzer().Analyze(catalog, roots, calls).Methods)
+                {
+                    Assert.AreEqual(writes ? MethodEffectKind.Setter : MethodEffectKind.Getter, result.Kind);
+                }
+                Assert.AreEqual(calls.Calls.Count, calls.Calls.Select(call => (call.CallerInstanceId, call.Call.Point)).Distinct().Count());
+                if (reflection)
+                {
+                    foreach (ResolvedCall call in calls.Calls.Where(call => call.Call.Target.Name == "Invoke"))
+                    {
+                        Assert.AreEqual(writes ? "Write" : "Read", calls.Methods.Single(method => method.Id == call.Targets.Single().MethodId).Name);
+                    }
+                }
+            }
+        }
+
+        // 延迟条件收缩一条分支时，无关直调的固定目标不应整树重复连接。
+        /// <summary>保留仍可达的普通绑定，删除不可达写入，恢复分析及不同并行额度的结果一致。</summary>
+        [TestMethod]
+        public async Task ResolveAsyncRetainsDirectBindingsWhenAPathShrinks()
+        {
+            using TestProject project = TestProject.CreateWithCallTargets("""
+                namespace Samples;
+                public sealed class Data { public int Value; }
+                public static class Calls
+                {
+                    public static void Entry(Data outside)
+                    {
+                        QuietA();
+                        if (GateA()) outside.Value=1;
+                    }
+                    private static void QuietA() => QuietB();
+                    private static void QuietB() => QuietC();
+                    private static void QuietC() { }
+                    private static bool GateA() => GateB();
+                    private static bool GateB() => GateC();
+                    private static bool GateC() => GateD();
+                    private static bool GateD() => false;
+                }
+                """);
+            MaterialSet material = await new MaterialLoader().LoadAsync(new MaterialRequest(project.AssemblyDefinitionPath, 4));
+            MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4);
+            MethodEntry[] roots = ReadRoots(catalog, project, "Calls", "Entry");
+            foreach (int jobs in new[] { 1, 4 })
+            {
+                List<string> progress = new();
+                CallTargetResolutionResult calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs,
+                    requireCompleteCalls: false, progress: progress.Add, reportProgress: (snapshot, _) =>
+                        Assert.AreEqual(snapshot.Calls.Count, snapshot.Calls.Select(call => (call.CallerInstanceId, call.Call.Point)).Distinct().Count()));
+                Assert.IsTrue(progress.Any(message => message.StartsWith("路径收缩后保留 ", StringComparison.Ordinal)
+                    && !message.StartsWith("路径收缩后保留 0 ", StringComparison.Ordinal)), string.Join("\n", progress));
+                foreach (bool resume in new[] { false, true })
+                {
+                    if (resume)
+                    {
+                        calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, jobs, previous: calls);
+                    }
+                    Assert.IsEmpty(calls.PendingCalls);
+                    Assert.AreEqual(14, calls.Calls.Count);
+                    Assert.IsTrue(new EffectAnalyzer().Analyze(catalog, roots, calls).Methods.All(method => method.Kind == MethodEffectKind.Getter));
+                }
+            }
+        }
+
         // 已闭合的只读入口与多轮补读入口并存，不必每轮重新证明前者。
         /// <summary>只复用未变化的 Getter，后续发现的写入、恢复分析及并行额度不改变结论。</summary>
         [TestMethod]
