@@ -19,21 +19,42 @@ namespace SetterChecker.Cli
 
             try
             {
-                (MaterialRequest request, string output) = ParseArguments(arguments);
+                bool noReport = arguments.Contains("--no-report");
+                (MaterialRequest request, string output, string? saveBaseline) = ParseArguments(arguments.Where(argument => argument != "--no-report").ToArray());
                 Stopwatch stopwatch = Stopwatch.StartNew();
                 AnalysisRun run = await new SetterChecker.Core.SetterChecker()
-                        .AnalyzeAsync(request, progress: Console.Error.WriteLine,
-                            reportProgress: current => new ReportWriter().Write(current, output));
-                new ReportWriter().Write(run, output);
+                        .AnalyzeAsync(request, progress: Console.Error.WriteLine);
+                Stopwatch reportWatch = Stopwatch.StartNew();
+                if (!noReport)
+                {
+                    new ReportWriter().Write(run, output);
+                }
+                if (saveBaseline != null)
+                {
+                    ManualBaseline.Save(run, saveBaseline);
+                    Console.WriteLine("人工基线已保存：" + Path.GetFullPath(saveBaseline));
+                }
+                reportWatch.Stop();
                 stopwatch.Stop();
 
-                Console.WriteLine(run.Complete ? "分析完成" : "验收未通过；已输出确定结论与待解决问题");
+                Console.WriteLine(run.LogDecisionsComplete ? "分析完成，最终标签已全部确定" : "分析运行结束，仍有未确定项，功能验收未通过");
                 Console.WriteLine($"khengine 总函数：{run.Annotations.Methods.Count(method => method.IsReportable)}");
-                Console.WriteLine($"已证明真实行为：{run.Annotations.Methods.Count(method => method.IsReportable && method.Actual != null)}");
-                Console.WriteLine($"报告目录：{Path.GetFullPath(output)}");
-                Console.WriteLine($"完整耗时（包含源码编译和报告写出）：{stopwatch.Elapsed.TotalSeconds:F3} 秒");
+                Console.WriteLine($"尚需处理：{run.Annotations.Methods.Count(method => method.IsReportable && method.Failure != null && !method.UsesManualBaseline && !method.InformationalOnly)}");
+                if (!run.LogDecisionsComplete && run.Annotations.ManualBaselineStatus != null)
+                {
+                    Console.WriteLine(run.Annotations.ManualBaselineStatus);
+                }
+                if (!noReport)
+                {
+                    Console.WriteLine($"报告目录：{Path.GetFullPath(output)}");
+                }
+                if (!noReport)
+                {
+                    Console.WriteLine($"报告生成及写出：{reportWatch.Elapsed.TotalSeconds:F3} 秒");
+                }
+                Console.WriteLine($"完整耗时（包含源码准备{(noReport ? "，未生成报告" : "和报告写出")}）：{stopwatch.Elapsed.TotalSeconds:F3} 秒");
 
-                return run.Complete ? 0 : 1;
+                return run.LogDecisionsComplete ? 0 : 1;
             }
             catch (AnalysisException exception)
             {
@@ -44,12 +65,14 @@ namespace SetterChecker.Cli
         }
 
         // 解析项目路径和全程序共用的最大并行数。
-        private static (MaterialRequest Request, string Output) ParseArguments(string[] arguments)
+        private static (MaterialRequest Request, string Output, string? SaveBaseline) ParseArguments(string[] arguments)
         {
             string? projectPath = null;
             int jobs = 4;
             string output = Path.Combine(Environment.CurrentDirectory, "reports");
-            string? cache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SetterChecker", "Compilation");
+            string? baseline = null;
+            string? saveBaseline = null;
+            bool reflectionBaseline = false;
 
             for (int index = 0; index < arguments.Length; index++)
             {
@@ -71,16 +94,27 @@ namespace SetterChecker.Cli
                     output = ReadValue(arguments, ref index, "--output");
                     continue;
                 }
-                if (argument is "--cache" or "--no-cache")
-                {
-                    cache = argument == "--cache" ? ReadValue(arguments, ref index, argument) : null;
-                    continue;
-                }
 
                 if (argument is "-j" or "--jobs")
                 {
                     jobs = ReadJobs(ReadValue(arguments, ref index, argument));
 
+                    continue;
+                }
+
+                if (argument == "--baseline")
+                {
+                    baseline = ReadValue(arguments, ref index, argument);
+                    continue;
+                }
+                if (argument == "--reflection-baseline")
+                {
+                    reflectionBaseline = true;
+                    continue;
+                }
+                if (argument == "--save-baseline")
+                {
+                    saveBaseline = ReadValue(arguments, ref index, argument);
                     continue;
                 }
 
@@ -95,7 +129,7 @@ namespace SetterChecker.Cli
             }
 
             return (new MaterialRequest(projectPath ?? throw new AnalysisException("缺少 --project 项目路径。"), jobs)
-            { CacheDirectory = cache }, output);
+            { ManualBaselinePath = baseline, CaptureManualBaseline = saveBaseline != null, UseReflectionBaseline = reflectionBaseline }, output, saveBaseline);
         }
 
         // 读取必须紧跟在参数名后的值。

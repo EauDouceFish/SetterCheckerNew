@@ -1,0 +1,482 @@
+{
+  "Version": 1,
+  "InputKey": "7CAE2069117E178F552641E01B28E36304C59666CBCA14DAE64C14F8B93399E42E9A912B5E967D1E22D63048A6606A91B062B8ECA63D7C46BFCC4CC8AC5F9A18",
+  "Methods": [
+    {
+      "Id": "A16:KHENGINE.RUNTIMET10:KH.UIProxy::21:GetResultAvatarSuffix(1:12:System.Int32)-\u003E13:System.String",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/RuntimeMethodProxy/UIProxy.cs",
+      "Line": 371,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET11:KH.KHEntity::13:VEntityIsNull(0:)-\u003E14:System.Boolean",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Units/Entities/KHEntity.cs",
+      "Line": 82,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET12:KH.KHRTUtils::15:CheckGroupValid(2:40:A16:KHENGINE.RUNTIMET16:KH.KHPlayerActor12:System.Int32)-\u003E14:System.Boolean",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/Utils/KHRTUtils.cs",
+      "Line": 87,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET12:KH.KHRTUtils::22:RecoverAnimMainTexture(1:34:A16:KHENGINE.RUNTIMET10:KH.KHActor)-\u003E11:System.Void",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Utils/KHRTUtils.cs",
+      "Line": 430,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET12:KH.PlotTimer::15:isBattlePausing(0:)-\u003E14:System.Boolean",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Framework/GameMode/BattleMode/Utils/TimeManager/PlotTimer.cs",
+      "Line": 177,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET12:KHDAttribute::14:GetOptionNames(1:30:A11:NETSTANDARDT11:System.Type)-\u003E15:System.String[]",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Data/KHD/KHDAttribute.cs",
+      "Line": 185,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET12:KHDAttribute::15:GetOptionValues(1:30:A11:NETSTANDARDT11:System.Type)-\u003E14:System.Int32[]",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Data/KHD/KHDAttribute.cs",
+      "Line": 180,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET13:KH.TimeKeeper::9:isPausing(0:)-\u003E14:System.Boolean",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Framework/GameMode/BattleMode/Utils/TimeManager/TimeKeeper.cs",
+      "Line": 279,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET14:KH.ConfigProxy::11:GetBasePath(0:)-\u003E13:System.String",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/RuntimeMethodProxy/ConfigProxy.cs",
+      "Line": 87,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET14:KH.ConfigProxy::19:GetStreamConfigPath(1:13:System.String)-\u003E13:System.String",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/RuntimeMethodProxy/ConfigProxy.cs",
+      "Line": 110,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET14:KH.KHSafeRef\u00601::7:IsValid(0:)-\u003E14:System.Boolean",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Units/Entities/KHSafeRef.cs",
+      "Line": 66,
+      "Reason": "\u63A5\u53E3\u6216\u91CD\u5199\u6CA1\u6709\u5408\u6CD5\u5B9E\u73B0\uFF1AA16:KHENGINE.RUNTIMET11:KH.ISafeRef::11:get_version(0:)-\u003E12:System.Int32"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET14:KH.TriggerInfo::7:NewInfo(1:12:System.Int32)-\u003E38:A16:KHENGINE.RUNTIMET14:KH.TriggerInfo",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Trigger/TriggerInfo.cs",
+      "Line": 36,
+      "Reason": "\u5199\u5165\u5BF9\u8C61\u6765\u6E90\u5C1A\u672A\u786E\u5B9A"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET15:KH.EventTrigger::11:NewInstance(1:12:System.Int32)-\u003E39:A16:KHENGINE.RUNTIMET15:KH.EventTrigger",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Story/Trigger/EventTrigger.cs",
+      "Line": 16,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET15:KH.KHScriptData::7:newData(1:12:System.Int32)-\u003E39:A16:KHENGINE.RUNTIMET15:KH.KHScriptData",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Data/Script/Base/KHScriptData.cs",
+      "Line": 324,
+      "Reason": "\u5199\u5165\u5BF9\u8C61\u6765\u6E90\u5C1A\u672A\u786E\u5B9A"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET15:KH.KHScriptData::8:SetValue(1:39:A16:KHENGINE.RUNTIMET15:KH.KHScriptData)-\u003E11:System.Void",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Data/Script/Base/KHScriptData.cs",
+      "Line": 354,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET16:KH.KHBattleScene::21:CheckCanInterpolation(1:34:A16:KHENGINE.RUNTIMET10:KH.KHActor)-\u003E14:System.Boolean",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/Scene/KHBattleScene_Tick.cs",
+      "Line": 117,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET16:KH.MVMBattleMode::16:GetOfflinePlayer(1:34:A16:KHENGINE.RUNTIMET10:KH.SyncCmd)-\u003E40:A16:KHENGINE.RUNTIMET16:KH.KHPlayerActor",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Framework/GameMode/BattleMode/Net/MVM/MVMBattleMode.cs",
+      "Line": 927,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET17:KH.TriggerFactory::17:CreateTriggerImpl(1:12:System.Int32)-\u003E38:A16:KHENGINE.RUNTIMET14:KH.TriggerImpl",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Trigger/V3/Factory/TriggerFactory.cs",
+      "Line": 103,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET17:KH.TriggerFactory::21:CreateTriggerImplInfo(1:12:System.Int32)-\u003E42:A16:KHENGINE.RUNTIMET18:KH.TriggerImplInfo",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Trigger/V3/Factory/TriggerFactory.cs",
+      "Line": 117,
+      "Reason": "\u5199\u5165\u5BF9\u8C61\u6765\u6E90\u5C1A\u672A\u786E\u5B9A"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET18:KH.ActorDataCenter::9:HasCached(1:13:System.String)-\u003E14:System.Boolean",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/Units/Actor/ActorData/ActorDataCenter.cs",
+      "Line": 185,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET18:KH.KHScriptManager::11:newInstance(1:12:System.Int32)-\u003E35:A16:KHENGINE.RUNTIMET11:KH.KHScript",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/KHScriptManager.cs",
+      "Line": 198,
+      "Reason": "\u8FD4\u56DE\u503C\u53EF\u80FD\u662F\u65B0\u5EFA\u4E1A\u52A1\u5BF9\u8C61\uFF0C\u56FA\u5B9A\u8FD4\u56DE\u8BF4\u660E\u5C1A\u672A\u95ED\u5408"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET18:KH.KHScriptManager::14:CreateInstance(1:12:System.Int32)-\u003E35:A16:KHENGINE.RUNTIMET11:KH.KHScript",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/KHScriptManager.cs",
+      "Line": 187,
+      "Reason": "\u8FD4\u56DE\u503C\u53EF\u80FD\u662F\u65B0\u5EFA\u4E1A\u52A1\u5BF9\u8C61\uFF0C\u56FA\u5B9A\u8FD4\u56DE\u8BF4\u660E\u5C1A\u672A\u95ED\u5408"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET19:KH.DeepLearnAIProxy::20:KHGlobalExt_QuitGame(0:)-\u003E11:System.Void",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/RuntimeMethodProxy/DeepLearnAIProxy.cs",
+      "Line": 98,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET19:KH.Float3LuaArgInfo::8:GetValue(0:)-\u003E13:System.String",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Data/LuaCommonData.cs",
+      "Line": 233,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET19:KH.Float3LuaArgInfo::8:ToString(1:32:A16:KHENGINE.RUNTIMET9:KH.Float3)-\u003E13:System.String",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Data/LuaCommonData.cs",
+      "Line": 238,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET19:KH.KHTriggerFactory::11:newInstance(1:12:System.Int32)-\u003E38:A16:KHENGINE.RUNTIMET14:KH.BaseTrigger",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Trigger/KHTriggerFactory.cs",
+      "Line": 26,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET19:KH.KHTriggerFactory::11:newInstance(1:38:A16:KHENGINE.RUNTIMET14:KH.TriggerInfo)-\u003E38:A16:KHENGINE.RUNTIMET14:KH.BaseTrigger",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Trigger/KHTriggerFactory.cs",
+      "Line": 44,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET19:KH.UnityEngineProxy::15:IsBattlePausing(0:)-\u003E14:System.Boolean",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/RuntimeMethodProxy/UnityEngineProxy.cs",
+      "Line": 66,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET19:KH.UnityEngineProxy::30:UnityEngine_GetActiveSceneName(0:)-\u003E13:System.String",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/RuntimeMethodProxy/UnityEngineProxy.cs",
+      "Line": 44,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET20:KFL.KFLParameterInfo::8:SetValue(1:44:A16:KHENGINE.RUNTIMET20:KFL.KFLParameterInfo)-\u003E11:System.Void",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/KFL/Core/Function/Info/Function/Parameter/KFLParameterInfo.cs",
+      "Line": 46,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET20:KH.BinaryTableConfig::14:GetConfigCount(0:)-\u003E12:System.Int32",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/Framework/WorldModule/Manager/Data/BinaryTableConfig.cs",
+      "Line": 39,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET20:KH.BinaryTableConfig::18:ContainsConfigByte(1:13:System.String)-\u003E14:System.Boolean",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/Framework/WorldModule/Manager/Data/BinaryTableConfig.cs",
+      "Line": 28,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET20:KH.KHCommonFunctions::22:RecoverAnimMainTexture(1:34:A16:KHENGINE.RUNTIMET10:KH.KHActor)-\u003E11:System.Void",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/KFL/Function/KHCommonFunctions.cs",
+      "Line": 205,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET20:KH.TriggerKFLFactory::17:CreateTriggerImpl(1:12:System.Int32)-\u003E41:A16:KHENGINE.RUNTIMET17:KH.KFLTriggerImpl",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Trigger/KFL/Triggers/TriggerFactoryKFL.cs",
+      "Line": 108,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET20:KH.TriggerKFLFactory::21:CreateTriggerImplInfo(1:12:System.Int32)-\u003E45:A16:KHENGINE.RUNTIMET21:KH.KFLTriggerImplInfo",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Trigger/KFL/Triggers/TriggerFactoryKFL.cs",
+      "Line": 122,
+      "Reason": "\u5199\u5165\u5BF9\u8C61\u6765\u6E90\u5C1A\u672A\u786E\u5B9A"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET21:KH.KHConditionFactory::11:newInstance(1:12:System.Int32)-\u003E40:A16:KHENGINE.RUNTIMET16:KH.BaseCondition",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Condition/KHConditionFactory.cs",
+      "Line": 21,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET22:KFL.KFLTriggerRegister::12:CreateAction(1:48:A16:KHENGINE.RUNTIMET24:KFL.KFLTriggerActionInfo)-\u003E44:A16:KHENGINE.RUNTIMET20:KFL.KFLTriggerAction",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/KFL/Trigger/KFLTriggerRegister.cs",
+      "Line": 272,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET22:KFL.KFLTriggerRegister::15:CreateCondition(1:51:A16:KHENGINE.RUNTIMET27:KFL.KFLTriggerConditionInfo)-\u003E47:A16:KHENGINE.RUNTIMET23:KFL.KFLTriggerCondition",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/KFL/Trigger/KFLTriggerRegister.cs",
+      "Line": 193,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET22:KFL.KFLTriggerRegister::16:CreateActionInfo(1:12:System.Int32)-\u003E48:A16:KHENGINE.RUNTIMET24:KFL.KFLTriggerActionInfo",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/KFL/Trigger/KFLTriggerRegister.cs",
+      "Line": 251,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET22:KFL.KFLTriggerRegister::16:CreateEventProxy(1:52:A16:KHENGINE.RUNTIMET28:KFL.KFLTriggerEventProxyInfo)-\u003E48:A16:KHENGINE.RUNTIMET24:KFL.KFLTriggerEventProxy",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/KFL/Trigger/KFLTriggerRegister.cs",
+      "Line": 137,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET22:KFL.KFLTriggerRegister::19:CreateConditionInfo(1:12:System.Int32)-\u003E51:A16:KHENGINE.RUNTIMET27:KFL.KFLTriggerConditionInfo",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/KFL/Trigger/KFLTriggerRegister.cs",
+      "Line": 175,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET22:KFL.KFLTriggerRegister::20:CreateEventProxyInfo(1:12:System.Int32)-\u003E52:A16:KHENGINE.RUNTIMET28:KFL.KFLTriggerEventProxyInfo",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/KFL/Trigger/KFLTriggerRegister.cs",
+      "Line": 116,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET22:KH.BtTaskFactoryForAct::14:CreateNodeData(1:12:System.Int32)-\u003E37:A16:KHENGINE.RUNTIMET13:KH.BtNodeData",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/AI/BT/Utils/Act/BtTaskFactoryForAct.cs",
+      "Line": 168,
+      "Reason": "\u5199\u5165\u5BF9\u8C61\u6765\u6E90\u5C1A\u672A\u786E\u5B9A"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET23:KH.KHSC_IsControlPlayer::5:Check(1:42:A16:KHENGINE.RUNTIMET18:KH.KHScriptContext)-\u003E14:System.Boolean",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/Script/Atom/Condition/Units/KHSC_IsControlPlayer.cs",
+      "Line": 22,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET23:KH.TriggerScriptFactory::18:CreateDoScriptImpl(1:12:System.Int32)-\u003E39:A16:KHENGINE.RUNTIMET15:KH.DoScriptImpl",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Trigger/V3/Factory/TriggerScriptFactory.cs",
+      "Line": 103,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET23:KH.TriggerScriptFactory::25:CreateDoScriptImplArgInfo(1:12:System.Int32)-\u003E46:A16:KHENGINE.RUNTIMET22:KH.DoScriptImplArgInfo",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Trigger/V3/Factory/TriggerScriptFactory.cs",
+      "Line": 117,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET24:KFL.KFLDataTypeCodeIdDef::12:IsSimpleType(1:30:A11:NETSTANDARDT11:System.Type)-\u003E14:System.Boolean",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/KFL/Core/KFLDef.cs",
+      "Line": 380,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET24:KFL.KFLDataTypeCodeIdDef::13:GetTypeCodeId(1:30:A11:NETSTANDARDT11:System.Type)-\u003E12:System.Int32",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/KFL/Core/KFLDef.cs",
+      "Line": 80,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET24:KFL.KFLDataTypeCodeIdDef::13:GetTypeString(1:30:A11:NETSTANDARDT11:System.Type)-\u003E13:System.String",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/KFL/Core/KFLDef.cs",
+      "Line": 208,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET26:KH.TriggerConditionFactory::19:CreateConditionImpl(1:12:System.Int32)-\u003E40:A16:KHENGINE.RUNTIMET16:KH.ConditionImpl",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Trigger/V3/Factory/TriggerConditionFactory.cs",
+      "Line": 115,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET26:KH.TriggerConditionFactory::23:CreateConditionImplInfo(1:12:System.Int32)-\u003E44:A16:KHENGINE.RUNTIMET20:KH.ConditionImplInfo",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Trigger/V3/Factory/TriggerConditionFactory.cs",
+      "Line": 129,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET27:KH.SwapPlayerPVPBattleState::10:SwapPlayer(2:12:System.Int3212:System.Int32)-\u003E11:System.Void",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Framework/GameMode/BattleMode/Net/PVP/SwapPlayerPVP/SwapPlayerPVPBattleState.cs",
+      "Line": 41,
+      "Reason": "\u6E90\u7801\u64CD\u4F5C\u5C1A\u672A\u652F\u6301\uFF1ADeconstructionAssignment\uFF1BD:\\KiHan\\Packages\\khengine\\Runtime\\Framework\\GameMode\\BattleMode\\Net\\PVP\\SwapPlayerPVP\\SwapPlayerPVPBattleState.cs: (54,16)-(55,80)\uFF1B\u6E90\u7801\u64CD\u4F5C\u5C1A\u672A\u652F\u6301\uFF1ADeconstructionAssignment\uFF1BD:\\KiHan\\Packages\\khengine\\Runtime\\Framework\\GameMode\\BattleMode\\Net\\PVP\\SwapPlayerPVP\\SwapPlayerPVPBattleState.cs: (59,16)-(60,80)\uFF1B\u6E90\u7801\u64CD\u4F5C\u5C1A\u672A\u652F\u6301\uFF1ADeconstructionAssignment\uFF1BD:\\KiHan\\Packages\\khengine\\Runtime\\Framework\\GameMode\\BattleMode\\Net\\PVP\\SwapPlayerPVP\\SwapPlayerPVPBattleState.cs: (62,12)-(62,79)"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET28:KH.LTCCommonSetPlotVarScript::23:InvokeFunctionByFuncDic(5:94:A11:NETSTANDARDT15:System.Action\u00602\u003CA16:KHENGINE.RUNTIMET18:KH.KHScriptContext,System.String\u003E[]12:System.Int3242:A16:KHENGINE.RUNTIMET18:KH.KHScriptContext13:System.String13:System.String)-\u003E11:System.Void",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Global/LTC/LTCCommonSetPlotVarScript.cs",
+      "Line": 21,
+      "Reason": "\u59D4\u6258\u7ED1\u5B9A\u6765\u6E90\u5C1A\u672A\u95ED\u5408\uFF1AA16:KHENGINE.RUNTIMET28:KH.LTCCommonSetPlotVarScript::23:InvokeFunctionByFuncDic(5:94:A11:NETSTANDARDT15:System.Action\u00602\u003CA16:KHENGINE.RUNTIMET18:KH.KHScriptContext,System.String\u003E[]12:System.Int3242:A16:KHENGINE.RUNTIMET18:KH.KHScriptContext13:System.String13:System.String)-\u003E11:System.Void @ 7\uFF1BFieldRead\uFF1A"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET28:KH.LTCCommonSetPlotVarScript::25:InvokeFunctionByFuncDicEx(5:108:A11:NETSTANDARDT15:System.Action\u00603\u003CA16:KHENGINE.RUNTIMET18:KH.KHScriptContext,System.String,System.String\u003E[]12:System.Int3242:A16:KHENGINE.RUNTIMET18:KH.KHScriptContext13:System.String13:System.String)-\u003E11:System.Void",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Global/LTC/LTCCommonSetPlotVarScript.cs",
+      "Line": 40,
+      "Reason": "\u59D4\u6258\u7ED1\u5B9A\u6765\u6E90\u5C1A\u672A\u95ED\u5408\uFF1AA16:KHENGINE.RUNTIMET28:KH.LTCCommonSetPlotVarScript::25:InvokeFunctionByFuncDicEx(5:108:A11:NETSTANDARDT15:System.Action\u00603\u003CA16:KHENGINE.RUNTIMET18:KH.KHScriptContext,System.String,System.String\u003E[]12:System.Int3242:A16:KHENGINE.RUNTIMET18:KH.KHScriptContext13:System.String13:System.String)-\u003E11:System.Void @ 7\uFF1BFieldRead\uFF1A"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET28:KH.LTCCommonSetPlotVarScript::30:InvokeSVCommonActorInfoFuncDic(6:143:A11:NETSTANDARDT15:System.Action\u00604\u003CA16:KHENGINE.RUNTIMET18:KH.KHScriptContext,A16:KHENGINE.RUNTIMET10:KH.KHActor,System.String,System.String\u003E[]12:System.Int3242:A16:KHENGINE.RUNTIMET18:KH.KHScriptContext34:A16:KHENGINE.RUNTIMET10:KH.KHActor13:System.String13:System.String)-\u003E11:System.Void",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Global/LTC/LTCCommonSetPlotVarScript.cs",
+      "Line": 59,
+      "Reason": "\u59D4\u6258\u7ED1\u5B9A\u6765\u6E90\u5C1A\u672A\u95ED\u5408\uFF1AA16:KHENGINE.RUNTIMET28:KH.LTCCommonSetPlotVarScript::30:InvokeSVCommonActorInfoFuncDic(6:143:A11:NETSTANDARDT15:System.Action\u00604\u003CA16:KHENGINE.RUNTIMET18:KH.KHScriptContext,A16:KHENGINE.RUNTIMET10:KH.KHActor,System.String,System.String\u003E[]12:System.Int3242:A16:KHENGINE.RUNTIMET18:KH.KHScriptContext34:A16:KHENGINE.RUNTIMET10:KH.KHActor13:System.String13:System.String)-\u003E11:System.Void @ 5\uFF1BFieldRead\uFF1A"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET29:KH.Logic.KHGeneralTableConfig::15:GetSubNinjaConf(3:13:System.UInt3213:System.UInt3213:System.UInt32)-\u003E51:A11:KIHAN.PROTOT32:kihan_general_table.SubNinjaConf",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/Framework/WorldModule/Manager/Data/KHGeneralTableConfig.cs",
+      "Line": 323,
+      "Reason": "\u6E90\u7801\u64CD\u4F5C\u5C1A\u672A\u652F\u6301\uFF1ATuple\uFF1BD:\\KiHan\\Packages\\khengine\\Runtime\\Framework\\WorldModule\\Manager\\Data\\KHGeneralTableConfig.cs: (324,46)-(324,80)"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET29:KH.Logic.KHGeneralTableConfig::24:GetSubNinjaConfForBattle(2:13:System.UInt3213:System.UInt32)-\u003E51:A11:KIHAN.PROTOT32:kihan_general_table.SubNinjaConf",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/Framework/WorldModule/Manager/Data/KHGeneralTableConfig.cs",
+      "Line": 309,
+      "Reason": "\u6E90\u7801\u64CD\u4F5C\u5C1A\u672A\u652F\u6301\uFF1ATuple\uFF1BD:\\KiHan\\Packages\\khengine\\Runtime\\Framework\\WorldModule\\Manager\\Data\\KHGeneralTableConfig.cs: (324,46)-(324,80)"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET30:KH.LTCBCCommonTriggerCondition::24:OnPlayerDead_CheckIsMain(1:41:A16:KHENGINE.RUNTIMET17:KH.TriggerContext)-\u003E14:System.Boolean",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Condition/impl/LTC/LTCBCCommonTriggerCondition.cs",
+      "Line": 1207,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET30:KH.LTCBCCommonTriggerCondition::24:OnPlayerDead_CheckIsMain(2:13:System.String15:System.Object[])-\u003E14:System.Boolean",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Condition/impl/LTC/LTCBCCommonTriggerCondition.cs",
+      "Line": 1201,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET30:KH.LTCBCCommonTriggerCondition::29:BattleResult_CheckIsMineGroup(1:41:A16:KHENGINE.RUNTIMET17:KH.TriggerContext)-\u003E14:System.Boolean",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Condition/impl/LTC/LTCBCCommonTriggerCondition.cs",
+      "Line": 1269,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET30:KH.LTCBCCommonTriggerCondition::29:BattleResult_CheckIsMineGroup(2:13:System.String15:System.Object[])-\u003E14:System.Boolean",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Condition/impl/LTC/LTCBCCommonTriggerCondition.cs",
+      "Line": 1263,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET30:KH.LTCBCCommonTriggerCondition::37:OnPlayerStatusChanged_CheckIsMyTeamID(2:41:A16:KHENGINE.RUNTIMET17:KH.TriggerContext14:System.Boolean)-\u003E14:System.Boolean",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Condition/impl/LTC/LTCBCCommonTriggerCondition.cs",
+      "Line": 611,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET33:KH.PVPMVMTeamDungeon5ModelAdatper::24:GetNextRoomIndexBySelect(2:12:System.Int3212:System.Int32)-\u003E12:System.Int32",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/Framework/GameMode/BattleMode/Net/MVM/TeamDungeon5/PVPMVMTeamDungeon5ModelAdatper.cs",
+      "Line": 204,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET33:KH.PVPMVMTeamDungeon5ModelAdatper::31:GetNextRoomInfoBySelectForScene(2:12:System.Int3212:System.Int32)-\u003E12:System.Int32",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/Framework/GameMode/BattleMode/Net/MVM/TeamDungeon5/PVPMVMTeamDungeon5ModelAdatper.cs",
+      "Line": 154,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET33:KH.PVPMVMTeamDungeon6ModelAdatper::24:GetNextRoomIndexBySelect(2:12:System.Int3212:System.Int32)-\u003E12:System.Int32",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/Framework/GameMode/BattleMode/Net/MVM/TeamDungeon6/PVPMVMTeamDungeon6ModelAdatper.cs",
+      "Line": 204,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET33:KH.PVPMVMTeamDungeon6ModelAdatper::31:GetNextRoomInfoBySelectForScene(2:12:System.Int3212:System.Int32)-\u003E12:System.Int32",
+      "Decision": "NoLogTrack",
+      "File": "Packages/khengine/Runtime/Framework/GameMode/BattleMode/Net/MVM/TeamDungeon6/PVPMVMTeamDungeon6ModelAdatper.cs",
+      "Line": 154,
+      "Reason": "\u53CD\u5C04\u76EE\u6807\u672A\u5C55\u5F00\uFF1A\u65E5\u5FD7\u51B3\u5B9A\u91C7\u7528\u5F53\u524D\u6E90\u7801\u4EBA\u5DE5\u6807\u7B7E\uFF0C\u771F\u5B9E\u884C\u4E3A\u672A\u8BC1\u660E"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET38:KH.PVPRecordStatusManager\u002BPlayerStatus::16:FVector3ToString(1:43:A24:MOREFUN.LOCKSTEP.RUNTIMET11:KH.FVector3)-\u003E13:System.String",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Manager/PVPRecordStatusManager.cs",
+      "Line": 58,
+      "Reason": "runtime native implementation"
+    },
+    {
+      "Id": "A16:KHENGINE.RUNTIMET46:KH.TSFollowTrackingScript\u002BRocketTrackingScript::16:GetShootRotation(1:44:A16:KHENGINE.RUNTIMET20:KH.FollowTrackingArg)-\u003E46:A24:MOREFUN.LOCKSTEP.RUNTIMET14:KH.FQuaternion",
+      "Decision": "ShouldTrack",
+      "File": "Packages/khengine/Runtime/Script/Target/TSFollowTrackingScript.cs",
+      "Line": 239,
+      "Reason": "\u6E90\u7801\u5199\u5165\u76EE\u6807\u5C1A\u672A\u652F\u6301\uFF1AInstanceReference\uFF1Bthis"
+    }
+  ]
+}

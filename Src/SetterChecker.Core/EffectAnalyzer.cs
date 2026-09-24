@@ -2,423 +2,640 @@ using System.Diagnostics;
 
 namespace SetterChecker.Core
 {
-    /// <summary>沿已有调用与值来源证明根函数是否修改外部对象。</summary>
+    /// <summary>每个函数保存一份修改说明，只传递新增说明。</summary>
     public sealed class EffectAnalyzer
     {
-        // 保存被修改的对象来源，按每条调用边映射到实际参数并迭代至稳定。
-        /// <summary>返回全部根函数的真实行为；缺少必要证明时明确失败。</summary>
-        public EffectAnalysisResult Analyze(
-            MethodCatalogResult catalog,
-            IReadOnlyList<MethodEntry> roots,
-            CallTargetResolutionResult resolution,
-            CancellationToken cancellationToken = default)
+        // 真实判断和标签生效后的修改共用固定关系，分别保存结果。
+        /// <summary>返回请求函数的行为，不能判断时明确报错。</summary>
+        public EffectAnalysisResult Analyze(MethodCatalogResult catalog, IReadOnlyList<MethodEntry> roots,
+            CallTargetResolutionResult resolution, CancellationToken cancellationToken = default)
         {
-            return AnalyzeAvailable(catalog, roots, resolution, true, cancellationToken);
+            // 真实行为只计算一轮；未闭合项作为失败返回，不再重复计算标签生效后的第二轮。
+            return AnalyzeAvailable(catalog, roots, resolution, false, cancellationToken);
         }
 
-        // 共用写入传播处理完整或正在补读的图，未证明的根绝不加入确定结果。
-        internal EffectAnalysisResult AnalyzeAvailable(
-            MethodCatalogResult catalog, IReadOnlyList<MethodEntry> roots,
-            CallTargetResolutionResult resolution, bool requireCompleteProof, CancellationToken cancellationToken,
-            IReadOnlyDictionary<int, EffectEvidence>? frozenSetters = null, IReadOnlySet<string>? exemptMethods = null,
-            IReadOnlySet<string?>? businessAssemblies = null)
+        // 判定已经在连接调用时传递，这里只整理请求函数的结果。
+        internal EffectAnalysisResult AnalyzeAvailable(MethodCatalogResult catalog, IReadOnlyList<MethodEntry> roots,
+            CallTargetResolutionResult resolution, bool requireCompleteProof, CancellationToken cancellationToken)
         {
-            Stopwatch stopwatch = Stopwatch.StartNew();
-            HashSet<int> requestedRoots = roots.Select(root => resolution.ValueSources.RootInstances[root.Id].Id).ToHashSet();
-            MethodCallInstance[] instances = resolution.ValueSources.Instances.Where(instance => requestedRoots.Contains(instance.RootId) && frozenSetters?.ContainsKey(instance.RootId) != true).ToArray();
-            Dictionary<int, EffectEvidence> proofs = frozenSetters == null ? new() : new(frozenSetters);
-            Dictionary<int, EffectEvidence> boundaries = new();
-            HashSet<(int Instance, BehaviorFlowPoint Point, bool EveryPath, bool Conditions)> closedPrefixes = new();
-            ILookup<int, (ResolvedCall Call, ResolvedCallTarget Target)> callers = resolution.Calls
-                .Where(call => requestedRoots.Contains(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId)
-                    && frozenSetters?.ContainsKey(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId) != true)
-                .SelectMany(call => call.Targets.Select(target => (Call: call, Target: target))).ToLookup(item => item.Target.InstanceId);
-            HashSet<int> readOnlyRoots = requestedRoots.Except(proofs.Keys)
-                .Except(resolution.PendingCalls.Select(call => resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId))
-                .Where(root => resolution.ValueSources.HasOnlyReads(root) == true).ToHashSet();
-            IReadOnlyDictionary<(int Instance, int Block), string> unsettled = resolution.ValueSources.ReadConditionFailures(
-                instances.Where(instance => !readOnlyRoots.Contains(instance.RootId)));
-            HashSet<int> unsettledRoots = unsettled.Keys.Select(key => resolution.ValueSources.GetInstance(key.Instance).RootId).ToHashSet();
-            using ValueSourceIndex.IntegerPathProof pathProof = resolution.ValueSources.CreatePathProof();
-            HashSet<string> conditionalMethods = resolution.Behaviors.Methods.Where(ValueSourceIndex.IntegerPathProof.HasPathConditions)
-                .Select(body => body.MethodId).ToHashSet(StringComparer.Ordinal);
-            HashSet<int> pathConditions = instances.Where(instance => conditionalMethods.Contains(instance.MethodId)).Select(instance => instance.RootId).ToHashSet();
-
-            // 每处证据沿真实调用边独立传播，保留递归回边及逐参数失败隔离。
-            void Propagate(int instanceId, WriteSubject subject, EffectEvidence evidence, BehaviorFlowPoint? point = null)
+            using var timing = resolution.ValueSources.Timing.Measure(AnalysisTiming.Part.Effects);
+            Stopwatch watch = Stopwatch.StartNew();
+            EffectAnalysisResult result = resolution.Effects.ReadResults(roots, resolution.PendingCalls, cancellationToken, resolution.Failure);
+            if (requireCompleteProof && result.Failures.FirstOrDefault() is var failure && failure.Key != null)
             {
-                int rootId = resolution.ValueSources.GetInstance(instanceId).RootId;
-                Queue<(int Instance, WriteSubject Subject, EffectEvidence Evidence, BehaviorFlowPoint? Point)> pending = new(new[] { (instanceId, subject, evidence, point) });
-                HashSet<(int, WriteSubject, BehaviorFlowPoint?)> visited = new();
-                while (!proofs.ContainsKey(rootId) && pending.TryDequeue(out var current))
+                throw new AnalysisException($"函数行为尚未确定：{failure.Key}；{failure.Value.Detail}");
+            }
+            return result with { Elapsed = watch.Elapsed };
+        }
+
+        /// <summary>每个函数只保存真实修改、追踪修改各一条证据，新增结论只传一次。</summary>
+        internal sealed class FunctionEffects
+        {
+            private readonly MethodCatalogResult m_catalog;
+            private readonly Dictionary<string, MethodEntry> m_methods;
+            private readonly ValueSourceIndex m_values;
+            private readonly HashSet<string?> m_businessAssemblies;
+            private HashSet<string>? m_businessReturnTypes;
+            private readonly Dictionary<string, bool> m_businessReturnQueries = new(StringComparer.Ordinal);
+            private readonly Dictionary<(string Method, bool Tracking), ModificationEvidence> m_setters = new();
+            private readonly HashSet<(string Method, bool Tracking)> m_newObjectReturns = new();
+            private readonly Dictionary<string, Dictionary<string, (int Position, bool NewObjectConstruction)>> m_callers = new(StringComparer.Ordinal);
+            private readonly Dictionary<(string Method, bool Tracking), EffectEvidence> m_unknownWrites = new();
+            private readonly Queue<(string Method, bool Tracking)> m_pending = new();
+            private readonly List<string> m_settled = new();
+
+            // 修改说明和调用连接共用当前函数表。
+            internal FunctionEffects(MethodCatalogResult catalog, IReadOnlyList<MethodEntry> roots,
+                Dictionary<string, MethodEntry> methods, ValueSourceIndex values)
+            {
+                this.m_catalog = catalog;
+                this.m_methods = methods;
+                this.m_values = values;
+                this.m_businessAssemblies = roots.Select(method => method.AssemblyPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            }
+
+            // 真实行为与追踪行为都已确定后，不再为该函数继续查找修改。
+            internal bool IsSettled(string method) => this.m_setters.ContainsKey((method, false))
+                && (this.m_methods[method].HasNoLogTrackExemption || this.m_setters.ContainsKey((method, true)));
+
+            // 直接写入只需找到第一条确定证据，未知对象来源仍明确保留。
+            internal void ReadDirect(MethodBehavior body, IEnumerable<BehaviorWrite>? reflectionWrites = null, bool includeReturns = true)
+            {
+                using var timing = this.m_values.Timing.Measure(AnalysisTiming.Part.Effects);
+                if (IsSettled(body.MethodId))
+                {
+                    return;
+                }
+                this.m_unknownWrites.Remove((body.MethodId, false));
+                this.m_unknownWrites.Remove((body.MethodId, true));
+                foreach (BehaviorWrite write in body.Writes.Concat(reflectionWrites ?? Enumerable.Empty<BehaviorWrite>()))
+                {
+                    if (write.IsLazyInitialization)
+                    {
+                        continue;
+                    }
+                    if (IsStandardDictionaryTryGetValue(body, write))
+                    {
+                        continue;
+                    }
+                    IEnumerable<WriteSubjectKind> subjects = write.ReceiverValueId is int receiver
+                        ? ReadSubjects(this.m_values, new BehaviorValueReference(body.MethodId, receiver))
+                        : new[] { WriteSubjectKind.Static };
+                    foreach (WriteSubjectKind subject in subjects)
+                    {
+                        if (subject != WriteSubjectKind.Unknown)
+                        {
+                            Seed(body.MethodId, write.Point.BlockId, write.Member?.Name ?? write.Kind.ToString());
+                            return;
+                        }
+                        EffectEvidence evidence = new(new[] { body.MethodId }, write.Point.BlockId, "写入对象来源尚未确定");
+                        this.m_unknownWrites[(body.MethodId, false)] = evidence;
+                        this.m_unknownWrites[(body.MethodId, true)] = evidence;
+                    }
+                }
+                if (includeReturns)
+                {
+                    ReadReturns(body, false);
+                    ReadReturns(body, true);
+                }
+            }
+
+            // 分别检查真实创建与需要追踪的创建，可信 NLT 不抹掉写入所需的真实对象来源。
+            private void ReadReturns(MethodBehavior body, bool tracking)
+            {
+                var key = (body.MethodId, tracking);
+                if (this.m_setters.ContainsKey(key) || tracking && this.m_methods[body.MethodId].HasNoLogTrackExemption
+                    || !CanReturnBusinessObject(this.m_methods[body.MethodId]))
+                {
+                    return;
+                }
+                foreach (BehaviorReturn returned in body.Returns.Where(item => item.ValueId.HasValue))
+                {
+                    foreach (ValueOrigin origin in this.m_values.ReadReturnedOrigins(new BehaviorValueReference(body.MethodId, returned.ValueId!.Value), tracking: tracking))
+                    {
+                        BehaviorTypeReference? createdType = origin.Value.Type?.Id.StartsWith('!') == true
+                            ? origin.Value.AllocationConstraint : origin.Value.Type;
+                        // 返回新建对象或浅复制外壳本身不修改已有战斗状态；对象内部若写入了外部对象，已由 ReadDirect 的写入对象来源单独捕获。
+                        if (origin.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.ShallowCopy)
+                        {
+                            continue;
+                        }
+                        if ((origin.Value.Kind == BehaviorValueKind.CallResult
+                                || origin.Value.Kind == BehaviorValueKind.NewObject && createdType == null)
+                            && (origin.Value.Reference != ValueSourceIndex.ReflectionBaselineFailure
+                                || !this.m_unknownWrites.TryGetValue(key, out EffectEvidence? unknown)
+                                || unknown.Detail == ValueSourceIndex.ReflectionBaselineFailure))
+                        {
+                            this.m_unknownWrites[key] = new(new[] { body.MethodId }, returned.Point.BlockId,
+                                origin.Value.Reference == ValueSourceIndex.ReflectionBaselineFailure
+                                    ? ValueSourceIndex.ReflectionBaselineFailure : "返回值可能是新建业务对象，固定返回说明尚未闭合");
+                        }
+                    }
+                }
+            }
+
+            // 返回类型不可能承载业务对象时，不为判断创建行为计算它的全部返回内容。
+            private bool CanReturnBusinessObject(MethodEntry method)
+            {
+                if (this.m_businessReturnQueries.TryGetValue(method.Id, out bool known))
+                {
+                    return known;
+                }
+                BehaviorTypeReference reference = this.m_catalog.ReadMethodReturnType(method);
+                if (reference.DefinitionIdentity.Text.StartsWith('!'))
+                {
+                    return true;
+                }
+                TypeEntry type = this.m_catalog.ResolveTypeDefinition(reference);
+                // 枚举返回的是值，不因声明在业务程序集中就追踪新建业务对象。
+                if (type.IsEnum)
+                {
+                    this.m_businessReturnQueries.Add(method.Id, false);
+                    return false;
+                }
+                bool possible = this.m_businessAssemblies.Contains(type.AssemblyPath) && !type.IsCompilerGenerated;
+                if (!possible && !type.IsSealed && !type.IsValueType)
+                {
+                    if (this.m_businessReturnTypes == null)
+                    {
+                        this.m_businessReturnTypes = new(StringComparer.Ordinal);
+                        foreach (TypeEntry business in this.m_catalog.Types.Where(candidate => !candidate.IsCompilerGenerated
+                            && this.m_businessAssemblies.Contains(candidate.AssemblyPath)))
+                        {
+                            this.m_businessReturnTypes.Add(business.Id);
+                            foreach (var parent in this.m_catalog.ReadInheritedTypes(business))
+                            {
+                                this.m_businessReturnTypes.Add(parent.Definition.Id);
+                            }
+                        }
+                    }
+                    possible = this.m_businessReturnTypes.Contains(type.Id);
+                }
+                this.m_businessReturnQueries.Add(method.Id, possible);
+                return possible;
+            }
+
+            // 一个调用位置找到 Setter 后即可传递结论，不按实际参数复制行为。
+            internal void Bind(ResolvedCall call)
+            {
+                using var timing = this.m_values.Timing.Measure(AnalysisTiming.Part.Effects);
+                if (call.ValuesOnly)
+                {
+                    return;
+                }
+                if (call.RuntimeRule?.Operation == RuntimeOperation.WriteCollection)
+                {
+                    Seed(call.CallerMethodId, call.Call.Point.BlockId, call.RuntimeRule.Description);
+                }
+                if (call.RuntimeRule?.Operation == RuntimeOperation.Diagnostics)
+                {
+                    return;
+                }
+                if (call.InvokesUnboundParameter)
+                {
+                    Seed(call.CallerMethodId, call.Call.Point.BlockId, "调用未固定目标的委托参数，合法回调允许修改状态");
+                }
+                foreach (ResolvedCallTarget target in call.Targets)
+                {
+                    if (target.Reference.Name == ".ctor" && IsStandardCollectionType(target.Reference.DeclaringTypeDefinitionId))
+                    {
+                        continue;
+                    }
+                    if (!this.m_callers.TryGetValue(target.MethodId, out Dictionary<string, (int Position, bool NewObjectConstruction)>? callers))
+                    {
+                        callers = new(StringComparer.Ordinal);
+                        this.m_callers.Add(target.MethodId, callers);
+                    }
+                    callers.TryAdd(call.CallerMethodId,
+                        (call.Call.Point.BlockId, IsNewObjectConstruction(target)));
+                    foreach (bool tracking in new[] { false, true })
+                    {
+                        if (this.m_setters.ContainsKey((target.MethodId, tracking))
+                            && !IsNewObjectReturn(target.MethodId, tracking)
+                            && !IsNewObjectConstruction(target))
+                        {
+                            Add(call.CallerMethodId, tracking, new(target.MethodId, call.Call.Point.BlockId, string.Empty));
+                        }
+                    }
+                    Propagate();
+                    if (IsSettled(call.CallerMethodId))
+                    {
+                        break;
+                    }
+                }
+            }
+
+            // 返回新对象本身不修改调用者可见状态，不能把它传播成上层 Setter。
+            private bool IsNewObjectReturn(string method, bool tracking)
+            {
+                return this.m_newObjectReturns.Contains((method, tracking));
+            }
+
+            // 构造函数只初始化调用点刚创建的对象，不把初始化写入传播给调用者。
+            private bool IsNewObjectConstruction(ResolvedCallTarget target)
+            {
+                if (target.Reference.Name != ".ctor")
+                {
+                    return false;
+                }
+                if (!this.m_catalog.TypesById.TryGetValue(target.Reference.DeclaringTypeDefinitionId, out TypeEntry? declaringType)
+                    || !declaringType.IsValueType)
+                {
+                    return false;
+                }
+                foreach (BehaviorValueReference receiver in target.Receiver)
+                {
+                    if (!this.m_values.Behaviors.TryGetValue(receiver.MethodId, out MethodBehavior? body)
+                        || receiver.ValueId < 0 || receiver.ValueId >= body.Values.Count)
+                    {
+                        continue;
+                    }
+                    BehaviorValue value = body.Values[receiver.ValueId];
+                    if (value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray or BehaviorValueKind.ShallowCopy)
+                    {
+                        return true;
+                    }
+                    if (value.Kind == BehaviorValueKind.CallResult
+                        && body.Calls.Any(call => call.ResultValueId == receiver.ValueId
+                            && call.Kind == BehaviorCallKind.ObjectCreation))
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            // Dictionary.TryGetValue 只把结果写入 out 参数，不修改字典或其调用者可见状态。
+            private bool IsStandardDictionaryTryGetValue(MethodBehavior body, BehaviorWrite write)
+            {
+                if (write.Kind != BehaviorWriteKind.Indirect || write.Member != null
+                    || !IsStandardDictionaryTryGetValue(body.MethodId))
+                {
+                    return false;
+                }
+                return true;
+            }
+
+            private bool IsStandardDictionaryTryGetValue(string methodId)
+            {
+                if (!this.m_methods.TryGetValue(methodId, out MethodEntry? method)
+                    || method.Name != "TryGetValue" || method.Parameters.Count != 2
+                    || method.Parameters[1].RefKind != Microsoft.CodeAnalysis.RefKind.Out
+                    || !this.m_catalog.TypesById.TryGetValue(method.TypeId, out TypeEntry? owner))
+                {
+                    return false;
+                }
+                return owner.FullName == "System.Collections.Generic.Dictionary`2"
+                    || owner.FullName.StartsWith("System.Collections.Generic.Dictionary<", StringComparison.Ordinal);
+            }
+
+            // 标准 List/Dictionary 构造函数只初始化刚创建的容器，不修改外部业务对象。
+            private bool IsStandardCollectionType(string typeId)
+            {
+                if (typeId.Contains("System.Collections.Generic.List`1", StringComparison.Ordinal)
+                    || typeId.Contains("System.Collections.Generic.Dictionary`2", StringComparison.Ordinal))
+                {
+                    return true;
+                }
+                if (!this.m_catalog.TypesById.TryGetValue(typeId, out TypeEntry? type))
+                {
+                    return false;
+                }
+                return type.FullName is "System.Collections.Generic.List`1" or "System.Collections.Generic.Dictionary`2"
+                    || type.FullName.StartsWith("System.Collections.Generic.List<", StringComparison.Ordinal)
+                    || type.FullName.StartsWith("System.Collections.Generic.Dictionary<", StringComparison.Ordinal);
+            }
+
+            // 直接修改同时产生真实证据和受标签约束的追踪证据。
+            private void Seed(string method, int position, string detail)
+            {
+                ModificationEvidence evidence = new(null, position, detail);
+                Add(method, false, evidence);
+                Add(method, true, evidence);
+                Propagate();
+            }
+
+            // Setter 只从未确定变成确定；可信标签只阻断追踪传播。
+            private void Add(string method, bool tracking, ModificationEvidence evidence, bool newObjectReturn = false)
+            {
+                if (tracking && this.m_methods[method].HasNoLogTrackExemption)
+                {
+                    return;
+                }
+                if (!newObjectReturn)
+                {
+                    if (this.m_newObjectReturns.Remove((method, tracking))
+                        && this.m_setters.ContainsKey((method, tracking)))
+                    {
+                        this.m_pending.Enqueue((method, tracking));
+                    }
+                }
+                if (this.m_setters.TryAdd((method, tracking), evidence))
+                {
+                    if (newObjectReturn)
+                    {
+                        this.m_newObjectReturns.Add((method, tracking));
+                    }
+                    this.m_pending.Enqueue((method, tracking));
+                    if (IsSettled(method))
+                    {
+                        this.m_settled.Add(method);
+                    }
+                }
+            }
+
+            internal Action<IReadOnlyList<string>>? Settled { get; set; }
+
+            // 每次新增结论只通知已登记的直接调用者。
+            private void Propagate()
+            {
+                while (this.m_pending.TryDequeue(out var fact))
+                {
+                    if (!this.m_callers.TryGetValue(fact.Method,
+                        out Dictionary<string, (int Position, bool NewObjectConstruction)>? callers))
+                    {
+                        continue;
+                    }
+                    foreach (var caller in callers)
+                    {
+                        if (caller.Value.NewObjectConstruction || IsNewObjectReturn(fact.Method, fact.Tracking))
+                        {
+                            continue;
+                        }
+                        Add(caller.Key, fact.Tracking, new(fact.Method, caller.Value.Position, string.Empty));
+                    }
+                }
+                if (this.m_settled.Count != 0)
+                {
+                    this.Settled?.Invoke(this.m_settled);
+                    this.m_settled.Clear();
+                }
+            }
+
+            // 已确定 Setter 的其他未知调用不影响结论；未确定函数不得借剪枝变成 Getter。
+            internal EffectAnalysisResult ReadResults(IReadOnlyList<MethodEntry> roots, IReadOnlyList<PendingCall> pendingCalls,
+                CancellationToken cancellationToken, string? interrupted = null)
+            {
+                Dictionary<(string Method, bool Tracking), ModificationEvidence> unknown = new();
+                Queue<(string Method, bool Tracking)> queue = new();
+                // 只为还没有确定修改的函数保留未知证据。
+                void AddUnknown(string method, bool tracking, ModificationEvidence evidence)
+                {
+                    if (this.m_setters.ContainsKey((method, tracking)) || tracking && this.m_methods[method].HasNoLogTrackExemption)
+                    {
+                        return;
+                    }
+                    if (unknown.TryAdd((method, tracking), evidence))
+                    {
+                        queue.Enqueue((method, tracking));
+                    }
+                }
+                if (interrupted != null)
+                {
+                    foreach (string method in this.m_methods.Keys)
+                    {
+                        AddUnknown(method, false, new(null, -1, interrupted));
+                        AddUnknown(method, true, new(null, -1, interrupted));
+                    }
+                }
+                foreach (MethodBehavior body in this.m_values.Behaviors.Values)
+                {
+                    string? failure = body.Failure ?? (body.BodyKind != MethodBodyKind.Executable
+                        ? body.NativeBoundary?.ToString() ?? $"没有可读取的托管函数体：{body.BodyKind}" : null);
+                    if (failure != null)
+                    {
+                        AddUnknown(body.MethodId, false, new(null, -1, failure));
+                        AddUnknown(body.MethodId, true, new(null, -1, failure));
+                    }
+                }
+                foreach (var pair in this.m_unknownWrites)
+                {
+                    AddUnknown(pair.Key.Method, pair.Key.Tracking, new(null, pair.Value.Position, pair.Value.Detail));
+                }
+                foreach (PendingCall call in pendingCalls)
+                {
+                    ModificationEvidence evidence = new(null, call.Call.Point.BlockId, call.Failure ?? "调用目标尚未确定");
+                    AddUnknown(call.CallerMethodId, false, evidence);
+                    AddUnknown(call.CallerMethodId, true, evidence);
+                }
+                while (queue.TryDequeue(out var fact))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    if (!visited.Add((current.Instance, current.Subject, current.Point))
-                        || current.Subject.Failure == null && exemptMethods?.Contains(resolution.ValueSources.GetInstance(current.Instance).MethodId) == true)
+                    if (this.m_callers.TryGetValue(fact.Method,
+                        out Dictionary<string, (int Position, bool NewObjectConstruction)>? callers))
                     {
-                        continue;
-                    }
-                    if (current.Subject.Failure == null && !current.Subject.ExecutionProven && current.Point.HasValue
-                        && !resolution.ValueSources.HasClosedPrefix(current.Instance, current.Point.Value, closedPrefixes, conditionFailures: unsettled))
-                    {
-                        current.Subject = new WriteSubject(null, "修改位置之前的调用尚未证明可以正常返回", current.Subject.Witness);
-                    }
-                    if (current.Subject.Failure != null)
-                    {
-                        if (boundaries.TryGetValue(current.Instance, out EffectEvidence? previous)
-                            && previous.MethodPath.Count <= current.Evidence.MethodPath.Count)
+                        foreach (var caller in callers)
                         {
-                            continue;
-                        }
-                        boundaries[current.Instance] = current.Evidence with { Detail = current.Subject.Failure };
-                    }
-                    if (current.Instance == rootId)
-                    {
-                        if (current.Subject.Failure == null)
-                        {
-                            proofs.Add(rootId, current.Evidence);
-                        }
-                        continue;
-                    }
-                    foreach (var item in callers[current.Instance])
-                    {
-                        IEnumerable<WriteSubject> mapped = new[] { current.Subject };
-                        if (current.Subject.Failure == null && current.Subject.Reference is BehaviorValueReference reference)
-                        {
-                            BehaviorValue? value = reference.InstanceId == current.Instance
-                                ? resolution.Behaviors.MethodsById[reference.MethodId].Values[reference.ValueId] : null;
-                            IEnumerable<BehaviorValueReference> arguments = reference.InstanceId == current.Instance
-                                ? value!.Kind == BehaviorValueKind.Parameter ? item.Target.Arguments[value.ParameterIndex!.Value] : item.Target.Receiver
-                                : new[] { reference };
-                            mapped = arguments.SelectMany(argument => ReadWriteSubjects(catalog, resolution, argument, rootId,
-                                pathProof, current.Subject.Witness, pathConditions.Contains(rootId)));
-                        }
-                        foreach (WriteSubject mappedSubject in mapped)
-                        {
-                            pending.Enqueue((item.Call.CallerInstanceId, mappedSubject,
-                                current.Evidence with { MethodPath = current.Evidence.MethodPath.Prepend(item.Call.CallerMethodId).ToArray() }, item.Call.Call.Point));
+                            AddUnknown(caller.Key, fact.Tracking, new(fact.Method, caller.Value.Position, string.Empty));
                         }
                     }
                 }
-            }
+                Dictionary<string, EffectEvidence> failures = new(StringComparer.Ordinal);
+                IReadOnlyList<MethodEffect> actual = Results(false, failures);
+                return new EffectAnalysisResult(actual, TimeSpan.Zero)
+                {
+                    Failures = failures,
+                    SummaryUpdates = this.m_setters.Count + unknown.Count,
+                };
 
-            foreach (MethodCallInstance instance in instances)
-            {
-                foreach (BehaviorValue read in resolution.ValueSources.ReadStaticFieldReads(instance.Id))
+                // 只在输出时沿单条证据链接还原调用过程。
+                EffectEvidence Evidence(string method, bool tracking, Dictionary<(string Method, bool Tracking), ModificationEvidence> table)
                 {
-                    if (resolution.ValueSources.ReadStaticCallInitializationFailure(instance.Id, accessedField: read.Member) is string fieldFailure)
+                    List<string> path = new();
+                    ModificationEvidence evidence;
+                    do
                     {
-                        Propagate(instance.Id, new WriteSubject(null, fieldFailure), new EffectEvidence(new[] { instance.MethodId }, read.Point!.Value.BlockId, fieldFailure));
+                        path.Add(method);
+                        evidence = table[(method, tracking)];
+                        method = evidence.Callee!;
                     }
+                    while (method != null);
+                    return new(path, evidence.Position, evidence.Detail);
                 }
-                if (resolution.ValueSources.ReadStaticCallInitializationFailure(instance.Id) is string initializationFailure)
-                {
-                    Propagate(instance.Id, new WriteSubject(null, initializationFailure), new EffectEvidence(new[] { instance.MethodId }, -1, initializationFailure));
-                }
-                if (!resolution.Behaviors.MethodsById.TryGetValue(instance.MethodId, out MethodBehavior? body)
-                    || body.BodyKind != MethodBodyKind.Executable
-                        && !(body.BodyKind == MethodBodyKind.RuntimeImplementation && callers[instance.Id].Any() && callers[instance.Id].All(item =>
-                            resolution.ValueSources.IsRuntimeDelegateCreation(item.Call, item.Target))))
-                {
-                    Propagate(instance.Id, new WriteSubject(null, body?.Failure ?? body?.NativeBoundary?.ToString() ?? body?.BodyKind.ToString() ?? "等待读取函数体"),
-                        new EffectEvidence(new[] { instance.MethodId }, -1, string.Empty));
-                }
-            }
-            foreach (PendingCall call in resolution.PendingCalls.Where(call => requestedRoots.Contains(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId)
-                && !proofs.ContainsKey(resolution.ValueSources.GetInstance(call.CallerInstanceId).RootId)))
-            {
-                Propagate(call.CallerInstanceId, new WriteSubject(null, call.Failure ?? "等待确定调用目标：" + call.Call.Target.Identity.Text),
-                    new EffectEvidence(new[] { call.CallerMethodId }, call.Call.Point.BlockId, string.Empty));
-            }
-            foreach (var failure in unsettled)
-            {
-                MethodCallInstance instance = resolution.ValueSources.GetInstance(failure.Key.Instance);
-                Propagate(instance.Id, new WriteSubject(null, failure.Value),
-                    new EffectEvidence(new[] { instance.MethodId }, failure.Key.Block, failure.Value));
-            }
-            foreach (MethodCallInstance instance in instances)
-            {
-                resolution.Behaviors.MethodsById.TryGetValue(instance.MethodId, out MethodBehavior? body);
-                foreach (BehaviorWrite write in (body == null ? Enumerable.Empty<BehaviorWrite>() : resolution.ValueSources.GetWrites(instance.Id).OrderBy(write =>
-                             write.ReceiverValueId is int receiver && body.Values[receiver].Kind is not (BehaviorValueKind.CurrentInstance or BehaviorValueKind.Parameter) ? 1 : 0))
-                         .TakeWhile(_ => !proofs.ContainsKey(instance.RootId)))
-                {
-                    EffectEvidence evidence = new(new[] { instance.MethodId }, write.Point.BlockId, write.Member?.Name ?? write.Kind.ToString());
-                    foreach (WriteSubject subject in write.ReceiverValueId == null ? ReadStaticWriteSubjects(instance, write)
-                                 : ReadWriteSubjects(catalog, resolution, new BehaviorValueReference(instance.MethodId, write.ReceiverValueId.Value, instance.Id), instance.RootId,
-                                     pathProof, (new BehaviorValueReference(instance.MethodId, write.ReceiverValueId.Value, instance.Id), write.Point, write), pathConditions.Contains(instance.RootId)))
-                    {
-                        Propagate(instance.Id, subject, evidence, write.Point);
-                    }
-                }
-            }
 
-            // 静态写入没有接收对象，但仍必须满足写入之前的引用及转换条件。
-            IEnumerable<WriteSubject> ReadStaticWriteSubjects(MethodCallInstance instance, BehaviorWrite write)
-            {
-                string? failure = null;
-                try
+                // 真实结果与标签生效后的结果分别输出，不互相覆盖。
+                IReadOnlyList<MethodEffect> Results(bool tracking, Dictionary<string, EffectEvidence> destination)
                 {
-                    if (pathConditions.Contains(instance.RootId) || write.Selection != null)
+                    List<MethodEffect> results = new();
+                    foreach (MethodEntry root in roots.OrderBy(method => method.Id, StringComparer.Ordinal))
                     {
-                        var selected = pathProof.ReadSelectedOriginsAtPoint(instance.RootId, Array.Empty<ValueOrigin>(), instance.Id, write.Point, null, write: write);
-                        if (!selected.Possible)
+                        if (this.m_setters.ContainsKey((root.Id, tracking)) && !IsNewObjectReturn(root.Id, tracking))
                         {
-                            if (selected.Complete)
-                            {
-                                yield break;
-                            }
-                            failure = pathProof.ExecutionFailure ?? "尚有未闭合执行路径，未取得静态写入见证";
+                            results.Add(new(root.Id, MethodEffectKind.Setter, Evidence(root.Id, tracking, this.m_setters)));
+                        }
+                        else if (unknown.ContainsKey((root.Id, tracking)))
+                        {
+                            destination.Add(root.Id, Evidence(root.Id, tracking, unknown));
+                        }
+                        else
+                        {
+                            results.Add(new(root.Id, MethodEffectKind.Getter, null));
                         }
                     }
-                    else
-                    {
-                        resolution.ValueSources.RequireStaticFieldInitialization(instance.Id, write.Member!);
-                    }
+                    return results;
                 }
-                catch (AnalysisException exception)
-                {
-                    failure = exception.Message;
-                }
-                if (failure != null)
-                {
-                    yield return new WriteSubject(null, failure);
-                    yield break;
-                }
-                yield return new WriteSubject(null, ExecutionProven: pathConditions.Contains(instance.RootId) || write.Selection != null);
             }
-
-            businessAssemblies ??= roots.Select(method => method.AssemblyPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            List<MethodEffect> results = new();
-            Dictionary<string, EffectEvidence> failures = new(StringComparer.Ordinal);
-            foreach (MethodEntry root in roots.OrderBy(method => method.Id, StringComparer.Ordinal))
-            {
-                int instanceId = resolution.ValueSources.RootInstances[root.Id].Id;
-                EffectEvidence? proof = proofs.GetValueOrDefault(instanceId);
-                foreach (BehaviorReturn returned in resolution.Behaviors.MethodsById[root.Id].Returns.Where(value => value.ValueId.HasValue && proof == null
-                             && !unsettledRoots.Contains(instanceId)
-                             && resolution.ValueSources.IsReachable(instanceId, value.Point.BlockId)
-                             && !readOnlyRoots.Contains(instanceId)))
-                {
-                    IReadOnlyList<(BehaviorValueReference Reference, BehaviorFlowPoint Point)> sites;
-                    try
-                    {
-                        sites = resolution.ValueSources.ReadReturnSites(instanceId, returned, closedPrefixes, unsettled);
-                    }
-                    catch (AnalysisException exception)
-                    {
-                        boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Point.BlockId, exception.Message));
-                        continue;
-                    }
-                    foreach (var site in sites.TakeWhile(_ => proof == null))
-                    {
-                        if (!resolution.ValueSources.HasClosedPrefix(instanceId, site.Point, closedPrefixes, conditionFailures: unsettled))
-                        {
-                            boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Point.BlockId, "返回位置之前的调用尚未证明可以正常返回"));
-                            continue;
-                        }
-                        BehaviorValueReference reference = site.Reference;
-                        Queue<(BehaviorValueReference Reference, IReadOnlySet<(BehaviorValueReference, ReturnedValuePath?)> Ancestors)> returnedObjects = new();
-                        returnedObjects.Enqueue((reference, new HashSet<(BehaviorValueReference, ReturnedValuePath?)>()));
-                        while (returnedObjects.TryDequeue(out var observation) && proof == null)
-                        {
-                            BehaviorValueReference current = observation.Reference;
-                            try
-                            {
-                                IReadOnlyList<ValueOrigin> returnedOrigins = resolution.ValueSources.GetCallOrigins(current);
-                                if (pathConditions.Contains(instanceId) && returnedOrigins.Any(origin => origin.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray))
-                                {
-                                    var selected = pathProof.ReadSelectedOriginsAtPoint(instanceId, returnedOrigins, instanceId, returned.Point, current, site.Point, normalReturn: true);
-                                    if (!selected.Complete)
-                                    {
-                                        boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Point.BlockId,
-                                            pathProof.ExecutionFailure ?? "单次经过循环不能排除其它迭代返回新对象"));
-                                    }
-                                    returnedOrigins = selected.Origins;
-                                }
-                                foreach (ValueOrigin origin in returnedOrigins
-                                             .OrderBy(origin => origin.Value.Kind == BehaviorValueKind.NewObject ? 0 : 1))
-                                {
-                                    // 同一返回位置的祖先对象已在更宽条件下读取；兄弟槽的不同观察不能合并。
-                                    if (observation.Ancestors.Contains((origin.Reference, origin.ReturnPath)))
-                                    {
-                                        continue;
-                                    }
-                                    if (origin.Value.Kind == BehaviorValueKind.NewObject && origin.Value.Type != null
-                                        && catalog.ResolveTypeDefinition(origin.Value.Type) is TypeEntry type
-                                        && !type.IsCompilerGenerated && businessAssemblies.Contains(type.AssemblyPath))
-                                    {
-                                        proof = new EffectEvidence(new[] { root.Id }, returned.Point.BlockId, "返回新建业务对象或包含它的容器");
-                                        break;
-                                    }
-                                    else if (origin.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray)
-                                    {
-                                        HashSet<(BehaviorValueReference, ReturnedValuePath?)> ancestors = new(observation.Ancestors)
-                                        {
-                                            (origin.Reference, origin.ReturnPath),
-                                        };
-                                        foreach (BehaviorValueReference member in resolution.ValueSources.ReadContainerValues(current, origin, returned.Point,
-                                            failure => boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Point.BlockId, failure)), site.Point,
-                                            pathConditions.Contains(instanceId) ? pathProof : null))
-                                        {
-                                            returnedObjects.Enqueue((member, ancestors));
-                                        }
-                                    }
-                                    else if (origin.Value.Kind == BehaviorValueKind.CallResult)
-                                    {
-                                        throw new AnalysisException($"返回对象来源尚未闭合：{root.Id} @ {returned.Point.BlockId}");
-                                    }
-                                }
-                            }
-                            catch (AnalysisException exception)
-                            {
-                                boundaries.TryAdd(instanceId, new EffectEvidence(new[] { root.Id }, returned.Point.BlockId, exception.Message));
-                            }
-                        }
-                    }
-                }
-                if (proof == null && boundaries.TryGetValue(instanceId, out EffectEvidence? boundary))
-                {
-                    failures.Add(root.Id, boundary);
-                    if (requireCompleteProof)
-                    {
-                        throw new AnalysisException($"函数真实行为缺少实现证明：{root.Id}；{boundary.Detail}；调用过程："
-                            + string.Join(" -> ", boundary.MethodPath));
-                    }
-                    continue;
-                }
-                results.Add(new MethodEffect(root.Id, proof == null ? MethodEffectKind.Getter : MethodEffectKind.Setter, proof));
-            }
-
-            return new EffectAnalysisResult(results, stopwatch.Elapsed) { Failures = failures };
         }
 
-        // 将写入目标还原为当前函数的参数、接收对象或静态存储。
-        private static IEnumerable<WriteSubject> ReadWriteSubjects(
-            MethodCatalogResult catalog, CallTargetResolutionResult resolution, BehaviorValueReference reference, int instanceId,
-            ValueSourceIndex.IntegerPathProof pathProof, (BehaviorValueReference Receiver, BehaviorFlowPoint Point, BehaviorWrite Write)? witness, bool hasPathConditions)
+        // 把写入值追到本函数的当前对象、参数或静态数据，临时新对象不算外部修改。
+        private static IEnumerable<WriteSubjectKind> ReadSubjects(ValueSourceIndex values, BehaviorValueReference reference)
         {
-            Queue<(BehaviorValueReference Reference, bool ThroughReference)> pending = new(new[] { (reference, false) });
-            HashSet<(BehaviorValueReference, bool)> visited = new();
-            bool complete = true;
-            bool publishedSubject = false;
-            while (pending.TryDequeue(out var query))
+            Queue<(BehaviorValueReference Reference, MemberAccess? Members)> pending = new(new[] { (reference, (MemberAccess?)null) });
+            HashSet<(BehaviorValueReference Reference, MemberAccess? Members)> visited = new();
+            while (pending.TryDequeue(out var item))
             {
-                if (!visited.Add(query))
+                if (!visited.Add(item))
                 {
                     continue;
                 }
-                BehaviorValueReference current = query.Reference;
-                IReadOnlyList<ValueOrigin>? origins = null;
-                string? failure = null;
-                try
+
+                IReadOnlyList<ValueOrigin> origins = values.ReadWriteOrigins(item.Reference, reference.MethodId).ToArray();
+                if (origins.Count == 0)
                 {
-                    origins = resolution.ValueSources.GetRelativeOrigins(current, instanceId, retainTypeChecks: true);
-                    if (witness.HasValue && (witness.Value.Write.Selection != null || witness.Value.Write.Kind == BehaviorWriteKind.Indirect && !resolution.ValueSources.IsManagedAddress(witness.Value.Receiver)
-                        || hasPathConditions && origins.Any(origin => origin.Value.Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance)
-                        || origins.Any(origin => origin.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.NewArray or BehaviorValueKind.Local or BehaviorValueKind.Constant)
-                            && origins.Any(origin => origin.Value.Kind is not (BehaviorValueKind.NewObject or BehaviorValueKind.NewArray or BehaviorValueKind.Local or BehaviorValueKind.Constant))))
-                    {
-                        var selected = pathProof.ReadSelectedOriginsAtPoint(instanceId, origins,
-                            witness.Value.Receiver.InstanceId, witness.Value.Point, witness.Value.Receiver, write: witness.Value.Write);
-                        origins = selected.Origins;
-                        complete &= selected.Complete;
-                    }
-                }
-                catch (AnalysisException exception)
-                {
-                    origins = null;
-                    failure = exception.Message;
-                }
-                if (origins == null)
-                {
-                    publishedSubject = true;
-                    yield return new WriteSubject(current, failure, witness);
-                    continue;
+                    yield return WriteSubjectKind.Unknown;
                 }
                 foreach (ValueOrigin origin in origins)
                 {
-                    WriteSubject? subject = null;
-                    try
+                    switch (origin.Value.Kind)
                     {
-                        switch (origin.Value.Kind)
-                        {
-                            case BehaviorValueKind.CurrentInstance:
-                            case BehaviorValueKind.Parameter:
-                                subject = new WriteSubject(origin.Reference, Witness: witness);
-                                break;
-                            case BehaviorValueKind.FieldRead when origin.Value.InputValueIds.Count == 0:
-                            case BehaviorValueKind.Address when origin.Value.Member != null && origin.Value.InputValueIds.Count == 0:
-                                subject = new WriteSubject(null, Witness: witness);
-                                break;
-                            case BehaviorValueKind.Address when !query.ThroughReference && (origin.Value.Reference?.StartsWith("argument:", StringComparison.Ordinal) == true
-                                || origin.Value.Reference?.StartsWith("local:", StringComparison.Ordinal) == true):
-                                break;
-                            case BehaviorValueKind.Conversion when origin.Value.Reference == "box"
-                                && !query.ThroughReference && !CallTargetResolver.IsReferenceType(catalog, origin.Value.Type!.Id, resolution.ValueSources):
-                                break;
-                            case BehaviorValueKind.Conversion:
-                            case BehaviorValueKind.FieldRead:
-                            case BehaviorValueKind.ArrayElementRead:
-                            case BehaviorValueKind.Address:
-                                foreach (int input in origin.Value.InputValueIds.Take(1))
+                        case BehaviorValueKind.ValueCopy:
+                            bool? referenceMember = HasReferenceMember(item.Members);
+                            if (referenceMember == true)
+                            {
+                                foreach (BehaviorValueReference input in origin.BoundReceiver
+                                    ?? origin.Value.InputValueIds.Select(value => origin.Reference with { ValueId = value }).ToArray())
                                 {
-                                    bool throughReference = query.ThroughReference || origin.Value.Kind == BehaviorValueKind.FieldRead
-                                        && CallTargetResolver.IsReferenceType(catalog, resolution.ValueSources.GetInstance(origin.Reference.InstanceId)
-                                            .Substitute(catalog.ReadResolvedFieldType(origin.Value.Member!)).Text, resolution.ValueSources);
-                                    pending.Enqueue((origin.Reference with { ValueId = input }, throughReference));
+                                    pending.Enqueue((input, item.Members));
                                 }
-                                break;
-                            case BehaviorValueKind.NewObject:
-                            case BehaviorValueKind.NewArray:
-                            case BehaviorValueKind.Local:
-                            case BehaviorValueKind.Constant:
-                                break;
-                            default:
-                                subject = new WriteSubject(origin.Reference, "被写对象来源尚未闭合", witness);
-                                break;
-                        }
-                    }
-                    catch (AnalysisException exception)
-                    {
-                        subject = new WriteSubject(origin.Reference, exception.Message, witness);
-                    }
-                    if (subject.HasValue)
-                    {
-                        publishedSubject = true;
-                        yield return subject.Value;
+                            }
+                            else if (referenceMember == null)
+                            {
+                                yield return WriteSubjectKind.Unknown;
+                            }
+                            break;
+                        case BehaviorValueKind.CurrentInstance:
+                            yield return WriteSubjectKind.Receiver;
+                            break;
+                        case BehaviorValueKind.Parameter:
+                            yield return WriteSubjectKind.Parameter;
+                            break;
+                        case BehaviorValueKind.FieldRead when origin.Value.InputValueIds.Count == 0:
+                        case BehaviorValueKind.Address when origin.Value.Member != null && origin.Value.InputValueIds.Count == 0:
+                            yield return WriteSubjectKind.Static;
+                            break;
+                        case BehaviorValueKind.Address when origin.Value.Reference?.StartsWith("local:", StringComparison.Ordinal) == true
+                            || origin.Value.Reference?.StartsWith("argument:", StringComparison.Ordinal) == true:
+                            if (item.Members != null)
+                            {
+                                foreach (BehaviorValueReference value in values.ReadMemberValues(origin, item.Members.Member))
+                                {
+                                    pending.Enqueue((value, item.Members.Next));
+                                }
+                            }
+                            break;
+                        case BehaviorValueKind.Address:
+                        case BehaviorValueKind.FieldRead:
+                        case BehaviorValueKind.ArrayElementRead:
+                            MemberAccess? access = item.Members;
+                            if (origin.Value.Member != null)
+                            {
+                                if (ContainsMember(access, origin.Reference))
+                                {
+                                    yield return WriteSubjectKind.Unknown;
+                                    break;
+                                }
+                                access = new MemberAccess(origin.Value.Member, origin.Reference, access);
+                            }
+                            foreach (BehaviorValueReference input in origin.BoundReceiver
+                                ?? origin.Value.InputValueIds.Take(1).Select(value => origin.Reference with { ValueId = value }).ToArray())
+                            {
+                                pending.Enqueue((input, access));
+                            }
+                            break;
+                        case BehaviorValueKind.NewObject:
+                        case BehaviorValueKind.ShallowCopy:
+                            if (item.Members != null)
+                            {
+                                if (origin.IsAllocationSummary)
+                                {
+                                    yield return WriteSubjectKind.Unknown;
+                                    break;
+                                }
+                                foreach (BehaviorValueReference value in values.ReadMemberValues(origin, item.Members.Member))
+                                {
+                                    pending.Enqueue((value, item.Members.Next));
+                                }
+                            }
+                            break;
+                        case BehaviorValueKind.NewArray:
+                        case BehaviorValueKind.Local:
+                        case BehaviorValueKind.Constant:
+                            break;
+                        default:
+                            yield return WriteSubjectKind.Unknown;
+                            break;
                     }
                 }
             }
-            if (!complete && !publishedSubject)
-            {
-                yield return new WriteSubject(reference, pathProof.ExecutionFailure ?? "尚有未覆盖的执行路径，不能排除其中的旧对象写入", witness);
-            }
         }
 
-        private readonly record struct WriteSubject(BehaviorValueReference? Reference, string? Failure = null,
-            (BehaviorValueReference Receiver, BehaviorFlowPoint Point, BehaviorWrite Write)? Witness = null, bool ExecutionProven = false);
+        // 值副本内只有沿引用成员继续写入才会影响副本外的数据。
+        private static bool? HasReferenceMember(MemberAccess? access)
+        {
+            bool? result = false;
+            for (; access != null; access = access.Next)
+            {
+                if (access.Member.IsReferenceStorage == true)
+                {
+                    return true;
+                }
+                if (access.Member.IsReferenceStorage == null)
+                {
+                    result = null;
+                }
+            }
+            return result;
+        }
+
+        // 递归成员关系不能无限增长；发现循环时保留明确的待分析项。
+        private static bool ContainsMember(MemberAccess? access, BehaviorValueReference reference)
+        {
+            for (; access != null; access = access.Next)
+            {
+                if (access.Reference == reference)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private enum WriteSubjectKind { Receiver, Parameter, Static, Unknown }
+        private sealed record MemberAccess(BehaviorMemberReference Member, BehaviorValueReference Reference, MemberAccess? Next);
+        private sealed record ModificationEvidence(string? Callee, int Position, string Detail);
     }
 
-    /// <summary>函数自身的真实行为，与日志豁免无关。</summary>
+    /// <summary>函数修改能力，不是日志标签决定。</summary>
     public enum MethodEffectKind
     {
-        /// <summary>全部必要实现均无外部修改。</summary>
+        /// <summary>没有外部修改，必要调用均已确定。</summary>
         Getter,
-        /// <summary>存在已经证明的外部修改或业务对象传出。</summary>
+        /// <summary>具有修改外部对象或传出业务对象的能力。</summary>
         Setter,
     }
 
-    /// <summary>保存已经证明、可以复核的调用过程和写入位置。</summary>
+    /// <summary>交付时生成的一条修改证据及位置。</summary>
     public sealed record EffectEvidence(IReadOnlyList<string> MethodPath, int Position, string Detail);
 
-    /// <summary>保存一个根函数的真实判断及 Setter 证据。</summary>
+    /// <summary>函数的真实判断及证据。</summary>
     public sealed record MethodEffect(string MethodId, MethodEffectKind Kind, EffectEvidence? Evidence);
 
-    /// <summary>保存行为结论和本模块耗时。</summary>
+    /// <summary>真实行为和标签生效后行为使用各自的说明。</summary>
     public sealed record EffectAnalysisResult(IReadOnlyList<MethodEffect> Methods, TimeSpan Elapsed)
     {
-        /// <summary>尚未证明的根函数及其原始失败过程。</summary>
+        /// <summary>真实行为尚未确定的函数。</summary>
         public IReadOnlyDictionary<string, EffectEvidence> Failures { get; init; } = new Dictionary<string, EffectEvidence>();
+        /// <summary>本轮实际新增的函数修改说明数量。</summary>
+        public int SummaryUpdates { get; init; }
     }
 }

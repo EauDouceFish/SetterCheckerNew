@@ -16,18 +16,18 @@ namespace SetterChecker.Core
         /// </summary>
         public async Task<AnalysisRun> AnalyzeAsync(
             MaterialRequest request,
-            CancellationToken cancellationToken = default, Action<string>? progress = null, Action<AnalysisRun>? reportProgress = null)
+            CancellationToken cancellationToken = default, Action<string>? progress = null)
         {
             request = request with { SourceTexts = request.SourceTexts.ToDictionary(pair => Path.GetFullPath(pair.Key), pair => pair.Value, StringComparer.OrdinalIgnoreCase) };
             await this.m_analysisRequests.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                // 依次读取当前材料、建立目录、展开调用、判断行为和处理标签。
+                // 依次读取源码、建立固定调用关系、传递修改说明和处理标签。
                 progress?.Invoke("正在读取当前游戏源码及编译参数。");
                 MaterialSet material = await this.m_materialLoader.LoadAsync(
                     request,
                     cancellationToken).ConfigureAwait(false);
-                progress?.Invoke($"材料读取完成：{material.SourceAssemblies.Count} 个源码程序集，包含编译耗时 {material.Elapsed.TotalSeconds:F1} 秒。");
+                progress?.Invoke($"材料读取完成：{material.SourceAssemblies.Count} 个源码上下文，耗时 {material.Elapsed.TotalSeconds:F1} 秒；没有生成源码程序集。");
                 MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(
                     material,
                     request.Jobs,
@@ -38,61 +38,68 @@ namespace SetterChecker.Core
                     || method.SourceSymbol is { IsImplicitlyDeclared: false, IsAbstract: false, IsExtern: false } symbol
                         && reportPaths.Contains(method.SourcePath!)
                         && AnnotationEvaluator.FindAttribute(symbol.ContainingType, "KH.NoLogTrackAttribute") != null).ToArray();
+                // 类级豁免只改变该函数自己的日志决定，真实写入仍必须向调用者传播。
+                MethodEntry[] analysisRoots = roots;
                 CallTargetResolutionResult? calls = null;
                 EffectAnalysisResult effects = new(Array.Empty<MethodEffect>(), TimeSpan.Zero);
                 string? failure = null;
-                int reportedProofs = -1;
                 System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
 
-                // 同一轮补齐调用后只重查未定行为，已有真实修改证据不用于标签追踪判断。
-                EffectAnalysisResult ReadEffects()
+                // 完成分析后生成标签与报告数据，未证明项目始终保留失败。
+                AnalysisRun ReadRun()
                 {
-                    Dictionary<int, EffectEvidence> proven = effects.Methods.Where(method => method.Kind == MethodEffectKind.Setter)
-                        .ToDictionary(method => calls!.ValueSources.RootInstances[method.MethodId].Id, method => method.Evidence!);
-
-                    return new EffectAnalyzer().AnalyzeAvailable(catalog, roots, calls!, false, cancellationToken, frozenSetters: proven);
-                }
-
-                // 进度和最终交付共用标签处理与报告数据，未证明项目始终保留失败。
-                AnalysisRun ReadRun(bool isInProgress = false)
-                {
-                    AnnotationResult annotations = new AnnotationEvaluator().Evaluate(catalog, roots, effects, calls, cancellationToken, deferTracking: isInProgress);
-                    return new AnalysisRun(material, catalog, calls, annotations, failure, new Dictionary<string, double>
+                    AnnotationResult annotations = new AnnotationEvaluator().Evaluate(catalog, roots, effects, calls, cancellationToken);
+                    if (request.ManualBaselinePath != null)
                     {
-                        ["材料（包含编译）"] = material.Elapsed.TotalSeconds,
-                        ["其中材料阶段编译准备"] = material.CompilationElapsed.TotalSeconds,
-                        ["其中生成或复用完整程序集（累计工作秒，含按需部分）"] = material.SourceAssemblies.Where(source => source.Output.IsValueCreated).Sum(source => source.Output.Value.Elapsed.TotalSeconds),
+                        annotations = ManualBaseline.Apply(annotations, material, request.ManualBaselinePath);
+                    }
+                    if (request.UseReflectionBaseline)
+                    {
+                        annotations = ManualBaseline.ApplyReflection(annotations);
+                    }
+                    annotations = ManualBaseline.ApplyNative(annotations, calls);
+                    Dictionary<string, double> timings = new()
+                    {
+                        ["材料及源码上下文"] = material.Elapsed.TotalSeconds,
+                        ["其中源码上下文准备"] = material.CompilationElapsed.TotalSeconds,
                         ["函数总表"] = catalog.Elapsed.TotalSeconds,
                         ["读取行为、调用、效果与进度记录"] = watch.Elapsed.TotalSeconds - annotations.Elapsed.TotalSeconds,
                         ["其中读取行为"] = calls?.Behaviors.Elapsed.TotalSeconds ?? 0,
                         ["标签检查"] = annotations.Elapsed.TotalSeconds,
-                    })
-                    { IsInProgress = isInProgress };
+                    };
+                    if (calls != null)
+                    {
+                        foreach (var timing in calls.ValueSources.Timing.ReadSeconds())
+                        {
+                            timings.Add("分析分项/" + timing.Key, timing.Value);
+                        }
+                    }
+                    foreach (var timing in material.Timings)
+                    {
+                        timings.Add("材料分项/" + timing.Key, timing.Value);
+                    }
+                    return new AnalysisRun(material, catalog, calls, annotations, failure, timings)
+                    { SummaryUpdates = effects.SummaryUpdates };
                 }
                 try
                 {
-                    calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, request.Jobs,
-                        cancellationToken, requireCompleteCalls: false, progress: progress, reportProgress: (current, proofs) =>
-                        {
-                            calls = current;
-                            effects = proofs;
-                            if (proofs.Methods.Count != reportedProofs)
-                            {
-                                reportProgress?.Invoke(ReadRun(isInProgress: true));
-                                reportedProofs = proofs.Methods.Count;
-                            }
-                        }).ConfigureAwait(false);
-                    effects = ReadEffects();
-                    if (calls.PendingCalls.Count != 0)
-                    {
-                        calls = await new CallTargetResolver().ResolveAsync(material, catalog, roots, request.Jobs,
-                            cancellationToken, requireCompleteCalls: false, previous: calls, progress: progress).ConfigureAwait(false);
-                        effects = ReadEffects();
-                    }
+                    calls = await new CallTargetResolver().ResolveAsync(material, catalog, analysisRoots, request.Jobs,
+                        cancellationToken, requireCompleteCalls: false, progress: progress,
+                        useReflectionBaseline: request.UseReflectionBaseline).ConfigureAwait(false);
+                    failure = calls.Failure;
+                    effects = new EffectAnalyzer().Analyze(catalog, analysisRoots, calls, cancellationToken);
                 }
                 catch (AnalysisException exception)
                 {
                     failure = exception.Message;
+                }
+                calls?.ValueSources.Timing.Stop();
+                if (calls != null)
+                {
+                    foreach (var timing in calls.ValueSources.Timing.ReadSeconds())
+                    {
+                        progress?.Invoke($"分析分项：{timing.Key} {timing.Value:F3} 秒。");
+                    }
                 }
                 return ReadRun();
             }
@@ -103,15 +110,126 @@ namespace SetterChecker.Core
         }
     }
 
+    /// <summary>协调线程的互斥计时；嵌套工作暂停上层类别，函数体并行读取按等待的实际时间计入。</summary>
+    internal sealed class AnalysisTiming
+    {
+        internal enum Part { Scheduling, Bodies, Targets, Origins, Effects, Declarations, Dispatch, Reflection, Bindings, Registrations, HierarchyIndex, ImplementationMatch, RegistrationSyntax, ImplementationHierarchy, ImplementationMembers }
+        private readonly long[] m_ticks = new long[Enum.GetValues<Part>().Length];
+        private readonly long[] m_entries = new long[Enum.GetValues<Part>().Length];
+        private readonly long[] m_allocations = new long[Enum.GetValues<Part>().Length];
+        internal Dictionary<string, long> Counts { get; } = new(StringComparer.Ordinal);
+        private long m_last = System.Diagnostics.Stopwatch.GetTimestamp();
+        private long m_lastAllocation = GC.GetTotalAllocatedBytes(false);
+        private Part m_current;
+        private bool m_stopped;
+        private readonly TimeSpan m_initialGcPause = GC.GetTotalPauseDuration();
+        private readonly long m_initialAllocatedBytes = GC.GetTotalAllocatedBytes(true);
+
+        // 切换类别前结清上一段时间，同类递归不重复采样。
+        internal Scope Measure(Part part)
+        {
+            if (this.m_stopped)
+            {
+                return new Scope(this, this.m_current, false);
+            }
+            Part previous = this.m_current;
+            this.m_entries[(int)part]++;
+            if (previous != part)
+            {
+                Switch(part);
+            }
+            return new Scope(this, previous, previous != part);
+        }
+
+        // 将这段墙钟时间只记入当前工作类别。
+        private void Switch(Part part)
+        {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            long allocated = GC.GetTotalAllocatedBytes(false);
+            this.m_ticks[(int)this.m_current] += now - this.m_last;
+            this.m_allocations[(int)this.m_current] += allocated - this.m_lastAllocation;
+            this.m_last = now;
+            this.m_lastAllocation = allocated;
+            this.m_current = part;
+        }
+
+        // 分析结束后停止计时，报告生成不混入分析耗时。
+        internal void Stop()
+        {
+            if (!this.m_stopped)
+            {
+                Switch(this.m_current);
+                this.m_stopped = true;
+                this.Counts["分析期间GC暂停毫秒"] = (long)(GC.GetTotalPauseDuration() - this.m_initialGcPause).TotalMilliseconds;
+                this.Counts["分析期间分配字节"] = GC.GetTotalAllocatedBytes(true) - this.m_initialAllocatedBytes;
+                foreach (Part part in Enum.GetValues<Part>())
+                {
+                    this.Counts["阶段分配估计字节/" + part] = this.m_allocations[(int)part];
+                }
+            }
+        }
+
+        // 以固定顺序输出互不重叠的时间。
+        internal Dictionary<string, double> ReadSeconds()
+        {
+            string[] names = { "调度及其他", "函数体读取", "调用目标查找", "对象来源查询", "Setter判断与传播",
+                "函数声明定位", "接口候选遍历", "反射操作处理", "固定参数绑定", "外围注册绑定",
+                "继承索引准备", "具体实现匹配", "注册语法扫描", "实现继承对应", "实现函数匹配" };
+            return Enumerable.Range(0, names.Length).ToDictionary(index => names[index],
+                index => (double)this.m_ticks[index] / System.Diagnostics.Stopwatch.Frequency);
+        }
+
+        // 次数与秒数分开保存，避免报告把计数当时间相加。
+        internal Dictionary<string, long> ReadEntries() => Enum.GetValues<Part>().ToDictionary(part => part.ToString(), part => this.m_entries[(int)part]);
+
+        // 记录实际重复操作数量，与耗时分开比较以排除机器波动。
+        internal void Count(string name, long amount = 1) => this.Counts[name] = this.Counts.GetValueOrDefault(name) + amount;
+
+        // 只在枚举实际推进时计时，暂停枚举不会占用上层执行时间。
+        internal IEnumerable<T> MeasureEnumeration<T>(IEnumerable<T> values, Part part)
+        {
+            using IEnumerator<T> iterator = values.GetEnumerator();
+            while (true)
+            {
+                bool moved;
+                using (Measure(part))
+                {
+                    moved = iterator.MoveNext();
+                }
+                if (!moved)
+                {
+                    yield break;
+                }
+                yield return iterator.Current;
+            }
+        }
+
+        internal readonly struct Scope(AnalysisTiming timing, Part previous, bool changed) : IDisposable
+        {
+            // 离开嵌套工作后恢复调用者类别。
+            public void Dispose()
+            {
+                if (changed)
+                {
+                    timing.Switch(previous);
+                }
+            }
+        }
+    }
+
     /// <summary>保存本轮材料、已证结论与失败，不把诊断冒充完整结果。</summary>
     public sealed record AnalysisRun(MaterialSet Material, MethodCatalogResult Catalog,
         CallTargetResolutionResult? Calls, AnnotationResult Annotations, string? Failure, Dictionary<string, double> Timings)
     {
-        /// <summary>本次结果是同步发布的进度快照，不能视作最终验收。</summary>
-        public bool IsInProgress { get; init; }
+        /// <summary>真实分析与日志分析累计加入的不同修改说明数。</summary>
+        public int SummaryUpdates { get; init; }
 
         /// <summary>所有根函数及其标签审计均已完成。</summary>
-        public bool Complete => !this.IsInProgress && this.Failure == null && this.Annotations.Complete && this.Calls?.Behaviors.Methods.All(body => body.Failure == null) == true;
+        public bool Complete => this.Failure == null && this.Annotations.Complete && this.Calls?.Behaviors.Methods.All(body => body.Failure == null) == true;
+
+        /// <summary>日志决定可交付不等于真实行为已证明，人工基线单独计数。</summary>
+        public bool LogDecisionsComplete => this.Failure == null && this.Annotations.Methods.Where(method => method.IsReportable)
+            .All(method => method.Failure == null || method.InformationalOnly || method.UsesManualBaseline);
     }
 
     /// <summary>
@@ -137,12 +255,19 @@ namespace SetterChecker.Core
         /// <summary>编辑器当前文本覆盖；路径必须属于本轮真实编译输入，不写回游戏。</summary>
         public IReadOnlyDictionary<string, string> SourceTexts { get; init; } = new Dictionary<string, string>();
 
-        /// <summary>编译产物缓存目录；不指定时仅保留当前会话上下文，不写磁盘缓存。</summary>
-        public string? CacheDirectory { get; init; }
+        /// <summary>显式采用已确认的人工标签基线；不改写真实行为。</summary>
+        public string? ManualBaselinePath { get; init; }
+
+        /// <summary>为显式保存基线准备当前材料校验值。</summary>
+        public bool CaptureManualBaseline { get; init; }
+
+        /// <summary>在查询反射目标之前停止展开，受影响的未证明函数按当前人工标签决定日志。</summary>
+        public bool UseReflectionBaseline { get; init; }
+
     }
 
     /// <summary>
-    /// 表示本轮源码及延迟编译内容；本轮取消后不可再使用，应重新 LoadAsync 请求快照。
+    /// 保存本轮源码编译上下文；分析直接读取源码，不生成程序集。
     /// </summary>
     public sealed record SourceAssemblyMaterial(
         string Name,
@@ -151,29 +276,19 @@ namespace SetterChecker.Core
         IReadOnlyList<string> SourcePaths,
         IReadOnlyList<string> ReportSourcePaths,
         string AssemblyPath,
-        Lazy<CompiledAssembly> Output)
+        CompilationOrigin CompilationOrigin)
     {
-        /// <summary>首次需要真实成员或指令时取得完整产物，之后共用同一份内容。</summary>
-        public byte[] AssemblyImage => this.Output.Value.Image;
-
-        /// <summary>查询状态不会触发未使用的外部程序集编译。</summary>
-        public CompilationOrigin CompilationOrigin => this.Output.IsValueCreated ? this.Output.Value.Origin : CompilationOrigin.Deferred;
+        /// <summary>是否作为运行时实现、重写和注册候选来源。</summary>
+        public bool IsCandidateSource { get; init; } = true;
     }
 
-    /// <summary>保存一次完整编译或有效复用所得的映像及耗时。</summary>
-    public sealed record CompiledAssembly(byte[] Image, CompilationOrigin Origin, TimeSpan Elapsed);
-
-    /// <summary>区分真实编译工作和两种产物复用。</summary>
+    /// <summary>区分本轮建立源码上下文和会话内复用。</summary>
     public enum CompilationOrigin
     {
-        /// <summary>只建立编译上下文，尚未需要完整产物。</summary>
-        Deferred,
-        /// <summary>本轮实际编译生成。</summary>
+        /// <summary>本轮建立源码编译上下文。</summary>
         Built,
         /// <summary>核验后保留同会话上下文。</summary>
         Session,
-        /// <summary>核验后读取磁盘产物。</summary>
-        DiskCache,
     }
 
     /// <summary>
@@ -194,8 +309,14 @@ namespace SetterChecker.Core
         IReadOnlyList<string> AnalyzerPaths,
         TimeSpan Elapsed)
     {
-        /// <summary>材料耗时中用于把当前源码编译到内存的部分，不重复计入总耗时。</summary>
+        /// <summary>材料耗时中建立源码编译上下文的部分，不生成程序集，不重复计入总耗时。</summary>
         public TimeSpan CompilationElapsed { get; init; }
+
+        /// <summary>仅在保存或采用基线时核验全部输入内容，不凭文件日期复用。</summary>
+        public string? BaselineInputKey { get; init; }
+
+        /// <summary>材料读取各步骤的独立耗时，包含在材料总耗时中。</summary>
+        public IReadOnlyDictionary<string, double> Timings { get; init; } = new Dictionary<string, double>();
 
         /// <summary>当前 Unity 宿主已证明使用按简单程序集名装载的规则。</summary>
         public bool UsesUnityLegacyBinding { get; init; }
@@ -206,5 +327,8 @@ namespace SetterChecker.Core
         /// <summary>参考完整身份到材料模块已唯一选定的真实文件。</summary>
         public IReadOnlyDictionary<string, string> AssemblyRedirects { get; init; } =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>按 R4 排除的编辑器或测试程序集名称。</summary>
+        public IReadOnlyList<string> ExcludedEditorAssemblies { get; init; } = Array.Empty<string>();
     }
 }

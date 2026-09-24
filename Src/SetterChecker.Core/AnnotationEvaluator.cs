@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
 using Microsoft.CodeAnalysis;
 
 namespace SetterChecker.Core
@@ -9,33 +11,10 @@ namespace SetterChecker.Core
         // 从真实源码标签和已证明行为生成逐函数决定及最短告警调用过程。
         /// <summary>未知行为和冲突保留失败，依赖函数不进入修改清单。</summary>
         public AnnotationResult Evaluate(MethodCatalogResult catalog, IReadOnlyList<MethodEntry> roots, EffectAnalysisResult effects,
-            CallTargetResolutionResult? calls, CancellationToken cancellationToken = default, bool deferTracking = false)
+            CallTargetResolutionResult? calls, CancellationToken cancellationToken = default)
         {
             Stopwatch watch = Stopwatch.StartNew();
             Dictionary<string, MethodEffect> facts = effects.Methods.ToDictionary(method => method.MethodId);
-            Dictionary<string, MethodEffect> tracking = new(facts);
-            IReadOnlyDictionary<string, EffectEvidence> trackingFailures = effects.Failures;
-            HashSet<string> exempt = (calls?.Methods ?? roots).Where(method => method.HasNoLogTrackExemption).Select(method => method.Id).ToHashSet();
-            if (calls != null && exempt.Count != 0)
-            {
-                HashSet<int> affectedRoots = calls.ValueSources.Instances.Where(instance => exempt.Contains(instance.MethodId)).Select(instance => instance.RootId).ToHashSet();
-                MethodEntry[] trackedRoots = roots.Where(method => facts.GetValueOrDefault(method.Id)?.Kind == MethodEffectKind.Setter && !exempt.Contains(method.Id)
-                    && affectedRoots.Contains(calls.ValueSources.RootInstances[method.Id].Id)).ToArray();
-                EffectAnalysisResult remaining = deferTracking
-                    ? new EffectAnalysisResult(Array.Empty<MethodEffect>(), TimeSpan.Zero)
-                    { Failures = trackedRoots.ToDictionary(method => method.Id, method => new EffectEvidence(new[] { method.Id }, -1, "等待完成标签影响检查")) }
-                    : new EffectAnalyzer().AnalyzeAvailable(catalog, trackedRoots, calls, false, cancellationToken, exemptMethods: exempt,
-                        businessAssemblies: roots.Select(method => method.AssemblyPath).ToHashSet(StringComparer.OrdinalIgnoreCase));
-                foreach (MethodEntry method in trackedRoots)
-                {
-                    tracking.Remove(method.Id);
-                }
-                foreach (MethodEffect method in remaining.Methods)
-                {
-                    tracking.Add(method.MethodId, method);
-                }
-                trackingFailures = remaining.Failures;
-            }
             List<AnnotationMethod> methods = new();
             foreach (MethodEntry method in roots.OrderBy(method => method.Id, StringComparer.Ordinal))
             {
@@ -47,58 +26,83 @@ namespace SetterChecker.Core
                     || FindAttribute(symbol.ContainingType, "KH.LogTrackAttribute") != null;
                 bool reason = nlt?.ConstructorArguments.Any(argument => argument.Type?.SpecialType == SpecialType.System_String
                     && argument.Value is string text && !string.IsNullOrWhiteSpace(text)) == true;
-                MethodEffectKind? actual = facts.GetValueOrDefault(method.Id)?.Kind;
+                bool trustedClass = nltClass && !log;
+                MethodEffectKind? actual = trustedClass ? MethodEffectKind.Getter : facts.GetValueOrDefault(method.Id)?.Kind;
                 string? failure = log && sourceNlt ? "NoLogTrack 与 LogTrack 冲突"
+                    : trustedClass ? null
                     : actual == null ? effects.Failures.GetValueOrDefault(method.Id)?.Detail ?? "尚未取得真实行为证明"
-                    : !sourceNlt && !log ? trackingFailures.GetValueOrDefault(method.Id)?.Detail : null;
-                string? decision = failure != null ? null : nltClass ? "NLTClass" : sourceNlt ? "NoLogTrack"
-                    : log || tracking.GetValueOrDefault(method.Id)?.Kind == MethodEffectKind.Setter ? "ShouldTrack" : "NoLogTrack";
+                    : null;
+                string? decision = log && sourceNlt ? null : nltClass ? "NLTClass" : sourceNlt ? "NoLogTrack"
+                    : log ? "ShouldTrack" : failure != null ? null
+                    : actual == MethodEffectKind.Setter ? "ShouldTrack" : "NoLogTrack";
+                bool informational = sourceNlt && !log && actual == null
+                    || failure?.StartsWith("接口或重写没有合法实现：", StringComparison.Ordinal) == true
+                    && FindAttribute(symbol.ContainingType, "System.ObsoleteAttribute") != null
+                    && calls != null && calls.Behaviors.MethodsById.TryGetValue(method.Id, out MethodBehavior? body)
+                    && body.Failure == null && body.Writes.Count == 0 && body.Calls.Count == 1
+                    && body.Calls[0].Target.SourceSymbol?.ContainingType.TypeKind == TypeKind.Interface;
                 methods.Add(new AnnotationMethod(method.Id, method.TypeName, method.Name, method.SourcePath!, method.Line,
                     sourceNlt, actual, decision, failure,
                     failure == null && actual == MethodEffectKind.Setter && nlt != null && !reason && !nltClass,
                     failure == null && actual == MethodEffectKind.Setter && (reason || nltClass),
-                    method.IsReportable && failure == null && !sourceNlt && !log && decision == "NoLogTrack",
+                    method.IsReportable && failure == null && actual == MethodEffectKind.Getter
+                        && !sourceNlt && !log && decision == "NoLogTrack",
                     facts.GetValueOrDefault(method.Id)?.Evidence ?? effects.Failures.GetValueOrDefault(method.Id))
                 {
                     SourceMethod = method,
-                    TrackingEvidence = sourceNlt ? null : tracking.GetValueOrDefault(method.Id)?.Evidence ?? trackingFailures.GetValueOrDefault(method.Id),
+                    InformationalOnly = informational,
                 });
             }
 
-            Dictionary<string, (AnnotationMethod Warning, string[] Path)> shortest = methods.Where(method => method.MissingReason)
-                .ToDictionary(method => method.Id, method => (method, new[] { method.Id }));
-            Queue<(int InstanceId, AnnotationMethod Warning, string[] Path)> pending = new((calls?.ValueSources.Instances ?? Array.Empty<MethodCallInstance>())
-                .Where(instance => shortest.ContainsKey(instance.MethodId)).OrderBy(instance => instance.MethodId, StringComparer.Ordinal).ThenBy(instance => instance.Id)
-                .Select(instance => (instance.Id, shortest[instance.MethodId].Warning, new[] { instance.MethodId })));
-            HashSet<int> visited = new();
-            // 图中递归只返回祖先；最短上游过程沿父调用即可，所有告警共用一次遍历。
-            while (pending.TryDequeue(out var item))
+            Dictionary<string, (AnnotationMethod Warning, string? Next)> shortest = methods.Where(method => method.MissingReason)
+                .ToDictionary(method => method.Id, method => (method, (string?)null), StringComparer.Ordinal);
+            ILookup<string, string> callers = (calls?.Calls ?? Array.Empty<ResolvedCall>())
+                .SelectMany(call => call.Targets.Select(target => (Target: target.MethodId, Caller: call.CallerMethodId)))
+                .Concat(shortest.Count == 0 || calls == null ? Enumerable.Empty<(string Target, string Caller)>()
+                    : calls.Behaviors.Methods.SelectMany(body => body.Calls
+                        .Where(call => call.Kind is BehaviorCallKind.Direct or BehaviorCallKind.ObjectCreation
+                            && call.Target.SourceSymbol?.DeclaringSyntaxReferences.Length > 0)
+                        .Select(call => (Target: catalog.ResolveMethodDefinition(call.Target, false).Method.Id, Caller: body.MethodId))))
+                .Distinct().ToLookup(pair => pair.Target, pair => pair.Caller, StringComparer.Ordinal);
+            Queue<string> pending = new(shortest.Keys.Order(StringComparer.Ordinal));
+            // 每个上游函数只保存一步关联，输出时再还原最短告警过程。
+            while (pending.TryDequeue(out string? current))
             {
-                if (!visited.Add(item.InstanceId))
+                cancellationToken.ThrowIfCancellationRequested();
+                foreach (string caller in callers[current].Order(StringComparer.Ordinal))
                 {
-                    continue;
-                }
-                MethodCallInstance instance = calls!.ValueSources.GetInstance(item.InstanceId);
-                if (instance.ParentId == 0 && (!shortest.TryGetValue(instance.MethodId, out var known) || item.Path.Length < known.Path.Length))
-                {
-                    shortest[instance.MethodId] = (item.Warning, item.Path);
-                }
-                if (instance.ParentId != 0)
-                {
-                    pending.Enqueue((instance.ParentId, item.Warning, item.Path.Prepend(calls.ValueSources.GetInstance(instance.ParentId).MethodId).ToArray()));
+                    if (shortest.TryAdd(caller, (shortest[current].Warning, current)))
+                    {
+                        pending.Enqueue(caller);
+                    }
                 }
             }
-            foreach (var path in shortest.OrderBy(item => item.Key, StringComparer.Ordinal).Select(item => item.Value))
+            foreach (AnnotationMethod method in methods.Where(method => method.IsReportable && shortest.ContainsKey(method.Id)))
             {
-                path.Warning.WarningPaths.Add(path.Path);
+                List<string> path = new();
+                for (string? current = method.Id; current != null; current = shortest[current].Next)
+                {
+                    path.Add(current);
+                }
+                shortest[method.Id].Warning.WarningPaths.Add(path.ToArray());
             }
-            return new AnnotationResult(methods, calls?.PendingCalls.Count ?? 0, watch.Elapsed);
+            HashSet<string> informationalMethods = methods.Where(method => method.InformationalOnly).Select(method => method.Id).ToHashSet(StringComparer.Ordinal);
+            return new AnnotationResult(methods, calls?.PendingCalls.Count(call => !informationalMethods.Contains(call.CallerMethodId)) ?? 0, watch.Elapsed);
         }
 
         // 按完整特性类型名读取当前声明，不把同名业务类型当作日志规则。
         internal static AttributeData? FindAttribute(ISymbol symbol, string name)
         {
             return symbol.GetAttributes().SingleOrDefault(attribute => attribute.AttributeClass?.ToDisplayString() == name);
+        }
+
+        // 类级可信豁免在行为分析前直接闭合；标签冲突仍需进入分析。
+        internal static bool IsTrustedClassNoLogTrack(MethodEntry method)
+        {
+            IMethodSymbol symbol = method.SourceSymbol!;
+            return FindAttribute(symbol.ContainingType, "KH.NoLogTrackAttribute") != null
+                && FindAttribute(symbol, "KH.LogTrackAttribute") == null
+                && FindAttribute(symbol.ContainingType, "KH.LogTrackAttribute") == null;
         }
     }
 
@@ -109,20 +113,138 @@ namespace SetterChecker.Core
     {
         internal MethodEntry SourceMethod { get; init; } = null!;
 
+        /// <summary>可信豁免的行为审计未知或废弃接口无实现，仅提示，不阻塞日志决定。</summary>
+        public bool InformationalOnly { get; init; }
+
+        /// <summary>最终日志决定来自人工基线，Actual 与失败证据仍保留。</summary>
+        public bool UsesManualBaseline { get; init; }
+
         /// <summary>类级豁免独立复查不扩大标签统计范围。</summary>
         public bool IsReportable => this.SourceMethod.IsReportable;
 
         /// <summary>每个上层可报告函数到该告警的最短调用过程。</summary>
         public List<string[]> WarningPaths { get; } = new();
 
-        /// <summary>可信标签生效后仍需追踪或尚未证明的独立依据。</summary>
-        public EffectEvidence? TrackingEvidence { get; init; }
     }
 
     /// <summary>保存统一报告输入和标签阶段耗时。</summary>
     public sealed record AnnotationResult(IReadOnlyList<AnnotationMethod> Methods, int PendingCalls, TimeSpan Elapsed)
     {
+        /// <summary>说明本轮基线是否有效，不把失效配置静默当作已采用。</summary>
+        public string? ManualBaselineStatus { get; init; }
+
         /// <summary>行为、冲突与告警调用关系均已检查完毕。</summary>
-        public bool Complete => this.PendingCalls == 0 && this.Methods.All(method => method.Failure == null);
+        public bool Complete => this.PendingCalls == 0 && this.Methods.All(method => method.Failure == null
+            || method.InformationalOnly && !method.SourceNoLogTrack);
     }
+
+    /// <summary>保存已确认的当前标签，不缓存函数行为或调用分析状态。</summary>
+    public sealed record ManualBaseline(int Version, string InputKey, IReadOnlyList<ManualBaselineEntry> Methods)
+    {
+        // 原生实现无法读取时采用当前人工标签，依据函数体类别而不是错误文本猜测。
+        internal static AnnotationResult ApplyNative(AnnotationResult result, CallTargetResolutionResult? calls)
+        {
+            if (calls == null)
+            {
+                return result;
+            }
+            AnnotationMethod[] methods = result.Methods.Select(method =>
+            {
+                EffectEvidence? evidence = method.Evidence;
+                if (!method.IsReportable || method.Failure == null || evidence?.Detail != method.Failure
+                    || evidence.MethodPath.Count == 0
+                    || !calls.Behaviors.MethodsById.TryGetValue(evidence.MethodPath[^1], out MethodBehavior? body)
+                    || body.Failure != null
+                    || body.BodyKind is not (MethodBodyKind.PlatformInvocation or MethodBodyKind.RuntimeImplementation))
+                {
+                    return method;
+                }
+                string reason = body.NativeBoundary is { } boundary ? boundary.LibraryName + " native in cpp"
+                    : "runtime native implementation";
+                return method with { Decision = ReadSourceDecision(method), UsesManualBaseline = true, Failure = reason };
+            }).ToArray();
+            return result with
+            {
+                Methods = methods,
+                ManualBaselineStatus = (result.ManualBaselineStatus == null ? string.Empty : result.ManualBaselineStatus + " ")
+                    + "原生实现不可读取时采用当前人工标签，不代表真实行为已证明。",
+            };
+        }
+
+        // 只替代明确因反射短路而未证明的日志决定，保留真实未知与其他错误。
+        internal static AnnotationResult ApplyReflection(AnnotationResult result)
+        {
+            return result with
+            {
+                Methods = result.Methods.Select(method => method.IsReportable && method.Failure == ValueSourceIndex.ReflectionBaselineFailure
+                    ? method with { Decision = ReadSourceDecision(method), UsesManualBaseline = true } : method).ToArray(),
+                ManualBaselineStatus = "已启用反射人工基线：本轮按当前源码标签决定日志，不代表反射行为已证明。",
+            };
+        }
+
+        // 只收录当前无法证明的可报告函数，冲突标签不得进入基线。
+        /// <summary>显式将当前未知函数的源码标签保存为人工基线，不将其标为已证明。</summary>
+        public static void Save(AnalysisRun run, string path)
+        {
+            string key = run.Material.BaselineInputKey ?? throw new AnalysisException("保存人工基线前必须核验本轮材料。");
+            if (run.Failure != null)
+            {
+                throw new AnalysisException("分析流程失败，不能据此保存人工基线：" + run.Failure);
+            }
+            ManualBaselineEntry[] entries = run.Annotations.Methods
+                .Where(method => method.IsReportable && method.Failure != null && method.Failure != "NoLogTrack 与 LogTrack 冲突")
+                .OrderBy(method => method.Id, StringComparer.Ordinal)
+                .Select(method => new ManualBaselineEntry(method.Id, ReadSourceDecision(method),
+                    Path.GetRelativePath(run.Material.ProjectRoot, method.File).Replace('\\', '/'), method.Line, method.Failure)).ToArray();
+            File.WriteAllText(path, JsonSerializer.Serialize(new ManualBaseline(1, key, entries),
+                new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
+        }
+
+        // 整份材料一致才采用基线；失效时继续输出本轮真实分析，不猜测依赖范围。
+        internal static AnnotationResult Apply(AnnotationResult result, MaterialSet material, string path)
+        {
+            ManualBaseline baseline;
+            try
+            {
+                baseline = JsonSerializer.Deserialize<ManualBaseline>(File.ReadAllText(path))
+                    ?? throw new AnalysisException("人工基线内容为空：" + path);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+            {
+                throw new AnalysisException("无法读取人工基线：" + exception.Message);
+            }
+            if (baseline.Version != 1 || baseline.Methods == null || string.IsNullOrWhiteSpace(baseline.InputKey))
+            {
+                throw new AnalysisException("人工基线格式或版本不支持：" + path);
+            }
+            if (material.BaselineInputKey == null || baseline.InputKey != material.BaselineInputKey)
+            {
+                return result with { ManualBaselineStatus = "人工基线已失效：源码、引用或工具版本发生变化，本轮未采用；需重新确认。" };
+            }
+            Dictionary<string, ManualBaselineEntry> entries = new(StringComparer.Ordinal);
+            foreach (ManualBaselineEntry entry in baseline.Methods)
+            {
+                if (entry == null || string.IsNullOrWhiteSpace(entry.Id)
+                    || entry.Decision is not ("NoLogTrack" or "NLTClass" or "ShouldTrack") || !entries.TryAdd(entry.Id, entry))
+                {
+                    throw new AnalysisException("人工基线存在无效决定或重复函数：" + path);
+                }
+            }
+            AnnotationMethod[] methods = result.Methods.Select(method =>
+                method.IsReportable && method.Failure != null && method.Failure != "NoLogTrack 与 LogTrack 冲突"
+                    && entries.TryGetValue(method.Id, out ManualBaselineEntry? entry) && entry.Decision == ReadSourceDecision(method)
+                    ? method with { Decision = entry.Decision, UsesManualBaseline = true } : method).ToArray();
+            return result with { Methods = methods, ManualBaselineStatus = "已采用当前材料的人工基线；未证明项仍保留原始诊断。" };
+        }
+
+        // 类级标签优先；没有 NoLogTrack 按项目人工标注约定追踪。
+        private static string ReadSourceDecision(AnnotationMethod method)
+        {
+            return AnnotationEvaluator.FindAttribute(method.SourceMethod.SourceSymbol!.ContainingType, "KH.NoLogTrackAttribute") != null
+                ? "NLTClass" : method.SourceNoLogTrack ? "NoLogTrack" : "ShouldTrack";
+        }
+    }
+
+    /// <summary>一个已确认的人工标签及其来源位置，原失败原因保留供复查。</summary>
+    public sealed record ManualBaselineEntry(string Id, string Decision, string File, int Line, string? Reason);
 }

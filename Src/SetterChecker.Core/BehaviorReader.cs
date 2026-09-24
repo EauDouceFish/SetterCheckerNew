@@ -1,6 +1,10 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.FlowAnalysis;
+using Microsoft.CodeAnalysis.Operations;
+using System.Text.Json.Serialization;
 using Cecil = Mono.Cecil;
 using Cil = Mono.Cecil.Cil;
 using OpCode = Mono.Cecil.Cil.OpCode;
@@ -30,7 +34,7 @@ namespace SetterChecker.Core
         }
 
         // 逐方法保存读取失败，不丢弃同批成功事实；调用方必须继续保留失败状态。
-        internal async Task<BehaviorReadResult> ReadAvailableAsync(MaterialSet material, MethodCatalogResult catalog,
+        internal Task<BehaviorReadResult> ReadAvailableAsync(MaterialSet material, MethodCatalogResult catalog,
             IReadOnlyList<MethodEntry> methods, int jobs, CancellationToken cancellationToken)
         {
             if (jobs <= 0)
@@ -39,90 +43,39 @@ namespace SetterChecker.Core
             }
 
             Stopwatch stopwatch = Stopwatch.StartNew();
-            IReadOnlyDictionary<string, SourceAssemblyMaterial> sourceImages = material.SourceAssemblies.ToDictionary(
-                assembly => Path.GetFullPath(assembly.AssemblyPath),
-                assembly => assembly,
-                StringComparer.OrdinalIgnoreCase);
-            long partitionCount = (long)jobs * 4;
-            BehaviorWorkItem[] workItems = methods
-                .GroupBy(
-                    method => method.AssemblyPath
-                        ?? throw new AnalysisException($"函数缺少实际程序集：{method.Id}"),
-                    StringComparer.OrdinalIgnoreCase)
-                .SelectMany(group =>
+            MethodBehavior[] results = new MethodBehavior[methods.Count];
+            if (methods.Count == 1 || jobs == 1)
+            {
+                for (int index = 0; index < methods.Count; index++)
                 {
-                    MethodEntry[] assemblyMethods = group.ToArray();
-                    int batchSize = (int)Math.Max(
-                        1,
-                        (assemblyMethods.Length + partitionCount - 1) / partitionCount);
-
-                    return assemblyMethods.Chunk(batchSize).Select(batch => new BehaviorWorkItem(
-                        group.Key,
-                        batch));
-                })
-                .ToArray();
-            ConcurrentBag<IReadOnlyList<MethodBehavior>> parts = new();
-
-            await Parallel.ForEachAsync(
-                workItems,
-                new ParallelOptions
-                {
-                    CancellationToken = cancellationToken,
-                    MaxDegreeOfParallelism = jobs,
-                },
-                (workItem, token) =>
-                {
-                    token.ThrowIfCancellationRequested();
-                    parts.Add(ReadManagedBehaviors(
-                        workItem.AssemblyPath,
-                        sourceImages,
-                        catalog,
-                        workItem.Methods));
-
-                    return ValueTask.CompletedTask;
-                }).ConfigureAwait(false);
-
-            MethodBehavior[] ordered = parts
-                .SelectMany(part => part)
-                .OrderBy(behavior => behavior.MethodId, StringComparer.Ordinal)
-                .ToArray();
-
-            stopwatch.Stop();
-
-            return new BehaviorReadResult(ordered, stopwatch.Elapsed);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    results[index] = ReadAvailableBehavior(catalog, methods[index]);
+                }
+            }
+            else
+            {
+                Parallel.For(0, methods.Count,
+                    new ParallelOptions { CancellationToken = cancellationToken, MaxDegreeOfParallelism = jobs },
+                    index =>
+                    {
+                        results[index] = ReadAvailableBehavior(catalog, methods[index]);
+                    });
+            }
+            Array.Sort(results, (left, right) => StringComparer.Ordinal.Compare(left.MethodId, right.MethodId));
+            return Task.FromResult(new BehaviorReadResult(results, stopwatch.Elapsed));
         }
 
-        // 一次打开内存编译结果或真实托管文件并读取一批函数。
-        private static IReadOnlyList<MethodBehavior> ReadManagedBehaviors(
-            string assemblyPath,
-            IReadOnlyDictionary<string, SourceAssemblyMaterial> sourceImages,
-            MethodCatalogResult catalog,
-            IReadOnlyList<MethodEntry> methods)
+        // 读取单个函数时直接复用目录，不重建整个项目的程序集分组。
+        private static MethodBehavior ReadAvailableBehavior(MethodCatalogResult catalog, MethodEntry method)
         {
-            string fullPath = Path.GetFullPath(assemblyPath);
-            using Cecil.ModuleDefinition module = sourceImages.TryGetValue(fullPath, out SourceAssemblyMaterial? source)
-                ? MethodCatalog.OpenModule(source.AssemblyImage)
-                : MethodCatalog.OpenModule(fullPath);
-
-            if (methods.Any(method => !string.Equals(
-                    method.AssemblyName,
-                    module.Assembly.Name.Name,
-                    StringComparison.Ordinal)))
+            try
             {
-                throw new AnalysisException($"托管函数与真实程序集不一致：{assemblyPath}");
+                return catalog.ReadMethodBehavior(method);
             }
-
-            return methods.Select(method =>
+            catch (AnalysisException exception)
             {
-                try
-                {
-                    return ReadManagedBehavior(module, catalog, method);
-                }
-                catch (AnalysisException exception)
-                {
-                    return MethodBehavior.Empty(method.Id, MethodBodyKind.ReadFailure) with { Failure = exception.Message };
-                }
-            }).ToArray();
+                return MethodBehavior.Empty(method.Id, MethodBodyKind.ReadFailure) with { Failure = exception.Message };
+            }
         }
 
         // 按一个确定的函数定义标记读取函数体或明确的无托管体边界。
@@ -167,12 +120,889 @@ namespace SetterChecker.Core
             return new ManagedBehaviorBuilder(catalog, method, module.TypeSystem).Read(definition.Body);
         }
 
-        /// <summary>
-        /// 保存一次程序集内容读取所处理的函数批次。
-        /// </summary>
-        private sealed record BehaviorWorkItem(
-            string AssemblyPath,
-            IReadOnlyList<MethodEntry> Methods);
+        // 源码直接读取编译器绑定后的操作，不生成程序集。
+        internal static MethodBehavior ReadSourceBehavior(MethodCatalogResult catalog, MethodEntry method, CSharpCompilation compilation)
+        {
+            try
+            {
+                return new SourceBehaviorBuilder(catalog, method, compilation).Read();
+            }
+            catch (AnalysisException exception)
+            {
+                return MethodBehavior.Empty(method.Id, MethodBodyKind.ReadFailure) with { Failure = exception.Message };
+            }
+        }
+
+        /// <summary>把源码操作转换成与 DLL 相同的读写、调用和局部赋值事实。</summary>
+        private sealed class SourceBehaviorBuilder
+        {
+            private readonly MethodCatalogResult m_catalog;
+            private readonly MethodEntry m_method;
+            private readonly CSharpCompilation m_compilation;
+            private readonly List<BehaviorValue> m_values = new();
+            private readonly List<BehaviorAssignment> m_assignments = new();
+            private readonly List<BehaviorWrite> m_writes = new();
+            private readonly List<BehaviorCall> m_calls = new();
+            private readonly List<BehaviorReturn> m_returns = new();
+            private readonly List<string> m_failures = new();
+            private readonly Dictionary<ISymbol, int> m_slots = new(SymbolEqualityComparer.Default);
+            private readonly Dictionary<CaptureId, int> m_captures = new();
+            private readonly Dictionary<CaptureId, IOperation> m_captureTargets = new();
+            private int m_block;
+            private int m_order;
+            private int? m_initializer;
+            private int? m_conditionalReceiver;
+            private int? m_this;
+            private ControlFlowGraph? m_graph;
+
+            // 同一函数仅保留一份变量、调用和写入表。
+            internal SourceBehaviorBuilder(MethodCatalogResult catalog, MethodEntry method, CSharpCompilation compilation)
+            {
+                this.m_catalog = catalog;
+                this.m_method = method;
+                this.m_compilation = compilation;
+            }
+
+            // 控制流只用于局部变量来源，不代入调用者的布尔条件。
+            internal MethodBehavior Read()
+            {
+                IMethodSymbol symbol = this.m_method.SourceSymbol!;
+                if (symbol.IsAbstract)
+                {
+                    return MethodBehavior.Empty(this.m_method.Id, MethodBodyKind.Declaration);
+                }
+                if (symbol.IsExtern)
+                {
+                    DllImportData? import = symbol.GetDllImportData();
+                    return MethodBehavior.Empty(this.m_method.Id, import == null ? MethodBodyKind.RuntimeImplementation : MethodBodyKind.PlatformInvocation,
+                        import == null ? null : new NativeBoundary(import.ModuleName ?? string.Empty, import.EntryPointName ?? symbol.Name));
+                }
+                foreach (IParameterSymbol parameter in symbol.Parameters)
+                {
+                    int slot = Add(BehaviorValueKind.Parameter, parameter.Type, parameterIndex: parameter.Ordinal);
+                    this.m_values[slot] = this.m_values[slot] with { SourceSymbol = parameter };
+                    this.m_slots.Add(parameter, slot);
+                }
+                SyntaxNode? syntax = symbol.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax();
+                bool hasYield = syntax?.DescendantNodes(node => node == syntax || node is not (LocalFunctionStatementSyntax or AnonymousFunctionExpressionSyntax))
+                    .OfType<YieldStatementSyntax>().Any() == true;
+                if (hasYield && !this.m_method.IsIteratorBody)
+                {
+                    int[] inputs = (symbol.IsStatic ? Enumerable.Empty<int>() : new[] { CurrentInstance() })
+                        .Concat(symbol.Parameters.Select(parameter => this.m_slots[parameter])).ToArray();
+                    int iterator = Add(BehaviorValueKind.Iterator, symbol.ReturnType, inputs,
+                        method: this.m_catalog.ReadMethodReference(this.m_catalog.ReadIteratorBody(this.m_method)));
+                    this.m_returns.Add(new BehaviorReturn(iterator, Point()));
+                    return new MethodBehavior(this.m_method.Id, MethodBodyKind.Executable, this.m_values, this.m_assignments,
+                        this.m_writes, this.m_calls, this.m_returns,
+                        new[] { new BehaviorFlowBlock(0, true, Array.Empty<BehaviorFlowEdge>()) })
+                    { InitializesLocals = true };
+                }
+                ControlFlowGraph? graph = this.m_catalog.SourceGraphs.GetValueOrDefault(symbol);
+                bool straightBody = TryReadStraightBody(symbol, syntax);
+                if (!straightBody && syntax is BaseMethodDeclarationSyntax or AccessorDeclarationSyntax &&
+                    (syntax.ChildNodes().Any(node => node is BlockSyntax or ArrowExpressionClauseSyntax)))
+                {
+                    graph = ControlFlowGraph.Create(syntax, this.m_catalog.ReadSourceModel(this.m_compilation, syntax.SyntaxTree));
+                }
+                else if (graph == null && syntax is LocalFunctionStatementSyntax or AnonymousFunctionExpressionSyntax)
+                {
+                    throw new AnalysisException($"源码局部函数与闭包尚未接通：{this.m_method.Id}");
+                }
+                if (straightBody)
+                {
+                    graph = null;
+                }
+                else if (graph == null)
+                {
+                    ExpressionSyntax? expression = syntax switch
+                    {
+                        ArrowExpressionClauseSyntax arrow => arrow.Expression,
+                        PropertyDeclarationSyntax property => property.ExpressionBody?.Expression,
+                        IndexerDeclarationSyntax indexer => indexer.ExpressionBody?.Expression,
+                        _ => null,
+                    };
+                    if (expression != null)
+                    {
+                        int value = ReadOperation(this.m_catalog.ReadSourceModel(this.m_compilation, expression.SyntaxTree).GetOperation(expression)!);
+                        this.m_returns.Add(new BehaviorReturn(value, Point()));
+                    }
+                    else
+                    {
+                        ReadImplicitBody(symbol);
+                    }
+                }
+                else
+                {
+                    this.m_graph = graph;
+                    foreach (IMethodSymbol local in graph.LocalFunctions)
+                    {
+                        this.m_catalog.SourceGraphs.TryAdd(local, graph.GetLocalFunctionControlFlowGraph(local));
+                    }
+                    foreach (BasicBlock block in graph.Blocks)
+                    {
+                        if (!block.IsReachable)
+                        {
+                            continue;
+                        }
+                        this.m_block = block.Ordinal;
+                        this.m_order = 0;
+                        foreach (IOperation operation in block.Operations)
+                        {
+                            ReadOperation(operation);
+                        }
+                        int? branch = block.BranchValue == null ? null : ReadOperation(block.BranchValue);
+                        if (block.FallThroughSuccessor?.Semantics == ControlFlowBranchSemantics.Return
+                            || block.ConditionalSuccessor?.Semantics == ControlFlowBranchSemantics.Return)
+                        {
+                            this.m_returns.Add(new BehaviorReturn(branch, Point()));
+                        }
+                    }
+                }
+                BehaviorFlowBlock[] blocks = graph == null ? new[] { new BehaviorFlowBlock(0, true, Array.Empty<BehaviorFlowEdge>()) }
+                    : graph.Blocks.Select(block => new BehaviorFlowBlock(block.Ordinal, block.IsReachable,
+                        new[] { block.FallThroughSuccessor, block.ConditionalSuccessor }.OfType<ControlFlowBranch>()
+                            .Select(edge => new BehaviorFlowEdge(edge.Destination?.Ordinal, edge.Semantics,
+                                edge.FinallyRegions.Select(region => region.FirstBlockOrdinal).ToArray())).ToArray())).ToArray();
+                MarkLazyWrites(syntax);
+                return new MethodBehavior(this.m_method.Id, MethodBodyKind.Executable, this.m_values, this.m_assignments,
+                    this.m_writes, this.m_calls, this.m_returns, blocks)
+                {
+                    InitializesLocals = true,
+                    HiddenPlayerCodeLines = ReadHiddenPlayerCodeLines(syntax),
+                    Failure = this.m_failures.Count == 0 ? null : string.Join("；", this.m_failures.Distinct()),
+                };
+            }
+
+            // 仅记录编辑器宏中可能隐藏真机分支的行号，不改变本轮行为判断。
+            private static IReadOnlyList<int> ReadHiddenPlayerCodeLines(SyntaxNode? syntax)
+            {
+                if (syntax == null)
+                {
+                    return Array.Empty<int>();
+                }
+                return syntax.DescendantTrivia(descendIntoTrivia: true)
+                    .Where(trivia => trivia.HasStructure && trivia.GetStructure() is DirectiveTriviaSyntax directive
+                        && directive.ToString().Contains("UNITY_EDITOR", StringComparison.Ordinal))
+                    .Select(trivia => trivia.GetLocation().GetLineSpan().StartLinePosition.Line + 1)
+                    .Distinct().Order().ToArray();
+            }
+
+            // 只标记用户确认的字段懒初始化写入，不把普通字段赋值误当成缓存初始化。
+            private void MarkLazyWrites(SyntaxNode? syntax)
+            {
+                if (syntax == null || this.m_writes.Count == 0)
+                {
+                    return;
+                }
+                HashSet<string> fields = new(StringComparer.Ordinal);
+                foreach (AssignmentExpressionSyntax assignment in syntax.DescendantNodes().OfType<AssignmentExpressionSyntax>())
+                {
+                    ExpressionSyntax? value = assignment.Right;
+                    bool directCreation = value is ObjectCreationExpressionSyntax or ArrayCreationExpressionSyntax
+                        || value is ParenthesizedExpressionSyntax { Expression: AssignmentExpressionSyntax nested }
+                            && nested.Right is ObjectCreationExpressionSyntax or ArrayCreationExpressionSyntax;
+                    if (assignment.IsKind(SyntaxKind.CoalesceAssignmentExpression) && directCreation
+                        || assignment.IsKind(SyntaxKind.SimpleAssignmentExpression) && directCreation
+                            && assignment.Parent?.Parent is IfStatementSyntax)
+                    {
+                        string? name = GetFieldName(assignment.Left);
+                        if (name != null)
+                        {
+                            fields.Add(name);
+                        }
+                    }
+                }
+                foreach (IfStatementSyntax branch in syntax.DescendantNodes().OfType<IfStatementSyntax>())
+                {
+                    if (branch.Else != null || !IsNullCheck(branch.Condition))
+                    {
+                        continue;
+                    }
+                    IEnumerable<StatementSyntax> statements = branch.Statement is BlockSyntax block
+                        ? block.Statements
+                        : new[] { branch.Statement };
+                    AssignmentExpressionSyntax[] assignments = statements.SelectMany(statement => statement.DescendantNodesAndSelf())
+                        .OfType<AssignmentExpressionSyntax>().Where(item => item.IsKind(SyntaxKind.SimpleAssignmentExpression)
+                            && item.Right is ObjectCreationExpressionSyntax or ArrayCreationExpressionSyntax).ToArray();
+                    AssignmentExpressionSyntax? assignment = assignments.Length == 1 ? assignments[0] : null;
+                    string? name = assignment == null ? null : GetFieldName(assignment.Left);
+                    if (name != null && statements.Count() == 1)
+                    {
+                        fields.Add(name);
+                    }
+                }
+                if (fields.Count == 0)
+                {
+                    return;
+                }
+                for (int index = 0; index < this.m_writes.Count; index++)
+                {
+                    BehaviorWrite write = this.m_writes[index];
+                    if (write.Member?.Name is string name && fields.Contains(name))
+                    {
+                        this.m_writes[index] = write with { IsLazyInitialization = true };
+                    }
+                }
+            }
+
+            // 读取简单字段名，other.F 不属于允许的 this/静态字段懒初始化。
+            private static string? GetFieldName(ExpressionSyntax expression)
+            {
+                return expression switch
+                {
+                    IdentifierNameSyntax identifier => identifier.Identifier.ValueText,
+                    MemberAccessExpressionSyntax member when member.Expression is ThisExpressionSyntax => member.Name.Identifier.ValueText,
+                    _ => null,
+                };
+            }
+
+            // 判断 F == null、null == F 和 F is null 三种空值条件。
+            private static bool IsNullCheck(ExpressionSyntax condition)
+            {
+                if (condition is IsPatternExpressionSyntax { Pattern: ConstantPatternSyntax { Expression: LiteralExpressionSyntax literal } }
+                    && literal.IsKind(SyntaxKind.NullLiteralExpression))
+                {
+                    return true;
+                }
+                if (condition is BinaryExpressionSyntax binary && binary.IsKind(SyntaxKind.EqualsExpression))
+                {
+                    return binary.Left.IsKind(SyntaxKind.NullLiteralExpression) || binary.Right.IsKind(SyntaxKind.NullLiteralExpression);
+                }
+                return condition is InvocationExpressionSyntax invocation
+                    && invocation.Expression.ToString().EndsWith("ReferenceEquals", StringComparison.Ordinal)
+                    && invocation.ArgumentList.Arguments.Any(argument => argument.Expression.IsKind(SyntaxKind.NullLiteralExpression));
+            }
+
+            // 普通直线语句直接读取已绑定操作；有分支、闭包或隐式执行关系时仍使用原控制流。
+            private bool TryReadStraightBody(IMethodSymbol symbol, SyntaxNode? syntax)
+            {
+                if (symbol.IsAsync || syntax is not (MethodDeclarationSyntax or AccessorDeclarationSyntax))
+                {
+                    return false;
+                }
+                BlockSyntax? block = syntax is MethodDeclarationSyntax method ? method.Body : ((AccessorDeclarationSyntax)syntax).Body;
+                if (block != null && block.Statements.Any(statement => statement is not (ExpressionStatementSyntax or ReturnStatementSyntax or EmptyStatementSyntax)
+                    || statement is ReturnStatementSyntax && statement != block.Statements.Last()))
+                {
+                    return false;
+                }
+                IOperation? operation = this.m_catalog.ReadSourceModel(this.m_compilation, syntax.SyntaxTree).GetOperation(syntax);
+                IBlockOperation? body = operation is IMethodBodyOperation methodBody ? methodBody.BlockBody ?? methodBody.ExpressionBody : null;
+                if (body == null || !IsStraightOperation(body))
+                {
+                    return false;
+                }
+                foreach (IOperation statement in body.Operations)
+                {
+                    ReadOperation(statement);
+                }
+                return true;
+            }
+
+            // 仅接收无跳转且求值次序可直接保留的操作，不简化条件、初始化器或自定义处理器。
+            private static bool IsStraightOperation(IOperation operation)
+            {
+                bool supported = operation is IBlockOperation or IExpressionStatementOperation or IReturnOperation or IEmptyOperation
+                    or ILiteralOperation or IDefaultValueOperation or IInstanceReferenceOperation or ILocalReferenceOperation
+                    or IParameterReferenceOperation or IFieldReferenceOperation or IArgumentOperation
+                    or IInvocationOperation or IConversionOperation or IParenthesizedOperation or IUnaryOperation
+                    or ITypeOfOperation or ISizeOfOperation or INameOfOperation or IArrayElementReferenceOperation
+                    || operation is IObjectCreationOperation { Initializer: null }
+                    || operation is IPropertyReferenceOperation property && property.Arguments.Length == 0
+                    || operation is IBinaryOperation binary && binary.OperatorKind is not (BinaryOperatorKind.ConditionalAnd or BinaryOperatorKind.ConditionalOr)
+                    || operation is ISimpleAssignmentOperation assignment && (assignment.Target is ILocalReferenceOperation or IParameterReferenceOperation
+                        || assignment.Target is IFieldReferenceOperation { Instance: null or IInstanceReferenceOperation });
+                if (!supported || operation.Kind is OperationKind.YieldReturn or OperationKind.YieldBreak)
+                {
+                    return false;
+                }
+                foreach (IOperation child in operation.ChildOperations)
+                {
+                    if (!IsStraightOperation(child))
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            // 自动属性按其真实存储读取或写入，默认构造函数调用基类构造。
+            private void ReadImplicitBody(IMethodSymbol symbol)
+            {
+                if (symbol.AssociatedSymbol is IEventSymbol eventSymbol)
+                {
+                    this.m_writes.Add(new BehaviorWrite(BehaviorWriteKind.Field, eventSymbol.IsStatic ? null : CurrentInstance(),
+                        this.m_catalog.ReadSourceMemberReference(eventSymbol, this.m_method.AssemblyPath!), Array.Empty<int>(),
+                        this.m_slots[symbol.Parameters.Single()], Point()));
+                    return;
+                }
+                if (symbol.AssociatedSymbol is IPropertySymbol property)
+                {
+                    BehaviorMemberReference member = this.m_catalog.ReadSourceMemberReference(property, this.m_method.AssemblyPath!);
+                    int? receiver = property.IsStatic ? null : CurrentInstance();
+                    if (symbol.MethodKind == MethodKind.PropertyGet)
+                    {
+                        int value = Add(BehaviorValueKind.FieldRead, property.Type, receiver == null ? Array.Empty<int>() : new[] { receiver.Value }, member: member);
+                        this.m_returns.Add(new BehaviorReturn(value, Point()));
+                    }
+                    else
+                    {
+                        this.m_writes.Add(new BehaviorWrite(BehaviorWriteKind.Field, receiver, member, Array.Empty<int>(),
+                            this.m_slots[symbol.Parameters.Last()], Point()));
+                    }
+                    return;
+                }
+                if (symbol.MethodKind is MethodKind.Constructor or MethodKind.StaticConstructor)
+                {
+                    if (!symbol.IsStatic && symbol.ContainingType.BaseType?.InstanceConstructors.FirstOrDefault(method => method.Parameters.Length == 0) is IMethodSymbol baseConstructor)
+                    {
+                        AddCall(baseConstructor, CurrentInstance(), Array.Empty<BehaviorArgument>(), BehaviorCallKind.Direct);
+                    }
+                    foreach (ISymbol member in symbol.ContainingType.GetMembers().Where(member => member.IsStatic == symbol.IsStatic))
+                    {
+                        foreach (SyntaxReference reference in member.DeclaringSyntaxReferences)
+                        {
+                            EqualsValueClauseSyntax? initializer = reference.GetSyntax().ChildNodes().OfType<EqualsValueClauseSyntax>().FirstOrDefault();
+                            if (initializer != null && member is IFieldSymbol or IPropertySymbol)
+                            {
+                                int value = ReadOperation(this.m_catalog.ReadSourceModel(this.m_compilation, initializer.SyntaxTree).GetOperation(initializer.Value)!);
+                                this.m_writes.Add(new BehaviorWrite(BehaviorWriteKind.Field, symbol.IsStatic ? null : CurrentInstance(),
+                                    this.m_catalog.ReadSourceMemberReference(member, this.m_method.AssemblyPath!), Array.Empty<int>(), value, Point()));
+                            }
+                        }
+                    }
+                    return;
+                }
+                throw new AnalysisException($"源码函数没有可读取的函数体：{this.m_method.Id}");
+            }
+
+            // 每项表达式只建立一次事实，未知操作明确报告缺口。
+            private int ReadOperation(IOperation operation)
+            {
+                int? initializer = this.m_initializer;
+                try
+                {
+                    return ReadKnownOperation(operation);
+                }
+                catch (AnalysisException exception)
+                {
+                    this.m_initializer = initializer;
+                    this.m_failures.Add(exception.Message);
+                    return Add(BehaviorValueKind.Computation, null, reference: "尚未读取：" + exception.Message);
+                }
+            }
+
+            // 根据编译器已绑定的操作提取调用、读取和写入，不猜测未支持语法的效果。
+            private int ReadKnownOperation(IOperation operation)
+            {
+                if (operation.ConstantValue.HasValue)
+                {
+                    return Add(BehaviorValueKind.Constant, operation.Type, reference:
+                        operation.ConstantValue.Value == null ? "null" : Convert.ToString(operation.ConstantValue.Value, System.Globalization.CultureInfo.InvariantCulture));
+                }
+                switch (operation)
+                {
+                    case IExpressionStatementOperation statement:
+                        return ReadOperation(statement.Operation);
+                    case IArgumentOperation argument:
+                        return ReadOperation(argument.Value);
+                    case ILiteralOperation:
+                    case IDefaultValueOperation:
+                        return Add(BehaviorValueKind.Constant, operation.Type, reference: operation.ConstantValue.Value == null
+                            ? "null" : Convert.ToString(operation.ConstantValue.Value, System.Globalization.CultureInfo.InvariantCulture));
+                    case IInstanceReferenceOperation instance:
+                        return instance.ReferenceKind == InstanceReferenceKind.ImplicitReceiver && this.m_initializer.HasValue ? this.m_initializer.Value : CurrentInstance();
+                    case ILocalReferenceOperation local:
+                        return ReadSlot(Slot(local.Local, local.Type), local.Type?.IsValueType == true && local.Local.RefKind == RefKind.None
+                            && SymbolEqualityComparer.Default.Equals(local.Local.ContainingSymbol, this.m_method.SourceSymbol));
+                    case IParameterReferenceOperation parameter:
+                        return ReadSlot(Slot(parameter.Parameter, parameter.Type), parameter.Type?.IsValueType == true && parameter.Parameter.RefKind == RefKind.None);
+                    case IFlowCaptureReferenceOperation capture:
+                        return ReadSlot(Capture(capture.Id, capture.Type));
+                    case IFlowCaptureOperation capture:
+                        int captured = ReadOperation(capture.Value);
+                        this.m_captureTargets[capture.Id] = capture.Value;
+                        this.m_assignments.Add(new BehaviorAssignment(Capture(capture.Id, capture.Value.Type), captured, Point()));
+                        return captured;
+                    case ISimpleAssignmentOperation assignment:
+                        return Write(assignment.Target, ReadOperation(assignment.Value));
+                    case ICompoundAssignmentOperation assignment:
+                        int left = ReadOperation(assignment.Target);
+                        int right = ReadOperation(assignment.Value);
+                        int combined = ReadBinaryValue(assignment.Type, assignment.OperatorKind, new[] { left, right }, assignment.OperatorMethod);
+                        return Write(assignment.Target, combined);
+                    case IIncrementOrDecrementOperation increment:
+                        int old = ReadOperation(increment.Target);
+                        return Write(increment.Target, increment.OperatorMethod == null ? Add(BehaviorValueKind.Computation, increment.Type, new[] { old })
+                            : AddCall(increment.OperatorMethod, null, new[] { new BehaviorArgument(old, RefKind.None) }));
+                    case IFieldReferenceOperation field:
+                        return Add(BehaviorValueKind.FieldRead, field.Type, field.Instance == null ? Array.Empty<int>() : new[] { ReadOperation(field.Instance) },
+                            member: this.m_catalog.ReadSourceMemberReference(field.Field, this.m_method.AssemblyPath!));
+                    case IPropertyReferenceOperation property:
+                        if (property.Instance?.Type is IArrayTypeSymbol && property.Property.Name == "Length"
+                            && SymbolEqualityComparer.Default.Equals(property.Property.ContainingType, this.m_compilation.GetSpecialType(SpecialType.System_Array)))
+                        {
+                            return Add(BehaviorValueKind.Computation, property.Type, new[] { ReadOperation(property.Instance) }, "ldlen");
+                        }
+                        return ReadAccessorCall(property.Property.GetMethod ?? throw new AnalysisException($"属性没有读取函数：{property.Property}"),
+                            property.Instance, ReadArguments(property.Arguments));
+                    case IEventAssignmentOperation assignment:
+                        IEventReferenceOperation assignedEvent = (IEventReferenceOperation)assignment.EventReference;
+                        IMethodSymbol accessor = (assignment.Adds ? assignedEvent.Event.AddMethod : assignedEvent.Event.RemoveMethod)!;
+                        return ReadAccessorCall(accessor, assignedEvent.Instance,
+                            new[] { new BehaviorArgument(ReadOperation(assignment.HandlerValue), RefKind.None) });
+                    case IEventReferenceOperation eventReference:
+                        return Add(BehaviorValueKind.FieldRead, eventReference.Type,
+                            eventReference.Instance == null ? Array.Empty<int>() : new[] { ReadOperation(eventReference.Instance) },
+                            member: this.m_catalog.ReadSourceMemberReference(eventReference.Event, this.m_method.AssemblyPath!));
+                    case IArrayElementReferenceOperation element:
+                        return Add(BehaviorValueKind.ArrayElementRead, element.Type, new[] { ReadOperation(element.ArrayReference) }.Concat(element.Indices.Select(ReadOperation)).ToArray());
+                    case IInvocationOperation invocation:
+                        return AddCall(invocation.TargetMethod, invocation.Instance == null ? null : ReadOperation(invocation.Instance), ReadArguments(invocation.Arguments),
+                            invocation.TargetMethod.MethodKind == MethodKind.DelegateInvoke ? BehaviorCallKind.Delegate
+                                : invocation.IsVirtual ? BehaviorCallKind.Virtual : BehaviorCallKind.Direct);
+                    case IObjectCreationOperation creation:
+                        int created = Add(BehaviorValueKind.NewObject, creation.Type);
+                        if (creation.Constructor != null)
+                        {
+                            AddCall(creation.Constructor, created, ReadArguments(creation.Arguments), BehaviorCallKind.ObjectCreation, created);
+                        }
+                        int? previous = this.m_initializer;
+                        this.m_initializer = created;
+                        if (creation.Initializer != null)
+                        {
+                            ReadOperation(creation.Initializer);
+                        }
+                        this.m_initializer = previous;
+                        return created;
+                    case ITypeParameterObjectCreationOperation creation:
+                        INamedTypeSymbol activator = this.m_compilation.GetTypeByMetadataName("System.Activator")
+                            ?? throw new AnalysisException("当前编译环境缺少 System.Activator");
+                        IMethodSymbol createInstance = activator.GetMembers("CreateInstance").OfType<IMethodSymbol>()
+                            .SingleOrDefault(method => method.IsStatic && method.Arity == 1 && method.Parameters.Length == 0)
+                            ?? throw new AnalysisException("当前编译环境缺少 System.Activator.CreateInstance<T>()");
+                        AddCall(createInstance.Construct(creation.Type!), null, Array.Empty<BehaviorArgument>());
+                        int genericCreated = Add(BehaviorValueKind.NewObject, creation.Type);
+                        ITypeSymbol? constraint = ((ITypeParameterSymbol)creation.Type!).ConstraintTypes
+                            .FirstOrDefault(type => type.TypeKind == TypeKind.Class);
+                        this.m_values[genericCreated] = this.m_values[genericCreated] with
+                        {
+                            AllocationConstraint = constraint == null ? null
+                                : this.m_catalog.ReadSourceTypeReference(constraint, this.m_method.AssemblyPath!),
+                        };
+                        int? previousGenericInitializer = this.m_initializer;
+                        this.m_initializer = genericCreated;
+                        if (creation.Initializer != null)
+                        {
+                            ReadOperation(creation.Initializer);
+                        }
+                        this.m_initializer = previousGenericInitializer;
+                        return genericCreated;
+                    case IArrayCreationOperation array:
+                        int allocated = Add(BehaviorValueKind.NewArray, array.Type, array.DimensionSizes.Select(ReadOperation).ToArray());
+                        if (array.Initializer != null)
+                        {
+                            for (int index = 0; index < array.Initializer.ElementValues.Length; index++)
+                            {
+                                int value = ReadOperation(array.Initializer.ElementValues[index]);
+                                this.m_writes.Add(new BehaviorWrite(BehaviorWriteKind.ArrayElement, allocated, null,
+                                    new[] { Add(BehaviorValueKind.Constant, null, reference: index.ToString(System.Globalization.CultureInfo.InvariantCulture)) }, value, Point()));
+                            }
+                        }
+                        return allocated;
+                    case IConversionOperation conversion:
+                        int converted = ReadOperation(conversion.Operand);
+                        return conversion.OperatorMethod == null ? Add(conversion.Conversion.IsNumeric
+                            ? BehaviorValueKind.Computation : BehaviorValueKind.Conversion, conversion.Type, new[] { converted },
+                            reference: conversion.IsTryCast ? "isinst" : null)
+                            : AddCall(conversion.OperatorMethod, null, new[] { new BehaviorArgument(converted, RefKind.None) });
+                    case IConditionalOperation conditional:
+                        ReadOperation(conditional.Condition);
+                        return Add(BehaviorValueKind.Merge, conditional.Type, new[] { ReadOperation(conditional.WhenTrue), ReadOperation(conditional.WhenFalse!) });
+                    case ICoalesceOperation coalesce:
+                        return Add(BehaviorValueKind.Merge, coalesce.Type, new[] { ReadOperation(coalesce.Value), ReadOperation(coalesce.WhenNull) });
+                    case IConditionalAccessOperation conditionalAccess:
+                        int receiver = ReadOperation(conditionalAccess.Operation);
+                        int? previousReceiver = this.m_conditionalReceiver;
+                        this.m_conditionalReceiver = receiver;
+                        int whenNotNull = ReadOperation(conditionalAccess.WhenNotNull);
+                        this.m_conditionalReceiver = previousReceiver;
+                        int whenNull = Add(BehaviorValueKind.Constant, conditionalAccess.Type, reference: "null");
+                        return Add(BehaviorValueKind.Merge, conditionalAccess.Type, new[] { whenNotNull, whenNull });
+                    case IConditionalAccessInstanceOperation:
+                        return this.m_conditionalReceiver
+                            ?? throw new AnalysisException($"条件访问实例缺少接收对象：{operation.Syntax}");
+                    case IParenthesizedOperation parenthesized:
+                        return ReadOperation(parenthesized.Operand);
+                    case IDelegateCreationOperation creation:
+                        return ReadOperation(creation.Target);
+                    case IMethodReferenceOperation method:
+                        IOperation? boundReceiver = method.Instance;
+                        if (boundReceiver == null && method.Method.IsExtensionMethod && method.Syntax is MemberAccessExpressionSyntax access)
+                        {
+                            SemanticModel model = this.m_catalog.ReadSourceModel(this.m_compilation, access.SyntaxTree);
+                            if (model.GetSymbolInfo(access).Symbol is IMethodSymbol { ReducedFrom: not null })
+                            {
+                                boundReceiver = model.GetOperation(access.Expression);
+                            }
+                        }
+                        int function = Add(BehaviorValueKind.Function, method.Type, boundReceiver == null ? Array.Empty<int>() : new[] { ReadOperation(boundReceiver) },
+                            method: this.m_catalog.ReadSourceMethodReference(method.Method, this.m_method.AssemblyPath!));
+                        this.m_values[function] = this.m_values[function] with { UsesVirtualDispatch = method.IsVirtual && method.Instance?.Syntax is not BaseExpressionSyntax };
+                        return function;
+                    case IFlowAnonymousFunctionOperation anonymous:
+                        this.m_catalog.SourceGraphs.TryAdd(anonymous.Symbol, this.m_graph!.GetAnonymousFunctionControlFlowGraph(anonymous));
+                        return Add(BehaviorValueKind.Function, anonymous.Type, anonymous.Symbol.IsStatic ? Array.Empty<int>() : new[] { CurrentInstance() },
+                            method: this.m_catalog.ReadSourceMethodReference(anonymous.Symbol, this.m_method.AssemblyPath!));
+                    case ITypeOfOperation type:
+                        return Add(BehaviorValueKind.Type, type.TypeOperand);
+                    case ISizeOfOperation size:
+                        int sizeValue = Add(BehaviorValueKind.Computation, size.Type, reference: "sizeof");
+                        this.m_values[sizeValue] = this.m_values[sizeValue] with { OperandType = this.m_catalog.ReadSourceTypeReference(size.TypeOperand, this.m_method.AssemblyPath!) };
+                        return sizeValue;
+                    case ICaughtExceptionOperation exception:
+                        return Add(BehaviorValueKind.Exception, exception.Type);
+                    case INameOfOperation:
+                        return Add(BehaviorValueKind.Constant, operation.Type, reference: operation.ConstantValue.Value?.ToString());
+                    case IInterpolatedStringOperation interpolated:
+                        return ReadInterpolatedString(interpolated);
+                    case IInterpolatedStringHandlerCreationOperation:
+                        throw new AnalysisException($"源码自定义插值字符串处理器尚未接通：{operation.Syntax}");
+                    case IBinaryOperation binary:
+                        int[] operands = new[] { ReadOperation(binary.LeftOperand), ReadOperation(binary.RightOperand) };
+                        return ReadBinaryValue(binary.Type, binary.OperatorKind, operands, binary.OperatorMethod);
+                    case IUnaryOperation unary:
+                        int operand = ReadOperation(unary.Operand);
+                        return unary.OperatorMethod == null ? Add(BehaviorValueKind.Computation, unary.Type, new[] { operand }, unary.OperatorKind.ToString())
+                            : AddCall(unary.OperatorMethod, null, new[] { new BehaviorArgument(operand, RefKind.None) });
+                    case IReturnOperation returned when returned.Kind == OperationKind.YieldBreak:
+                        return Add(BehaviorValueKind.Constant, null, reference: "void");
+                    case IReturnOperation returned:
+                        int? returnedValue = returned.ReturnedValue == null ? null : ReadOperation(returned.ReturnedValue);
+                        this.m_returns.Add(new BehaviorReturn(returnedValue, Point()));
+                        return returnedValue ?? Add(BehaviorValueKind.Constant, null, reference: "void");
+                    case IObjectOrCollectionInitializerOperation initializer:
+                        foreach (IOperation child in initializer.Initializers)
+                        {
+                            ReadOperation(child);
+                        }
+                        return this.m_initializer!.Value;
+                    case IIsNullOperation test:
+                        return Add(BehaviorValueKind.Computation, test.Type, new[] { ReadOperation(test.Operand) }, "is-null");
+                    case IIsTypeOperation test:
+                        return Add(BehaviorValueKind.Computation, test.Type, new[] { ReadOperation(test.ValueOperand) }, "is-type");
+                    case IIsPatternOperation test:
+                        int subject = ReadOperation(test.Value);
+                        ReadPattern(test.Pattern, subject);
+                        return Add(BehaviorValueKind.Computation, test.Type, new[] { subject }, "is-pattern");
+                    case IEmptyOperation:
+                    case ILocalFunctionOperation:
+                        return Add(BehaviorValueKind.Constant, null, reference: "void");
+                    default:
+                        throw new AnalysisException($"源码操作尚未支持：{operation.Kind}；{operation.Syntax.GetLocation().GetLineSpan()}");
+                }
+            }
+
+            // 普通字符串插值按真实 string.Format 重载建立调用和参数数组事实。
+            private int ReadInterpolatedString(IInterpolatedStringOperation operation)
+            {
+                if (operation.Type?.SpecialType != SpecialType.System_String)
+                {
+                    throw new AnalysisException($"源码非 string 插值尚未接通：{operation.Type}；{operation.Syntax}");
+                }
+
+                System.Text.StringBuilder format = new();
+                List<int> values = new();
+                foreach (IInterpolatedStringContentOperation part in operation.Parts)
+                {
+                    if (part is IInterpolatedStringTextOperation text)
+                    {
+                        string literal = text.Text.ConstantValue.HasValue
+                            ? text.Text.ConstantValue.Value?.ToString() ?? string.Empty
+                            : throw new AnalysisException($"源码插值文本不是常量：{text.Syntax}");
+                        format.Append(literal.Replace("{", "{{", StringComparison.Ordinal)
+                            .Replace("}", "}}", StringComparison.Ordinal));
+                        continue;
+                    }
+                    if (part is not IInterpolationOperation interpolation)
+                    {
+                        throw new AnalysisException($"源码插值内容尚未支持：{part.Kind}；{part.Syntax}");
+                    }
+
+                    format.Append('{').Append(values.Count);
+                    if (interpolation.Alignment != null)
+                    {
+                        if (!interpolation.Alignment.ConstantValue.HasValue || interpolation.Alignment.ConstantValue.Value is not int alignment)
+                        {
+                            throw new AnalysisException($"源码插值对齐值不是常量：{interpolation.Alignment.Syntax}");
+                        }
+                        format.Append(',').Append(alignment.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    }
+                    if (interpolation.FormatString != null)
+                    {
+                        if (!interpolation.FormatString.ConstantValue.HasValue || interpolation.FormatString.ConstantValue.Value is not string itemFormat)
+                        {
+                            throw new AnalysisException($"源码插值格式不是常量：{interpolation.FormatString.Syntax}");
+                        }
+                        format.Append(':').Append(itemFormat);
+                    }
+                    format.Append('}');
+                    values.Add(ReadOperation(interpolation.Expression));
+                }
+
+                INamedTypeSymbol stringType = this.m_compilation.GetSpecialType(SpecialType.System_String);
+                INamedTypeSymbol objectType = this.m_compilation.GetSpecialType(SpecialType.System_Object);
+                if (values.Count == 0)
+                {
+                    return Add(BehaviorValueKind.Constant, stringType, reference: format.ToString()
+                        .Replace("{{", "{", StringComparison.Ordinal).Replace("}}", "}", StringComparison.Ordinal));
+                }
+                int template = Add(BehaviorValueKind.Constant, stringType, reference: format.ToString());
+                if (values.Count <= 3)
+                {
+                    IMethodSymbol formatMethod = stringType.GetMembers("Format").OfType<IMethodSymbol>().SingleOrDefault(method =>
+                        method.IsStatic && method.Arity == 0 && method.Parameters.Length == values.Count + 1
+                        && method.Parameters[0].Type.SpecialType == SpecialType.System_String
+                        && method.Parameters.Skip(1).All(parameter => parameter.Type.SpecialType == SpecialType.System_Object))
+                        ?? throw new AnalysisException($"当前编译环境缺少 string.Format 的 {values.Count} 参数重载");
+                    BehaviorArgument[] arguments = new[] { new BehaviorArgument(template, RefKind.None) }
+                        .Concat(values.Select(value => new BehaviorArgument(
+                            Add(BehaviorValueKind.Conversion, objectType, new[] { value }), RefKind.None))).ToArray();
+                    return AddCall(formatMethod, null, arguments);
+                }
+
+                IArrayTypeSymbol arrayType = this.m_compilation.CreateArrayTypeSymbol(objectType);
+                int length = Add(BehaviorValueKind.Constant, this.m_compilation.GetSpecialType(SpecialType.System_Int32),
+                    reference: values.Count.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                int array = Add(BehaviorValueKind.NewArray, arrayType, new[] { length });
+                for (int index = 0; index < values.Count; index++)
+                {
+                    int converted = Add(BehaviorValueKind.Conversion, objectType, new[] { values[index] });
+                    int indexValue = Add(BehaviorValueKind.Constant, this.m_compilation.GetSpecialType(SpecialType.System_Int32),
+                        reference: index.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    this.m_writes.Add(new BehaviorWrite(BehaviorWriteKind.ArrayElement, array, null,
+                        new[] { indexValue }, converted, Point()));
+                }
+                IMethodSymbol arrayFormat = stringType.GetMembers("Format").OfType<IMethodSymbol>().SingleOrDefault(method =>
+                    method.IsStatic && method.Arity == 0 && method.Parameters.Length == 2
+                    && method.Parameters[0].Type.SpecialType == SpecialType.System_String
+                    && method.Parameters[1].IsParams && method.Parameters[1].Type is IArrayTypeSymbol argumentArray
+                    && argumentArray.ElementType.SpecialType == SpecialType.System_Object)
+                    ?? throw new AnalysisException("当前编译环境缺少 string.Format(string, params object[]) 重载");
+                return AddCall(arrayFormat, null, new[]
+                {
+                    new BehaviorArgument(template, RefKind.None),
+                    new BehaviorArgument(array, RefKind.None),
+                });
+            }
+
+            // 模式中的变量、属性读取和解构函数继续进入统一事实。
+            private void ReadPattern(IPatternOperation pattern, int subject)
+            {
+                switch (pattern)
+                {
+                    case IDeclarationPatternOperation declaration when declaration.DeclaredSymbol != null:
+                        this.m_assignments.Add(new BehaviorAssignment(Slot(declaration.DeclaredSymbol, declaration.MatchedType), subject, Point()));
+                        break;
+                    case IRecursivePatternOperation recursive:
+                        if (recursive.DeclaredSymbol != null)
+                        {
+                            this.m_assignments.Add(new BehaviorAssignment(Slot(recursive.DeclaredSymbol, recursive.MatchedType), subject, Point()));
+                        }
+                        if (recursive.DeconstructSymbol != null || recursive.DeconstructionSubpatterns.Length != 0)
+                        {
+                            throw new AnalysisException($"源码解构模式尚未接通：{recursive.Syntax}");
+                        }
+                        int? previous = this.m_initializer;
+                        this.m_initializer = subject;
+                        foreach (IPropertySubpatternOperation property in recursive.PropertySubpatterns)
+                        {
+                            ReadPattern(property.Pattern, ReadOperation(property.Member));
+                        }
+                        this.m_initializer = previous;
+                        break;
+                    case IBinaryPatternOperation binary:
+                        ReadPattern(binary.LeftPattern, subject);
+                        ReadPattern(binary.RightPattern, subject);
+                        break;
+                    case INegatedPatternOperation negated:
+                        ReadPattern(negated.Pattern, subject);
+                        break;
+                    case IConstantPatternOperation constant:
+                        ReadOperation(constant.Value);
+                        break;
+                    case IRelationalPatternOperation relational:
+                        ReadOperation(relational.Value);
+                        break;
+                    case ITypePatternOperation:
+                    case IDiscardPatternOperation:
+                        break;
+                    default:
+                        throw new AnalysisException($"源码模式尚未支持：{pattern.Kind}；{pattern.Syntax}");
+                }
+            }
+
+            // 参数按编译器给出的形参位置绑定，命名参数不受文本排列影响。
+            private BehaviorArgument[] ReadArguments(IEnumerable<IArgumentOperation> arguments)
+            {
+                return arguments.Select(argument => (Position: argument.Parameter!.Ordinal,
+                    Value: new BehaviorArgument(argument.Parameter.RefKind is RefKind.Out or RefKind.Ref
+                        ? ReadReference(argument.Value) : ReadOperation(argument.Value), argument.Parameter.RefKind)))
+                    .OrderBy(argument => argument.Position).Select(argument => argument.Value).ToArray();
+            }
+
+            // 引用参数传递存储位置，不把当前位置的内容当成写入目标。
+            private int ReadReference(IOperation operation)
+            {
+                return operation switch
+                {
+                    IDeclarationExpressionOperation declaration => ReadReference(declaration.Expression),
+                    IDiscardOperation discard => Add(BehaviorValueKind.Address, discard.Type, new[] { Add(BehaviorValueKind.Local, discard.Type) }),
+                    IFlowCaptureReferenceOperation capture => ReadReference(this.m_captureTargets[capture.Id]),
+                    ILocalReferenceOperation local => Add(BehaviorValueKind.Address, local.Type, new[] { Slot(local.Local, local.Type) }),
+                    IParameterReferenceOperation parameter when parameter.Parameter.RefKind != RefKind.None => Slot(parameter.Parameter, parameter.Type),
+                    IParameterReferenceOperation parameter => Add(BehaviorValueKind.Address, parameter.Type, new[] { Slot(parameter.Parameter, parameter.Type) }),
+                    IFieldReferenceOperation field => Add(BehaviorValueKind.Address, field.Type,
+                        field.Instance == null ? Array.Empty<int>() : new[] { ReadOperation(field.Instance) },
+                        member: this.m_catalog.ReadSourceMemberReference(field.Field, this.m_method.AssemblyPath!)),
+                    IArrayElementReferenceOperation array => Add(BehaviorValueKind.Address, array.Type,
+                        new[] { ReadOperation(array.ArrayReference) }.Concat(array.Indices.Select(ReadOperation)).ToArray()),
+                    _ => throw new AnalysisException($"源码引用参数的存储位置尚未支持：{operation.Kind}；{operation.Syntax}"),
+                };
+            }
+
+            // 属性和事件访问按实际重写调用，显式 base 访问保持直接调用。
+            private int ReadAccessorCall(IMethodSymbol accessor, IOperation? receiver, IReadOnlyList<BehaviorArgument> arguments)
+            {
+                bool dispatch = (accessor.IsVirtual || accessor.IsAbstract || accessor.IsOverride) && receiver?.Syntax is not BaseExpressionSyntax;
+                return AddCall(accessor, receiver == null ? null : ReadOperation(receiver), arguments,
+                    dispatch ? BehaviorCallKind.Virtual : BehaviorCallKind.Direct);
+            }
+
+            // 委托加减是编译器规定的列表操作，其余运算保留实际绑定的运算符。
+            private int ReadBinaryValue(ITypeSymbol? type, BinaryOperatorKind operation, int[] operands, IMethodSymbol? implementation)
+            {
+                if (implementation == null && type?.TypeKind == TypeKind.Delegate && operation is BinaryOperatorKind.Add or BinaryOperatorKind.Subtract)
+                {
+                    implementation = this.m_compilation.GetSpecialType(SpecialType.System_Delegate)
+                        .GetMembers(operation == BinaryOperatorKind.Add ? "Combine" : "Remove").OfType<IMethodSymbol>()
+                        .Single(method => method.Parameters.Length == 2 && method.Parameters.All(parameter => parameter.Type.SpecialType == SpecialType.System_Delegate));
+                }
+                return implementation == null ? Add(BehaviorValueKind.Computation, type, operands, operation.ToString())
+                    : AddCall(implementation, null, operands.Select(value => new BehaviorArgument(value, RefKind.None)).ToArray());
+            }
+
+            // 写入局部变量只更新来源；属性写入只调用实际 setter。
+            private int Write(IOperation target, int value)
+            {
+                switch (target)
+                {
+                    case IFlowCaptureReferenceOperation capture:
+                        return Write(this.m_captureTargets[capture.Id], value);
+                    case ILocalReferenceOperation local:
+                        this.m_assignments.Add(new BehaviorAssignment(Slot(local.Local, local.Type), value, Point()));
+                        break;
+                    case IParameterReferenceOperation parameter when parameter.Parameter.RefKind == RefKind.None:
+                        this.m_assignments.Add(new BehaviorAssignment(Slot(parameter.Parameter, parameter.Type), value, Point()));
+                        break;
+                    case IParameterReferenceOperation parameter:
+                        int parameterSlot = Slot(parameter.Parameter, parameter.Type);
+                        this.m_writes.Add(new BehaviorWrite(BehaviorWriteKind.Indirect, parameterSlot, null, Array.Empty<int>(), value, Point()));
+                        this.m_assignments.Add(new BehaviorAssignment(parameterSlot, value, Point()));
+                        break;
+                    case IFieldReferenceOperation field:
+                        this.m_writes.Add(new BehaviorWrite(BehaviorWriteKind.Field, field.Instance == null ? null : ReadOperation(field.Instance),
+                            this.m_catalog.ReadSourceMemberReference(field.Field, this.m_method.AssemblyPath!), Array.Empty<int>(), value, Point()));
+                        break;
+                    case IPropertyReferenceOperation property:
+                        ReadAccessorCall(property.Property.SetMethod ?? throw new AnalysisException($"属性没有写入函数：{property.Property}"),
+                            property.Instance, ReadArguments(property.Arguments).Append(new BehaviorArgument(value, RefKind.None)).ToArray());
+                        break;
+                    case IArrayElementReferenceOperation array:
+                        this.m_writes.Add(new BehaviorWrite(BehaviorWriteKind.ArrayElement, ReadOperation(array.ArrayReference), null,
+                            array.Indices.Select(ReadOperation).ToArray(), value, Point()));
+                        break;
+                    case IDiscardOperation:
+                        break;
+                    default:
+                        throw new AnalysisException($"源码写入目标尚未支持：{target.Kind}；{target.Syntax}");
+                }
+                return value;
+            }
+
+            // 每个调用位置只保存一份参数关系和返回槽。
+            private int AddCall(IMethodSymbol method, int? receiver, IReadOnlyList<BehaviorArgument> arguments,
+                BehaviorCallKind kind = BehaviorCallKind.Direct, int? created = null)
+            {
+                int result = created ?? Add(BehaviorValueKind.CallResult, method.ReturnType);
+                if (receiver == null && !method.IsStatic && method.MethodKind == MethodKind.LocalFunction)
+                {
+                    receiver = CurrentInstance();
+                }
+                this.m_calls.Add(new BehaviorCall(kind, this.m_catalog.ReadSourceMethodReference(method, this.m_method.AssemblyPath!),
+                    receiver, arguments, method.ReturnsVoid && created == null ? null : result, Point()));
+                return result;
+            }
+
+            // 统一编号并记录值产生的位置。
+            private int Add(BehaviorValueKind kind, ITypeSymbol? type, IReadOnlyList<int>? inputs = null, string? reference = null,
+                int? parameterIndex = null, BehaviorMemberReference? member = null, BehaviorMethodReference? method = null)
+            {
+                int id = this.m_values.Count;
+                this.m_values.Add(new BehaviorValue(id, kind, reference, parameterIndex, inputs ?? Array.Empty<int>())
+                {
+                    Point = Point(),
+                    Type = type == null ? null : this.m_catalog.ReadSourceTypeReference(type, this.m_method.AssemblyPath!),
+                    Member = member,
+                    Method = method,
+                });
+                return id;
+            }
+
+            // 当前对象只建立一个根值。
+            private int CurrentInstance() => this.m_this ??= Add(BehaviorValueKind.CurrentInstance, this.m_method.SourceSymbol!.ContainingType);
+
+            // 源码符号直接索引变量槽。
+            private int Slot(ISymbol symbol, ITypeSymbol? type)
+            {
+                if (!this.m_slots.TryGetValue(symbol, out int slot))
+                {
+                    slot = Add(SymbolEqualityComparer.Default.Equals(symbol.ContainingSymbol, this.m_method.SourceSymbol)
+                        ? BehaviorValueKind.Local : BehaviorValueKind.CapturedVariable, type, reference: symbol.Name);
+                    this.m_slots.Add(symbol, slot);
+                }
+                this.m_values[slot] = this.m_values[slot] with { SourceSymbol = symbol };
+                return slot;
+            }
+
+            // 控制流临时槽使用编译器已有编号。
+            private int Capture(CaptureId id, ITypeSymbol? type)
+            {
+                if (!this.m_captures.TryGetValue(id, out int slot))
+                {
+                    slot = Add(BehaviorValueKind.Local, type);
+                    this.m_captures.Add(id, slot);
+                }
+                return slot;
+            }
+
+            // 读取位置与槽分开，后续通过局部赋值表查来源。
+            private int ReadSlot(int slot, bool valueCopy = false)
+            {
+                int read = Add(BehaviorValueKind.SlotRead, null, new[] { slot });
+                if (!valueCopy)
+                {
+                    return read;
+                }
+                int copy = Add(BehaviorValueKind.ValueCopy, null, new[] { read });
+                this.m_values[copy] = this.m_values[copy] with { Type = this.m_values[slot].Type };
+                return copy;
+            }
+
+            // 块内次序用于区分赋值前后的局部读取。
+            private BehaviorFlowPoint Point() => new(this.m_block, this.m_order++);
+        }
 
         /// <summary>
         /// 读取托管指令栈并建立本函数的事实集合。
@@ -214,6 +1044,17 @@ namespace SetterChecker.Core
             public MethodBehavior Read(Cil.MethodBody body)
             {
                 Mono.Cecil.Rocks.MethodBodyRocks.SimplifyMacros(body);
+                if (!this.m_method.IsStatic)
+                {
+                    int receiver = GetArgumentValueId(0);
+                    this.m_values[receiver] = this.m_values[receiver] with { Type = ReadTypeReference(body.Method.DeclaringType) };
+                }
+                foreach (Cecil.ParameterDefinition parameter in body.Method.Parameters)
+                {
+                    int slot = GetArgumentValueId(parameter.Index + (this.m_method.IsStatic ? 0 : 1));
+                    Cecil.TypeReference type = parameter.ParameterType is Cecil.ByReferenceType reference ? reference.ElementType : parameter.ParameterType;
+                    this.m_values[slot] = this.m_values[slot] with { Type = ReadTypeReference(type) };
+                }
                 Cil.Instruction[] instructions = body.Instructions.ToArray();
                 foreach (Cil.Instruction allocation in instructions.Where(instruction => instruction.OpCode == OpCodes.Localloc))
                 {
@@ -295,18 +1136,6 @@ namespace SetterChecker.Core
                 }
 
                 var flow = ReadManagedControlFlow(body, this.m_incomingStacks.Keys.ToHashSet());
-                ILookup<int, int> incoming = flow.Blocks.Where(block => block.IsReachable)
-                    .SelectMany(block => block.Successors.Where(edge => edge.TargetBlockId.HasValue)
-                        .Select(edge => (Target: edge.TargetBlockId!.Value, From: block.Id)))
-                    .ToLookup(edge => edge.Target, edge => edge.From);
-                foreach (var merge in this.m_mergeValueIds)
-                {
-                    this.m_values[merge.Value] = this.m_values[merge.Value] with
-                    {
-                        IncomingValues = incoming[merge.Key.Offset].Where(this.m_outgoingStacks.ContainsKey)
-                            .Select(from => new BehaviorMergeInput(from, this.m_outgoingStacks[from][merge.Key.Index])).ToArray(),
-                    };
-                }
                 return new MethodBehavior(
                     this.m_method.Id,
                     MethodBodyKind.Executable,
@@ -315,14 +1144,12 @@ namespace SetterChecker.Core
                     this.m_writes.Values.OrderBy(item => item.Point.BlockId).ToArray(),
                     this.m_calls.Values.OrderBy(item => item.Point.BlockId).ToArray(),
                     this.m_returns.Values.OrderBy(item => item.Point.BlockId).ToArray(),
-                    flow.Blocks,
-                    flow.Handlers)
+                    flow)
                 { InitializesLocals = body.InitLocals };
             }
 
-            // 按托管指令建立控制流块，并保留原始异常处理表。
-            private (IReadOnlyList<BehaviorFlowBlock> Blocks,
-                IReadOnlyList<BehaviorExceptionHandler> Handlers) ReadManagedControlFlow(
+            // 按托管指令及异常处理入口建立控制流块，不向分析结果复制异常表。
+            private IReadOnlyList<BehaviorFlowBlock> ReadManagedControlFlow(
                 Cil.MethodBody body,
                 IReadOnlySet<int> reachableOffsets)
             {
@@ -353,7 +1180,7 @@ namespace SetterChecker.Core
                     block.IsReachable && block.Successors.Any(edge => edge.TargetBlockId == body.CodeSize));
                 BehaviorFlowBlock exit = new(body.CodeSize, exitReachable, Array.Empty<BehaviorFlowEdge>());
 
-                return (instructionBlocks.Prepend(entry).Append(exit).ToArray(), handlers);
+                return instructionBlocks.Prepend(entry).Append(exit).ToArray();
             }
 
             // 直接保存指令跳转和离开 try 时必须执行的 finally 入口，不另建区域树。
@@ -542,7 +1369,8 @@ namespace SetterChecker.Core
                     else
                     {
                         // 每次加载独立保留位置，不让后续赋值改变已入栈的值。
-                        this.m_stack.Push(AddValue(BehaviorValueKind.SlotRead, this.m_values[slotId].Reference, new[] { slotId }));
+                        this.m_stack.Push(argument && this.m_values[slotId].IsManagedReferenceSlot ? slotId
+                            : AddValue(BehaviorValueKind.SlotRead, this.m_values[slotId].Reference, new[] { slotId }));
                     }
                     return;
                 }
@@ -555,7 +1383,7 @@ namespace SetterChecker.Core
                     Cil.Code.Ldc_R4 => (this.m_typeSystem.Single, RequireOperand<float>(instruction).ToString("R", culture)),
                     Cil.Code.Ldc_R8 => (this.m_typeSystem.Double, RequireOperand<double>(instruction).ToString("R", culture)),
                     Cil.Code.Ldstr => (this.m_typeSystem.String, RequireOperand<string>(instruction)),
-                    Cil.Code.Ldnull => (null, null),
+                    Cil.Code.Ldnull => (null, "null"),
                     _ => null,
                 };
                 if (constant.HasValue)
@@ -632,9 +1460,19 @@ namespace SetterChecker.Core
                         $"托管 ldtoken 引用种类无法识别：{this.m_method.Id} @ {offset}");
                 }
 
+                if (code.Code is Cil.Code.Ldind_I or Cil.Code.Ldind_I1 or Cil.Code.Ldind_I2 or Cil.Code.Ldind_I4 or Cil.Code.Ldind_I8
+                    or Cil.Code.Ldind_R4 or Cil.Code.Ldind_R8 or Cil.Code.Ldind_Ref or Cil.Code.Ldind_U1 or Cil.Code.Ldind_U2 or Cil.Code.Ldind_U4 or Cil.Code.Ldobj)
+                {
+                    int address = Pop(code, offset);
+                    int? slot = AddressedSlot(address);
+                    this.m_stack.Push(slot.HasValue ? AddValue(BehaviorValueKind.SlotRead, code.Name, new[] { slot.Value })
+                        : AddValue(BehaviorValueKind.Conversion, code.Name, new[] { address }));
+                    return;
+                }
+
                 if (code.Code is Cil.Code.Castclass or Cil.Code.Isinst
                     or Cil.Code.Box or Cil.Code.Unbox or Cil.Code.Unbox_Any
-                    or Cil.Code.Ldobj)
+                    )
                 {
                     int valueId = AddValue(BehaviorValueKind.Conversion, code.Name, new[] { Pop(code, offset) },
                         type: ReadTypeReference(RequireOperand<Cecil.TypeReference>(instruction)));
@@ -645,10 +1483,12 @@ namespace SetterChecker.Core
 
                 if (code.Code is Cil.Code.Ldfld or Cil.Code.Ldflda or Cil.Code.Ldsfld or Cil.Code.Ldsflda)
                 {
+                    Cecil.FieldReference field = RequireOperand<Cecil.FieldReference>(instruction);
                     this.m_stack.Push(AddValue(
                         code.Code is Cil.Code.Ldflda or Cil.Code.Ldsflda ? BehaviorValueKind.Address : BehaviorValueKind.FieldRead,
                         null, code.Code is Cil.Code.Ldsfld or Cil.Code.Ldsflda ? Array.Empty<int>() : new[] { Pop(code, offset) },
-                        member: this.m_catalog.ReadManagedFieldReference(RequireOperand<Cecil.FieldReference>(instruction), this.m_method.AssemblyPath!)));
+                        type: ReadTypeReference(field.FieldType),
+                        member: this.m_catalog.ReadManagedFieldReference(field, this.m_method.AssemblyPath!)));
 
                     return;
                 }
@@ -757,7 +1597,9 @@ namespace SetterChecker.Core
                     IReadOnlyList<int> inputs = code == OpCodes.Ldvirtftn
                         ? new[] { Pop(code, offset) }
                         : Array.Empty<int>();
-                    this.m_stack.Push(AddValue(BehaviorValueKind.Function, null, inputs, method: reference));
+                    int function = AddValue(BehaviorValueKind.Function, null, inputs, method: reference);
+                    this.m_values[function] = this.m_values[function] with { UsesVirtualDispatch = code == OpCodes.Ldvirtftn };
+                    this.m_stack.Push(function);
 
                     return;
                 }
@@ -788,6 +1630,18 @@ namespace SetterChecker.Core
                 {
                     OperandType = this.m_currentOperandType,
                 };
+                if (kind == BehaviorWriteKind.Indirect && receiver.HasValue && AddressedSlot(receiver.Value) is int slot)
+                {
+                    this.m_assignments[offset] = new BehaviorAssignment(slot, value, NextPoint());
+                }
+            }
+
+            // 局部地址和引用参数都指向固定存储，读取与写入使用同一个槽。
+            private int? AddressedSlot(int address)
+            {
+                BehaviorValue value = this.m_values[address];
+                return value.Kind == BehaviorValueKind.Parameter && value.IsManagedReferenceSlot ? address
+                    : value.Kind == BehaviorValueKind.Address && value.Member == null && value.InputValueIds.Count == 1 ? value.InputValueIds[0] : null;
             }
 
             // 从 Cecil 指令取得一个类型完全确定的操作数。
@@ -880,9 +1734,10 @@ namespace SetterChecker.Core
                     this.m_catalog.ReadManagedMethodReference(
                         method,
                         this.m_method.AssemblyPath!);
-                MethodEntry definition = this.m_catalog.ResolveMethodDefinition(
+                ResolvedMethodDefinition resolved = this.m_catalog.ResolveMethodDefinition(
                     reference,
-                    searchInherited: code != OpCodes.Newobj).Method;
+                    searchInherited: code != OpCodes.Newobj);
+                MethodEntry definition = resolved.Method;
                 BehaviorArgument[] arguments = new BehaviorArgument[reference.Identity.Parameters.Count];
 
                 for (int index = arguments.Length - 1; index >= 0; index--)
@@ -914,7 +1769,9 @@ namespace SetterChecker.Core
                             ? reference.Identity.DeclaringType.Text
                             : reference.Identity.Text,
                         arguments.Select(argument => argument.ValueId).ToArray(),
-                        type: code == OpCodes.Newobj ? ReadTypeReference(method.DeclaringType) : null);
+                        type: code == OpCodes.Newobj ? ReadTypeReference(method.DeclaringType)
+                            : this.m_catalog.SubstituteType(ReadTypeReference(method.ReturnType),
+                                resolved.DeclaringTypeArguments, resolved.MethodTypeArguments));
 
                     this.m_stack.Push(resultValueId.Value);
                 }
@@ -1179,6 +2036,10 @@ namespace SetterChecker.Core
         Conversion,
         /// <summary>新建对象。</summary>
         NewObject,
+        /// <summary>新建浅复制外壳，成员来源仍关联原对象。</summary>
+        ShallowCopy,
+        /// <summary>源码迭代器创建的延迟枚举对象。</summary>
+        Iterator,
         /// <summary>新建数组。</summary>
         NewArray,
         /// <summary>函数调用返回值。</summary>
@@ -1197,8 +2058,12 @@ namespace SetterChecker.Core
         Computation,
         /// <summary>在一个执行位置读取参数、局部值、捕获值或控制流临时槽。</summary>
         SlotRead,
+        /// <summary>值类型的独立副本；内部引用仍保留原有指向。</summary>
+        ValueCopy,
         /// <summary>当前调用内申请的栈内存地址，输入为字节长度而非数组元素数。</summary>
         StackAllocation,
+        /// <summary>局部函数或闭包引用的外层源码变量，共用其符号索引。</summary>
+        CapturedVariable,
     }
 
     /// <summary>
@@ -1239,11 +2104,21 @@ namespace SetterChecker.Core
         int? ParameterIndex,
         IReadOnlyList<int> InputValueIds)
     {
+        /// <summary>泛型创建的类约束，只用于判断创建类别，不冒充对象的具体运行时类型。</summary>
+        public BehaviorTypeReference? AllocationConstraint { get; init; }
+
+        /// <summary>源码变量的唯一符号，供闭包与外层函数共用。</summary>
+        [JsonIgnore]
+        public ISymbol? SourceSymbol { get; init; }
+
         /// <summary>字段读取值所引用的结构化字段。</summary>
         public BehaviorMemberReference? Member { get; init; }
 
         /// <summary>函数或委托值所引用的结构化函数。</summary>
         public BehaviorMethodReference? Method { get; init; }
+
+        /// <summary>方法地址是否按对象的实际类型选择重写；显式 base 调用不使用重写。</summary>
+        public bool UsesVirtualDispatch { get; init; }
 
         /// <summary>反射属性保存真实读写函数，不把属性名称当作行为结论。</summary>
         public BehaviorPropertyReference? Property { get; init; }
@@ -1260,12 +2135,8 @@ namespace SetterChecker.Core
         /// <summary>派生值被读取或产生的执行位置；根槽可以为空。</summary>
         public BehaviorFlowPoint? Point { get; init; }
 
-        /// <summary>指令栈汇合时每条真实入边携带的值，保留分支与值的对应。</summary>
-        public IReadOnlyList<BehaviorMergeInput> IncomingValues { get; init; } = Array.Empty<BehaviorMergeInput>();
     }
 
-    /// <summary>记录一个前驱指令向汇合位置传入的值。</summary>
-    public sealed record BehaviorMergeInput(int PredecessorBlockId, int ValueId);
 
     /// <summary>保存一个反射属性的真实访问函数。</summary>
     public sealed record BehaviorPropertyReference(BehaviorMethodReference? Getter, BehaviorMethodReference? Setter);
@@ -1307,6 +2178,13 @@ namespace SetterChecker.Core
         string DeclaringTypeDefinitionId,
         string Name)
     {
+        /// <summary>成员是否保存引用；尚未确定的泛型参数保留为空。</summary>
+        public bool? IsReferenceStorage { get; init; }
+        /// <summary>已读取声明的成员是否为静态存储，未解析的引用保留为空。</summary>
+        public bool? IsStatic { get; init; }
+        /// <summary>源码字段或自动属性的真实声明，不需要元数据标记。</summary>
+        [JsonIgnore]
+        public ISymbol? SourceSymbol { get; init; }
         /// <summary>当前函数内容中字段引用的原始标记，用于还原完整类型来源。</summary>
         public int ReferenceMetadataToken { get; init; }
 
@@ -1337,8 +2215,9 @@ namespace SetterChecker.Core
         /// <summary>原写入指令的类型操作数；合成反射写入不伪造此项。</summary>
         public BehaviorTypeReference? OperandType { get; init; }
 
-        // 动态选出的写入仍须满足原成员选择，不将多个候选同时覆盖。
-        internal (BehaviorValueReference Input, ValueOrigin Selected)? Selection { get; init; }
+        /// <summary>源码确认是允许忽略的静态或 this 字段懒初始化。</summary>
+        public bool IsLazyInitialization { get; init; }
+
     }
 
     /// <summary>
@@ -1359,6 +2238,13 @@ namespace SetterChecker.Core
         string TargetAssemblyIdentity,
         string? ReferringAssemblyPath)
     {
+        /// <summary>源码绑定到的完整函数符号。</summary>
+        [JsonIgnore]
+        public IMethodSymbol? SourceSymbol { get; init; }
+
+        /// <summary>引用是否指向源码迭代器的唯一延迟函数体。</summary>
+        public bool IsIteratorBody { get; init; }
+
         /// <summary>调用在原始模块内使用的函数引用标记。</summary>
         public int ReferenceMetadataToken { get; init; }
 
@@ -1415,7 +2301,6 @@ namespace SetterChecker.Core
     /// <param name="Calls">函数调用。</param>
     /// <param name="Returns">函数返回。</param>
     /// <param name="Blocks">控制流块。</param>
-    /// <param name="ExceptionHandlers">完整异常处理表。</param>
     /// <param name="NativeBoundary">原生库和入口。</param>
     public sealed record MethodBehavior(
         string MethodId,
@@ -1426,7 +2311,6 @@ namespace SetterChecker.Core
         IReadOnlyList<BehaviorCall> Calls,
         IReadOnlyList<BehaviorReturn> Returns,
         IReadOnlyList<BehaviorFlowBlock> Blocks,
-        IReadOnlyList<BehaviorExceptionHandler> ExceptionHandlers,
         NativeBoundary? NativeBoundary = null)
     {
         /// <summary>真实函数头的 localsinit 标志，不为未初始化内存补零。</summary>
@@ -1434,6 +2318,9 @@ namespace SetterChecker.Core
 
         /// <summary>当前函数体尚未读出的原始分析失败。</summary>
         public string? Failure { get; init; }
+
+        /// <summary>可能被 UNITY_EDITOR 条件编译隐藏的真机代码行号。</summary>
+        public IReadOnlyList<int> HiddenPlayerCodeLines { get; init; } = Array.Empty<int>();
 
         // 建立没有可执行行为的声明或原生函数结果。
         internal static MethodBehavior Empty(
@@ -1450,7 +2337,6 @@ namespace SetterChecker.Core
                 Array.Empty<BehaviorCall>(),
                 Array.Empty<BehaviorReturn>(),
                 Array.Empty<BehaviorFlowBlock>(),
-                Array.Empty<BehaviorExceptionHandler>(),
                 nativeBoundary);
         }
     }
