@@ -1045,31 +1045,26 @@ namespace SetterChecker.Core
                     roots.Add(Path.Combine(projectRoot, Path.Combine(parts.Take(length).ToArray())));
                 }
             }
-            EnumerationOptions topDirectories = new() { IgnoreInaccessible = false, AttributesToSkip = 0 };
-            var scanDirectories = roots.Order(StringComparer.OrdinalIgnoreCase).SelectMany(root =>
-                new[] { (Path: root, Recursive: false) }.Concat(Directory.EnumerateDirectories(root, "*", topDirectories)
-                    .Where(path => !Path.GetFileName(path).StartsWith(".", StringComparison.Ordinal)
-                        && !Path.GetFileName(path).EndsWith('~'))
-                    .Select(path => (Path: path, Recursive: true)))).ToArray();
-            string[][] scannedFiles = new string[scanDirectories.Length][];
-            // 根目录只取直属文件，各子目录独立枚举，共用 -j 并行额度及原来的过滤规则。
-            Parallel.For(0, scanDirectories.Length,
-                new ParallelOptions { MaxDegreeOfParallelism = jobs, CancellationToken = cancellationToken }, index =>
+            // 逐层并行枚举单个目录，大目录树的子目录分给不同工作者；过滤规则与递归枚举一致。
+            List<string> files = new();
+            EnumerationOptions options = new() { IgnoreInaccessible = false, AttributesToSkip = 0 };
+            for (string[] level = roots.Order(StringComparer.OrdinalIgnoreCase).ToArray(); level.Length > 0;)
             {
-                scannedFiles[index] = new System.IO.Enumeration.FileSystemEnumerable<string>(scanDirectories[index].Path,
-                    (ref System.IO.Enumeration.FileSystemEntry entry) => entry.ToFullPath(),
-                    new EnumerationOptions { RecurseSubdirectories = scanDirectories[index].Recursive, IgnoreInaccessible = false, AttributesToSkip = 0 })
-                {
-                    ShouldRecursePredicate = (ref System.IO.Enumeration.FileSystemEntry entry) =>
-                        !entry.FileName.StartsWith(".", StringComparison.Ordinal) && !entry.FileName.EndsWith("~", StringComparison.Ordinal),
-                    ShouldIncludePredicate = (ref System.IO.Enumeration.FileSystemEntry entry) => !entry.IsDirectory
-                        && !entry.FileName.StartsWith(".", StringComparison.Ordinal)
-                        && (entry.FileName.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)
-                            || entry.FileName.EndsWith(".asmdef", StringComparison.OrdinalIgnoreCase)
-                            || entry.FileName.EndsWith(".asmref", StringComparison.OrdinalIgnoreCase)),
-                }.ToArray();
-            });
-            string[] files = scannedFiles.SelectMany(paths => paths).ToArray();
+                (string Path, bool IsDirectory)[][] entries = new (string, bool)[level.Length][];
+                Parallel.For(0, level.Length, new ParallelOptions { MaxDegreeOfParallelism = jobs, CancellationToken = cancellationToken },
+                    index => entries[index] = new System.IO.Enumeration.FileSystemEnumerable<(string, bool)>(level[index],
+                        (ref System.IO.Enumeration.FileSystemEntry entry) => (entry.ToFullPath(), entry.IsDirectory), options)
+                    {
+                        ShouldIncludePredicate = (ref System.IO.Enumeration.FileSystemEntry entry) =>
+                            !entry.FileName.StartsWith(".", StringComparison.Ordinal) && (entry.IsDirectory
+                                ? !entry.FileName.EndsWith("~", StringComparison.Ordinal)
+                                : entry.FileName.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)
+                                    || entry.FileName.EndsWith(".asmdef", StringComparison.OrdinalIgnoreCase)
+                                    || entry.FileName.EndsWith(".asmref", StringComparison.OrdinalIgnoreCase)),
+                    }.ToArray());
+                files.AddRange(entries.SelectMany(items => items).Where(entry => !entry.IsDirectory).Select(entry => entry.Path));
+                level = entries.SelectMany(items => items).Where(entry => entry.IsDirectory).Select(entry => entry.Path).ToArray();
+            }
 
             Dictionary<string, string> owners = new(StringComparer.OrdinalIgnoreCase);
             Dictionary<string, string> guids = new(StringComparer.OrdinalIgnoreCase);
