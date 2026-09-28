@@ -18,6 +18,7 @@ namespace SetterChecker.Core
             typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
             genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters,
             miscellaneousOptions: SymbolDisplayMiscellaneousOptions.ExpandNullable);
+        private const string CompilerGeneratedAttribute = "System.Runtime.CompilerServices.CompilerGeneratedAttribute";
 
         // 并行读取源码和托管文件并建立固定顺序的总表。
         /// <summary>
@@ -54,11 +55,9 @@ namespace SetterChecker.Core
                     assembly.ReportSourcePaths.ToHashSet(StringComparer.OrdinalIgnoreCase)))
                 .ToArray();
             ConcurrentBag<ManagedAssemblyPart> managedParts = new();
-            CatalogAssemblyWorkItem[] assemblyWorkItems = managedPaths
-                .Select(path => new CatalogAssemblyWorkItem(path, null))
-                .Concat(sourceContexts.Select(context => new CatalogAssemblyWorkItem(
-                    context.Material.AssemblyPath,
-                    context)))
+            (string Path, SourceCatalogContext? SourceContext)[] assemblyWorkItems = managedPaths
+                .Select(path => (path, (SourceCatalogContext?)null))
+                .Concat(sourceContexts.Select(context => (context.Material.AssemblyPath, (SourceCatalogContext?)context)))
                 .ToArray();
 
             await Parallel.ForEachAsync(
@@ -153,7 +152,7 @@ namespace SetterChecker.Core
                     IsValueType = symbol.IsValueType,
                     IsEnum = symbol.TypeKind == TypeKind.Enum,
                     IsSealed = symbol.IsSealed,
-                    IsCompilerGenerated = HasCompilerGeneratedAttribute(symbol),
+                    IsCompilerGenerated = HasAttribute(symbol, CompilerGeneratedAttribute),
                     IsNullableValueType = symbol.SpecialType == SpecialType.System_Nullable_T,
                     IsExplicitLayout = symbol.GetAttributes().Any(attribute => attribute.AttributeClass?.ToDisplayString()
                         == "System.Runtime.InteropServices.StructLayoutAttribute" && attribute.ConstructorArguments.FirstOrDefault().Value is int kind && kind == 2),
@@ -335,8 +334,7 @@ namespace SetterChecker.Core
                 ? definition.MetadataName + "@" + location?.SourceSpan.Start : definition.MetadataName;
             MethodIdentityTemplate identity = new(new(type.LogicalId), name, definition.Arity,
                 parameters.Select(parameter => parameter.TypeIdentity).ToArray(), new(returnType));
-            bool hasLog = definition.GetAttributes().Concat(definition.ContainingType.GetAttributes()).Any(attribute =>
-                attribute.AttributeClass?.ToDisplayString() == "KH.LogTrackAttribute");
+            bool hasLog = HasAttribute(definition, "KH.LogTrackAttribute") || HasAttribute(definition.ContainingType, "KH.LogTrackAttribute");
             MethodKind kind = definition.MethodKind == MethodKind.ExplicitInterfaceImplementation ? MethodKind.Ordinary : definition.MethodKind;
             return new MethodEntry(identity.Text, identity.Text, type.AssemblyName, type.Id, type.FullName, definition.MetadataName,
                 returnType, parameters, kind, sourcePath, line,
@@ -349,8 +347,8 @@ namespace SetterChecker.Core
                 IsFinal = definition.IsSealed,
                 IsPrivate = definition.DeclaredAccessibility == Accessibility.Private,
                 GenericParameters = ReadSourceGenericParameters(definition.TypeParameters),
-                HasNoLogTrackExemption = !hasLog && definition.GetAttributes().Concat(definition.ContainingType.GetAttributes())
-                    .Any(attribute => attribute.AttributeClass?.ToDisplayString() == "KH.NoLogTrackAttribute"),
+                HasNoLogTrackExemption = !hasLog
+                    && (HasAttribute(definition, "KH.NoLogTrackAttribute") || HasAttribute(definition.ContainingType, "KH.NoLogTrackAttribute")),
             };
         }
 
@@ -382,16 +380,15 @@ namespace SetterChecker.Core
                 && method.ContainingType.TypeKind is TypeKind.Class or TypeKind.Struct
                 && method.MetadataName != "getInstance"
                 && !method.MetadataName.StartsWith("BaseProxy_", StringComparison.Ordinal)
-                && !HasCompilerGeneratedAttribute(method)
-                && !HasCompilerGeneratedAttribute(method.ContainingType);
+                && !HasAttribute(method, CompilerGeneratedAttribute)
+                && !HasAttribute(method.ContainingType, CompilerGeneratedAttribute);
         }
 
-        // 检查一个源码符号是否由编译器生成。
-        private static bool HasCompilerGeneratedAttribute(ISymbol symbol)
+        // 按完整名称检查源码符号是否带有指定特性，先比短名称，不为无关特性生成显示名称。
+        private static bool HasAttribute(ISymbol symbol, string fullName)
         {
-            return symbol.GetAttributes().Any(attribute =>
-                attribute.AttributeClass?.ToDisplayString() ==
-                "System.Runtime.CompilerServices.CompilerGeneratedAttribute");
+            return symbol.GetAttributes().Any(attribute => attribute.AttributeClass is { } type
+                && fullName.EndsWith(type.Name, StringComparison.Ordinal) && type.ToDisplayString() == fullName);
         }
 
         // 生成边界明确的程序集加类型身份。
@@ -406,11 +403,6 @@ namespace SetterChecker.Core
             SourceAssemblyMaterial Material,
             IReadOnlySet<string> DeclaredPaths,
             IReadOnlySet<string> ReportablePaths);
-
-        /// <summary>保存一个外部文件或源码内存 PE 目录读取任务。</summary>
-        private sealed record CatalogAssemblyWorkItem(
-            string Path,
-            SourceCatalogContext? SourceContext);
 
         // 启动和按需载入共用完整模块读取、源码回贴与资源释放。
         internal static ManagedAssemblyPart ReadManagedTypes(
@@ -478,8 +470,7 @@ namespace SetterChecker.Core
                 IsEnum = type.IsEnum,
                 IsExplicitLayout = type.IsExplicitLayout,
                 IsSealed = type.IsSealed,
-                IsCompilerGenerated = type.CustomAttributes.Any(attribute => attribute.AttributeType.FullName
-                    == "System.Runtime.CompilerServices.CompilerGeneratedAttribute"),
+                IsCompilerGenerated = type.CustomAttributes.Any(attribute => attribute.AttributeType.FullName == CompilerGeneratedAttribute),
                 IsNullableValueType = type.Namespace == "System" && type.Name == "Nullable`1"
                     && (type.Module.TypeSystem.CoreLibrary is Cecil.ModuleDefinition coreModule
                         && coreModule == type.Module
@@ -1307,13 +1298,11 @@ namespace SetterChecker.Core
                 types,
                 managedParts.SelectMany(part => part.Forwarders).ToArray());
             this.m_forwardersByAlias = MethodCatalog.IndexForwarders(managedParts.SelectMany(part => part.Forwarders));
-            IReadOnlyDictionary<string, TypeEntry> typesById = null!;
-            IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> typesByLogicalId = null!;
+            ConcurrentDictionary<string, IReadOnlyList<TypeEntry>> typesByLogicalId = null!;
             ParallelOptions options = new() { MaxDegreeOfParallelism = jobs };
 
             Parallel.Invoke(
                 options,
-                () => typesById = types.ToDictionary(type => type.Id, StringComparer.Ordinal),
                 () =>
                 {
                     foreach (IGrouping<string, MethodEntry> group in methods.GroupBy(method => method.TypeId, StringComparer.Ordinal))
@@ -1323,9 +1312,10 @@ namespace SetterChecker.Core
                 },
                 () => typesByLogicalId = IndexLogicalTypes(types));
 
-            this.m_typesById = new(typesById, StringComparer.Ordinal);
-            this.m_typesByManagedLocation = new(IndexManagedTypeLocations(types), StringComparer.OrdinalIgnoreCase);
-            this.m_typesByLogicalId = new(typesByLogicalId, StringComparer.Ordinal);
+            this.m_typesById = new(types.Select(type => KeyValuePair.Create(type.Id, type)), StringComparer.Ordinal);
+            this.m_typesByManagedLocation = new(types.Where(type => type.AssemblyPath != null && type.MetadataToken > 0).Select(type =>
+                KeyValuePair.Create(ManagedTypeLocation(type.AssemblyPath!, type.MetadataToken), type)), StringComparer.OrdinalIgnoreCase);
+            this.m_typesByLogicalId = typesByLogicalId;
             this.Methods = methods.Select((method, ordinal) => method with { Ordinal = ordinal }).ToArray();
             foreach (MethodEntry method in this.Methods.Where(method => method.SourceSymbol != null))
             {
@@ -1336,16 +1326,6 @@ namespace SetterChecker.Core
                 type => ReadDeclaredOverrides(type));
             stopwatch.Stop();
             this.Elapsed = stopwatch.Elapsed;
-        }
-
-        // 按物理文件和TypeDef标记建立源码回贴后仍稳定的类型索引。
-        private IReadOnlyDictionary<string, TypeEntry> IndexManagedTypeLocations(
-            IEnumerable<TypeEntry> types)
-        {
-            return types.Where(type => type.AssemblyPath != null && type.MetadataToken > 0)
-                .ToDictionary(
-                    type => ManagedTypeLocation(type.AssemblyPath!, type.MetadataToken),
-                    StringComparer.OrdinalIgnoreCase);
         }
 
         // 生成一个物理文件内TypeDef标记的稳定查找键。
@@ -2026,13 +2006,13 @@ namespace SetterChecker.Core
         }
 
         // 合并真实定义与已经证明的转交别名，不再给每个类型复制别名列表。
-        private IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> IndexLogicalTypes(IReadOnlyList<TypeEntry> types)
+        private ConcurrentDictionary<string, IReadOnlyList<TypeEntry>> IndexLogicalTypes(IReadOnlyList<TypeEntry> types)
         {
-            return types.Select(type => (Name: type.LogicalId, Type: type))
+            return new(types.Select(type => (Name: type.LogicalId, Type: type))
                 .Concat(this.m_forwardedTargets.Select(item => (Name: item.Key.TypeId, Type: item.Value)))
-                .GroupBy(item => item.Name, StringComparer.Ordinal).ToDictionary(group => group.Key,
-                    group => (IReadOnlyList<TypeEntry>)group.Select(item => item.Type).DistinctBy(type => type.Id)
-                        .OrderBy(type => type.Id, StringComparer.Ordinal).ToArray(), StringComparer.Ordinal);
+                .GroupBy(item => item.Name, StringComparer.Ordinal).Select(group => KeyValuePair.Create(group.Key,
+                    (IReadOnlyList<TypeEntry>)group.Select(item => item.Type).DistinctBy(type => type.Id)
+                        .OrderBy(type => type.Id, StringComparer.Ordinal).ToArray())), StringComparer.Ordinal);
         }
 
         // 为函数总表与函数体读取共用同一套完整程序集身份定位规则。

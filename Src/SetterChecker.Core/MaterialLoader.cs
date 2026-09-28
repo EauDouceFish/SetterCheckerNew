@@ -364,8 +364,7 @@ namespace SetterChecker.Core
         {
             return assemblies.SelectMany(assembly => assembly.ImplementationPaths)
                 .Select(Path.GetDirectoryName)
-                .Where(path => path != null)
-                .Cast<string>()
+                .OfType<string>()
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .SelectMany(path => Directory.EnumerateFiles(path, "*.dll", SearchOption.TopDirectoryOnly))
                 .Where(IsManagedAssembly)
@@ -740,8 +739,7 @@ namespace SetterChecker.Core
                 .Select(reference => ReadParentDirectories(reference).FirstOrDefault(directory =>
                     string.Equals(directory.Name, "Data", StringComparison.OrdinalIgnoreCase)
                     && Directory.Exists(Path.Combine(directory.FullName, "MonoBleedingEdge")))?.FullName)
-                .Where(path => path != null)
-                .Cast<string>()
+                .OfType<string>()
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
@@ -1299,9 +1297,8 @@ namespace SetterChecker.Core
             int jobs,
             CancellationToken cancellationToken)
         {
-            SourceInput[] inputs = responses
-                .SelectMany(response => response.SourcePaths.Select(path =>
-                    new SourceInput(response.AssemblyName, path, response.ParseOptions)))
+            (string AssemblyName, string Path, CSharpParseOptions ParseOptions)[] inputs = responses
+                .SelectMany(response => response.SourcePaths.Select(path => (response.AssemblyName, path, response.ParseOptions)))
                 .ToArray();
             ConcurrentDictionary<string, ParsedSource> trees = new(StringComparer.OrdinalIgnoreCase);
             Dictionary<string, SyntaxTree> oldTrees = previous.Values.SelectMany(previousAssembly => previousAssembly.Material.Compilation.SyntaxTrees
@@ -1334,7 +1331,7 @@ namespace SetterChecker.Core
                         throw new AnalysisException($"无法读取源码 {group.Key}：{exception.Message}");
                     }
                     string contentKey = Convert.ToHexString(SHA512.HashData(MemoryMarshal.AsBytes(text.AsSpan())));
-                    foreach (SourceInput input in group)
+                    foreach (var input in group)
                     {
                         string key = SourceKey(input.AssemblyName, input.Path);
                         oldTrees.TryGetValue(key, out SyntaxTree? oldTree);
@@ -1505,11 +1502,6 @@ namespace SetterChecker.Core
             string Path,
             MetadataReferenceProperties Properties,
             string? SourceAssemblyName);
-
-        private sealed record SourceInput(
-            string AssemblyName,
-            string Path,
-            CSharpParseOptions ParseOptions);
 
         private readonly record struct ParsedSource(SyntaxTree Tree, string ContentKey);
 
