@@ -156,7 +156,8 @@ namespace SetterChecker.Core
             private (bool Static, ulong Slots) ClassifyRoot(string method, int value)
             {
                 ulong slots = 0;
-                Queue<(BehaviorValueReference Reference, bool Deep)> pending = new(new[] { (new BehaviorValueReference(method, value), false) });
+                Queue<(BehaviorValueReference Reference, bool Deep)> pending = new();
+                pending.Enqueue((new BehaviorValueReference(method, value), false));
                 HashSet<(BehaviorValueReference Reference, bool Deep)> visited = new();
                 while (pending.TryDequeue(out var item))
                 {
@@ -171,7 +172,7 @@ namespace SetterChecker.Core
                             continue;
                         }
                         BehaviorValue source = origin.Value;
-                        BehaviorValueReference Input() => origin.Reference with { ValueId = source.InputValueIds[0] };
+                        BehaviorValueReference input = source.InputValueIds.Count == 0 ? default : origin.Reference with { ValueId = source.InputValueIds[0] };
                         switch (source.Kind)
                         {
                             case BehaviorValueKind.CurrentInstance:
@@ -195,19 +196,19 @@ namespace SetterChecker.Core
                                 }
                                 if (source.InputValueIds.Count != 0)
                                 {
-                                    pending.Enqueue((Input(), item.Deep || source.Kind == BehaviorValueKind.FieldRead && source.Member?.IsReferenceStorage != false));
+                                    pending.Enqueue((input, item.Deep || source.Kind == BehaviorValueKind.FieldRead && source.Member?.IsReferenceStorage != false));
                                 }
                                 break;
                             case BehaviorValueKind.ArrayElementRead:
                                 if (source.InputValueIds.Count != 0)
                                 {
-                                    pending.Enqueue((Input(), true));
+                                    pending.Enqueue((input, true));
                                 }
                                 break;
                             case BehaviorValueKind.ValueCopy:
                                 if (item.Deep && source.InputValueIds.Count != 0)
                                 {
-                                    pending.Enqueue((Input(), true));
+                                    pending.Enqueue((input, true));
                                 }
                                 break;
                         }
@@ -258,7 +259,7 @@ namespace SetterChecker.Core
                     {
                         continue;
                     }
-                    foreach (var (caller, target, position) in bindings.ToArray())
+                    foreach (var (caller, target, position) in bindings)
                     {
                         MapBinding(caller, target, position);
                     }
@@ -919,6 +920,10 @@ namespace SetterChecker.Core
                 return mask;
             }
 
+            // 值的全部输入，与原值位于同一函数。
+            private static BehaviorValueReference[] ReadInputs(ValueOrigin origin)
+                => origin.Value.InputValueIds.Select(input => origin.Reference with { ValueId = input }).ToArray();
+
             // 值在本函数内的最终来源；调用结果用被调函数的返回摘要换算。
             private IReadOnlyList<EffectRoot> ReadRoots(MethodState state, int valueId, bool deep)
             {
@@ -957,7 +962,7 @@ namespace SetterChecker.Core
                             }
                             continue;
                         }
-                        BehaviorValueReference Input(int index) => origin.Reference with { ValueId = value.InputValueIds[index] };
+                        BehaviorValueReference firstInput = value.InputValueIds.Count == 0 ? default : origin.Reference with { ValueId = value.InputValueIds[0] };
                         switch (value.Kind)
                         {
                             case BehaviorValueKind.CurrentInstance:
@@ -992,7 +997,7 @@ namespace SetterChecker.Core
                                     state.CopySources.Add(origin.Reference.ValueId);
                                     List<EffectRoot> copied = new();
                                     foreach (BehaviorValueReference source in origin.BoundReceiver
-                                        ?? value.InputValueIds.Select(input => origin.Reference with { ValueId = input }).ToArray())
+                                        ?? ReadInputs(origin))
                                     {
                                         copied.AddRange(source.MethodId != state.Method ? new[] { EffectRoot.Foreign }
                                             : source.ValueId < 0 ? new[] { EffectRoot.UnknownOf("浅复制来源尚未确定") }
@@ -1011,7 +1016,7 @@ namespace SetterChecker.Core
                                 }
                                 else
                                 {
-                                    pending.Enqueue((Input(0), d || value.Member?.IsReferenceStorage != false));
+                                    pending.Enqueue((firstInput, d || value.Member?.IsReferenceStorage != false));
                                 }
                                 break;
                             case BehaviorValueKind.ArrayElementRead:
@@ -1021,7 +1026,7 @@ namespace SetterChecker.Core
                                 }
                                 else
                                 {
-                                    pending.Enqueue((Input(0), true));
+                                    pending.Enqueue((firstInput, true));
                                 }
                                 break;
                             case BehaviorValueKind.Address:
@@ -1034,13 +1039,16 @@ namespace SetterChecker.Core
                                 }
                                 else if (value.InputValueIds.Count != 0)
                                 {
-                                    pending.Enqueue((Input(0), d));
+                                    pending.Enqueue((firstInput, d));
                                     // 经局部变量地址做深写时，要追到赋给该变量的值（例如结构体枚举器中保存的原集合）。
                                     if (d && value.Member == null && this.m_bodies.TryGetValue(origin.Reference.MethodId, out MethodBehavior? owner))
                                     {
-                                        foreach (BehaviorAssignment assignment in owner.Assignments.Where(item => item.TargetValueId == value.InputValueIds[0]))
+                                        foreach (BehaviorAssignment assignment in owner.Assignments)
                                         {
-                                            pending.Enqueue((origin.Reference with { ValueId = assignment.ValueId }, true));
+                                            if (assignment.TargetValueId == firstInput.ValueId)
+                                            {
+                                                pending.Enqueue((origin.Reference with { ValueId = assignment.ValueId }, true));
+                                            }
                                         }
                                     }
                                 }
@@ -1053,7 +1061,7 @@ namespace SetterChecker.Core
                                 if (d)
                                 {
                                     foreach (BehaviorValueReference source in origin.BoundReceiver
-                                        ?? value.InputValueIds.Select(input => origin.Reference with { ValueId = input }).ToArray())
+                                        ?? ReadInputs(origin))
                                     {
                                         pending.Enqueue((source, true));
                                     }
