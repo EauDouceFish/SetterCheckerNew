@@ -279,8 +279,7 @@ namespace SetterChecker.Core
                             sources.ReadBody(body);
                             effects.ReadDirect(body);
                             Schedule(body.MethodId);
-                        }
-                    }
+                        }                    }
                     if (!ready.TryDequeue(out string? current))
                     {
                         if (deferred.Count != 0)
@@ -2916,7 +2915,12 @@ namespace SetterChecker.Core
             {
                 return;
             }
-            this.m_results[output] = new[] { new ValueOrigin(output, value with { Id = output.ValueId }) };
+            ValueOrigin[] result = { new ValueOrigin(output, value with { Id = output.ValueId }) };
+            if (this.m_results.TryGetValue(output, out var old) && old.Select(Key).SequenceEqual(result.Select(Key)))
+            {
+                return;
+            }
+            this.m_results[output] = result;
             Notify(CallKey(method, call.Point));
         }
 

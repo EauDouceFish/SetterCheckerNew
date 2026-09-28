@@ -61,7 +61,8 @@ namespace SetterChecker.Core
                     {
                         continue;
                     }
-                    var (isStatic, slots) = write.ReceiverValueId is int receiver ? ClassifyRoot(body.MethodId, receiver) : (true, 0UL);
+                    var (isStatic, slots) = write.ReceiverValueId is int receiver ? ClassifyRoot(body.MethodId, receiver)
+                        : (!IsFrameworkStatic(this.m_catalog, write.Member), 0UL);
                     if (isStatic)
                     {
                         AddTop(body.MethodId, new TopCause(null, write.Point.BlockId, write.Member?.Name ?? write.Kind.ToString()));
@@ -186,6 +187,10 @@ namespace SetterChecker.Core
                             case BehaviorValueKind.Address:
                                 if (source.Member != null && source.InputValueIds.Count == 0)
                                 {
+                                    if (IsFrameworkStatic(this.m_catalog, source.Member))
+                                    {
+                                        break;
+                                    }
                                     return (true, slots);
                                 }
                                 if (source.InputValueIds.Count != 0)
@@ -268,6 +273,26 @@ namespace SetterChecker.Core
         }
 
         internal const string UnboundCallbackDetail = "调用未固定目标的委托参数，合法回调允许修改状态";
+
+        private static readonly System.Text.RegularExpressions.Regex s_frameworkTypeId = new(
+            @"^A\d+:(MSCORLIB|NETSTANDARD|SYSTEM(\.[A-Z0-9_]+)*|MICROSOFT\.[A-Z0-9_.]+)T\d+:", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        // R8：标准库类型自身的静态字段是运行时内部缓存（区域设置、资源字符串等），不属于战斗状态。
+        private static bool IsFrameworkStatic(MethodCatalogResult catalog, BehaviorMemberReference? member)
+        {
+            if (member == null)
+            {
+                return false;
+            }
+            if (catalog.TypesById.TryGetValue(member.DeclaringTypeDefinitionId, out TypeEntry? type))
+            {
+                string name = type.AssemblyName;
+                return name is "mscorlib" or "netstandard" or "System.Private.CoreLib"
+                    || name.StartsWith("System.", StringComparison.Ordinal) || name.StartsWith("Microsoft.", StringComparison.Ordinal)
+                    || name == "System";
+            }
+            return s_frameworkTypeId.IsMatch(member.DeclaringTypeDefinitionId);
+        }
 
         // 标准 List/Dictionary 构造只初始化新容器，与原有规则一致不展开其内部实现。
         private static bool IsStandardCollectionCtor(MethodCatalogResult catalog, ResolvedCallTarget target)
@@ -511,8 +536,8 @@ namespace SetterChecker.Core
                         this.m_ignoredLazyWrites++;
                         continue;
                     }
-                    IReadOnlyList<EffectRoot> targets = write.ReceiverValueId is int receiver
-                        ? ReadRoots(state, receiver, false) : new[] { EffectRoot.Static };
+                    IReadOnlyList<EffectRoot> targets = write.ReceiverValueId is int receiver ? ReadRoots(state, receiver, false)
+                        : IsFrameworkStatic(this.m_catalog, write.Member) ? Array.Empty<EffectRoot>() : new[] { EffectRoot.Static };
                     SummaryCause cause = new(write.Point, null, -1, write.Member?.Name ?? write.Kind.ToString());
                     foreach (EffectRoot target in targets)
                     {
@@ -979,7 +1004,10 @@ namespace SetterChecker.Core
                             case BehaviorValueKind.FieldRead:
                                 if (value.InputValueIds.Count == 0)
                                 {
-                                    Add(value.Member != null ? EffectRoot.Static : EffectRoot.UnknownOf(value.Reference ?? "写入对象来源尚未确定"));
+                                    if (!IsFrameworkStatic(this.m_catalog, value.Member))
+                                    {
+                                        Add(value.Member != null ? EffectRoot.Static : EffectRoot.UnknownOf(value.Reference ?? "写入对象来源尚未确定"));
+                                    }
                                 }
                                 else
                                 {
@@ -999,7 +1027,10 @@ namespace SetterChecker.Core
                             case BehaviorValueKind.Address:
                                 if (value.Member != null && value.InputValueIds.Count == 0)
                                 {
-                                    Add(EffectRoot.Static);
+                                    if (!IsFrameworkStatic(this.m_catalog, value.Member))
+                                    {
+                                        Add(EffectRoot.Static);
+                                    }
                                 }
                                 else if (value.InputValueIds.Count != 0)
                                 {
