@@ -64,6 +64,31 @@ namespace SetterChecker.Core.Tests
             CollectionAssert.AreEquivalent(new[] { moved, added }, material.SourceAssemblies.Single().SourcePaths.ToArray());
         }
 
+        // 构建图只取顶层 Nodes 中的 Csc 节点；属性顺序、嵌套内容和其他节点不影响源码程序集之间的引用识别。
+        /// <summary>流式读取合成构建图后，上层程序集仍以源码引用连接 khengine。</summary>
+        [TestMethod]
+        public async Task BuildGraphKeepsOnlyCscNodeInputsAndOutputs()
+        {
+            using TestProject project = TestProject.Create("namespace KH { public class Engine { } }",
+                registrations: "public class Registration { public KH.Engine Engine; }");
+            string graphPath = Path.Combine(project.RootPath, "Library/Bee/build.json");
+            string cscNodes;
+            using (JsonDocument original = JsonDocument.Parse(File.ReadAllText(graphPath)))
+            {
+                cscNodes = string.Join(",", original.RootElement.GetProperty("Nodes").EnumerateArray().Select(node =>
+                    $$"""{"Inputs":{{node.GetProperty("Inputs").GetRawText()}},"Env":[{"Key":"A","Value":[1,{"B":null}]}],"Annotation":{{node.GetProperty("Annotation").GetRawText()}},"Outputs":{{node.GetProperty("Outputs").GetRawText()}},"ToBuildDependencies":[1,2]}"""));
+            }
+            File.WriteAllText(graphPath, $$"""
+                {"Meta":{"Nodes":[{"Annotation":"Csc Fake"}]},"Nodes":[
+                {"Annotation":"CopyFiles Library/Bee/artifacts/build/khengine.runtime.dll","Inputs":{"Nested":["x.rsp"]},"Outputs":[1]},
+                {"Inputs":["a.txt"],"Outputs":["Library/Bee/artifacts/build/Other.dll"],"Annotation":"CscLike"},
+                {{cscNodes}}],"Tail":[{"Annotation":"Csc Late"}]}
+                """, new System.Text.UTF8Encoding(false));
+            MaterialSet material = await new MaterialLoader().LoadAsync(new(project.AssemblyDefinitionPath, 4));
+            CollectionAssert.AreEqual(new[] { "Assembly-CSharp", "khengine.runtime" }, material.SourceAssemblies.Select(assembly => assembly.Name).ToArray());
+            Assert.IsTrue(material.SourceAssemblies[0].Compilation.References.OfType<Microsoft.CodeAnalysis.CompilationReference>().Any());
+        }
+
         // 对照关闭跨函数来源后的未知结果，确保不会把缺失来源当成 Getter。
         /// <summary>直接 Setter 不受实验开关影响，工厂返回来源则必须明确未证明。</summary>
         [TestMethod]

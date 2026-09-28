@@ -1146,21 +1146,53 @@ namespace SetterChecker.Core
             string graphPath = Path.Combine(projectRoot, "Library", "Bee",
                 Path.GetFileName(Path.GetDirectoryName(rootResponsePath)!) + ".json");
             RequireFiles(new[] { graphPath }, "当前构建图的 JSON", rootResponsePath);
-            using JsonDocument graph = JsonDocument.Parse(File.ReadAllText(graphPath));
-            var nodes = graph.RootElement.GetProperty("Nodes").EnumerateArray()
-                .Where(node => node.GetProperty("Annotation").GetString()!.StartsWith("Csc ", StringComparison.Ordinal))
-                .Select(node => new
-                {
-                    Outputs = node.GetProperty("Outputs").EnumerateArray().Select(value => ResolvePath(projectRoot, value.GetString()!)).ToArray(),
-                    Response = node.GetProperty("Inputs").EnumerateArray().Select(value => ResolvePath(projectRoot, value.GetString()!))
-                        .Single(path => path.EndsWith(".rsp", StringComparison.OrdinalIgnoreCase)),
-                }).ToArray();
+            var nodes = ReadCscNodes(graphPath, projectRoot).Select(node => (node.Outputs,
+                Response: node.Inputs.Single(path => path.EndsWith(".rsp", StringComparison.OrdinalIgnoreCase)))).ToArray();
             if (!nodes.Any(node => string.Equals(node.Response, rootResponsePath, StringComparison.OrdinalIgnoreCase)))
             {
                 throw new AnalysisException($"当前构建图未声明根编译：{graphPath} => {rootResponsePath}");
             }
             return nodes.SelectMany(node => node.Outputs.Select(path => (Path: path, node.Response)))
                 .ToDictionary(item => item.Path, item => item.Response, StringComparer.OrdinalIgnoreCase);
+        }
+
+        // 用 Utf8JsonReader 顺序读取构建图的 Nodes，只保留 Annotation 以 "Csc " 开头的节点的输入和输出路径。
+        private static List<(string[] Inputs, string[] Outputs)> ReadCscNodes(string graphPath, string projectRoot)
+        {
+            ReadOnlySpan<byte> json = File.ReadAllBytes(graphPath);
+            Utf8JsonReader reader = new(json.StartsWith(Encoding.UTF8.Preamble) ? json[Encoding.UTF8.Preamble.Length..] : json);
+            List<(string[] Inputs, string[] Outputs)> nodes = new();
+            // 每个属性值处理完后统一 Skip：数组和对象跳到结尾，已读完的值不再移动。
+            for (reader.Read(); reader.Read() && reader.TokenType == JsonTokenType.PropertyName; reader.Skip())
+            {
+                bool isNodes = reader.ValueTextEquals("Nodes"u8);
+                for (reader.Read(); isNodes && reader.Read() && reader.TokenType == JsonTokenType.StartObject;)
+                {
+                    bool? csc = null;
+                    string[]? inputs = null, outputs = null;
+                    for (; reader.Read() && reader.TokenType == JsonTokenType.PropertyName; reader.Skip())
+                    {
+                        bool isAnnotation = reader.ValueTextEquals("Annotation"u8), isInputs = reader.ValueTextEquals("Inputs"u8);
+                        bool isPaths = (isInputs || reader.ValueTextEquals("Outputs"u8)) && csc != false;
+                        reader.Read();
+                        if (isAnnotation)
+                        {
+                            csc = reader.GetString()!.StartsWith("Csc ", StringComparison.Ordinal);
+                        }
+                        else if (isPaths)
+                        {
+                            (isInputs ? ref inputs : ref outputs) = JsonElement.ParseValue(ref reader).EnumerateArray()
+                                .Select(value => ResolvePath(projectRoot, value.GetString()!)).ToArray();
+                        }
+                    }
+                    if (csc ?? throw new AnalysisException($"当前构建图节点缺少 Annotation：{graphPath}"))
+                    {
+                        nodes.Add((inputs ?? throw new AnalysisException($"当前构建图 Csc 节点缺少 Inputs：{graphPath}"),
+                            outputs ?? throw new AnalysisException($"当前构建图 Csc 节点缺少 Outputs：{graphPath}")));
+                    }
+                }
+            }
+            return nodes;
         }
 
         // 解析一份 Unity 编译响应文件并核对其中的真实路径。
@@ -1317,7 +1349,6 @@ namespace SetterChecker.Core
                     }
                     return ValueTask.CompletedTask;
                 }).ConfigureAwait(false);
-
             return trees;
         }
 
