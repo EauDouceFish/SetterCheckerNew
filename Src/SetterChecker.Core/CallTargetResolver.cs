@@ -1604,9 +1604,10 @@ namespace SetterChecker.Core
                     }
                     foreach (ValueOrigin origin in local)
                     {
-                        // 常量、类型对象和库函数新建的对象都不可能是带源码重写的业务对象。
+                        // 常量、类型对象、数组（元素另行展开）和库函数新建的对象都不可能是带源码重写的业务对象。
                         if (IsNull(origin) || origin.Value.Kind is BehaviorValueKind.Function or BehaviorValueKind.Constant
-                            or BehaviorValueKind.Computation or BehaviorValueKind.Type || IsLibraryCreated(origin))
+                            or BehaviorValueKind.Computation or BehaviorValueKind.Type or BehaviorValueKind.NewArray
+                            || origin.Value.Type?.Id.EndsWith(']') == true || IsLibraryCreated(origin))
                         {
                             continue;
                         }

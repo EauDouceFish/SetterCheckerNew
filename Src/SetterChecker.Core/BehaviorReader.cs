@@ -647,6 +647,11 @@ namespace SetterChecker.Core
                         return allocated;
                     case IConversionOperation conversion:
                         int converted = ReadOperation(conversion.Operand);
+                        if (conversion.OperatorMethod == null && conversion.Operand.Type is { IsValueType: true } && conversion.Type is { IsReferenceType: true })
+                        {
+                            // 装箱新建一个实际类型为该值类型的对象；框架对装箱对象的修改不影响原存储。
+                            return Add(BehaviorValueKind.NewObject, conversion.Operand.Type, new[] { converted });
+                        }
                         return conversion.OperatorMethod == null ? Add(conversion.Conversion.IsNumeric
                             ? BehaviorValueKind.Computation : BehaviorValueKind.Conversion, conversion.Type, new[] { converted },
                             reference: conversion.IsTryCast ? "isinst" : null)
