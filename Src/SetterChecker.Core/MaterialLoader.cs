@@ -50,20 +50,20 @@ namespace SetterChecker.Core
                 string reportRoot = FindReportRoot(assemblyDefinitionPath, projectRoot);
                 string assemblyName = ReadAssemblyDefinition(assemblyDefinitionPath).Name;
                 string responsePath = FindRootResponse(projectRoot, assemblyName);
+                HashSet<string> editorOnlyAssemblies = new(StringComparer.Ordinal) { "Assembly-CSharp-Editor", "Assembly-CSharp-Editor-firstpass" };
                 IReadOnlyList<CompilerResponse> responses = ReadResponseClosure(
                     projectRoot,
                     responsePath,
                     request.SourceTexts,
                     request.Jobs,
+                    editorOnlyAssemblies,
                     cancellationToken);
-                HashSet<string> editorOnlyAssemblies = ReadEditorOnlyReportAssemblies(reportRoot).ToHashSet(StringComparer.Ordinal);
-                foreach (string name in responses.Select(response => response.AssemblyName))
+                if (editorOnlyAssemblies.Contains(assemblyName))
                 {
-                    if (name.EndsWith("-Editor", StringComparison.Ordinal) || name.EndsWith("-Editor-firstpass", StringComparison.Ordinal))
-                    {
-                        editorOnlyAssemblies.Add(name);
-                    }
+                    throw new AnalysisException($"分析目标被声明为编辑器或测试程序集：{assemblyName}");
                 }
+                editorOnlyAssemblies.IntersectWith(responses.Select(response => response.AssemblyName));
+                responses = SelectPlayerAssemblies(responses, editorOnlyAssemblies);
                 timings.Add("编译参数读取", stage.Elapsed.TotalSeconds);
                 stage.Restart();
                 IReadOnlyDictionary<string, ParsedSource> trees = await ParseSourcesAsync(
@@ -246,19 +246,24 @@ namespace SetterChecker.Core
             return Convert.ToHexString(hash.GetHashAndReset());
         }
 
-        // 只排除 asmdef 明确声明仅用于编辑器的报告程序集，不删除分析材料。
-        private static IReadOnlySet<string> ReadEditorOnlyReportAssemblies(string reportRoot)
+        // R4：编辑器和测试程序集不进真机包；未被保留程序集引用的不再解析和编译，被引用的仅参与编译。
+        private static IReadOnlyList<CompilerResponse> SelectPlayerAssemblies(IReadOnlyList<CompilerResponse> responses, IReadOnlySet<string> editorOnly)
         {
-            Dictionary<string, (bool Excluded, string Path)> definitions = new(StringComparer.Ordinal);
-            foreach (string path in Directory.EnumerateFiles(reportRoot, "*.asmdef", SearchOption.AllDirectories))
+            Dictionary<string, CompilerResponse> byName = responses.ToDictionary(response => response.AssemblyName, StringComparer.Ordinal);
+            HashSet<string> kept = responses.Where(response => !editorOnly.Contains(response.AssemblyName))
+                .Select(response => response.AssemblyName).ToHashSet(StringComparer.Ordinal);
+            Queue<string> pending = new(kept.Order(StringComparer.Ordinal));
+            while (pending.TryDequeue(out string? name))
             {
-                var definition = ReadAssemblyDefinition(path);
-                if (!definitions.TryAdd(definition.Name, (definition.EditorOnly || definition.TestOnly, path)))
+                foreach (CompilerReference reference in byName[name].References)
                 {
-                    throw new AnalysisException($"报告包内程序集定义名称重复：{definition.Name}；{definitions[definition.Name].Path}；{path}");
+                    if (reference.SourceAssemblyName is string source && byName.ContainsKey(source) && kept.Add(source))
+                    {
+                        pending.Enqueue(source);
+                    }
                 }
             }
-            return definitions.Where(pair => pair.Value.Excluded).Select(pair => pair.Key).ToHashSet(StringComparer.Ordinal);
+            return responses.Where(response => kept.Contains(response.AssemblyName)).ToArray();
         }
 
         // 从输入程序集定义向上找到包含 package.json 的目标包目录。
@@ -997,6 +1002,7 @@ namespace SetterChecker.Core
             string rootResponsePath,
             IReadOnlyDictionary<string, string> sourceTexts,
             int jobs,
+            HashSet<string> editorOnly,
             CancellationToken cancellationToken)
         {
             IReadOnlyDictionary<string, string> outputs = ReadBuildOutputs(projectRoot, rootResponsePath);
@@ -1016,12 +1022,12 @@ namespace SetterChecker.Core
                 RequireFiles(response.AdditionalFilePaths.Where(checkedPaths.Add), "附加文件", path);
                 return response;
             }).ToArray();
-            return RefreshSourcePaths(projectRoot, responses, sourceTexts, jobs, cancellationToken);
+            return RefreshSourcePaths(projectRoot, responses, sourceTexts, jobs, editorOnly, cancellationToken);
         }
 
-        // 沿当前资产目录和已参与编译的包重新归属源码，编译选项及引用仍来自构建节点。
+        // 沿当前资产目录和已参与编译的包重新归属源码，编译选项及引用仍来自构建节点；同时收集编辑器与测试程序集（R4）。
         private static IReadOnlyList<CompilerResponse> RefreshSourcePaths(string projectRoot, CompilerResponse[] responses,
-            IReadOnlyDictionary<string, string> sourceTexts, int jobs, CancellationToken cancellationToken)
+            IReadOnlyDictionary<string, string> sourceTexts, int jobs, HashSet<string> editorOnly, CancellationToken cancellationToken)
         {
             HashSet<string> roots = new(StringComparer.OrdinalIgnoreCase);
             string assets = Path.Combine(projectRoot, "Assets");
@@ -1069,7 +1075,12 @@ namespace SetterChecker.Core
             Dictionary<string, string> guids = new(StringComparer.OrdinalIgnoreCase);
             foreach (string path in files.Where(path => path.EndsWith(".asmdef", StringComparison.OrdinalIgnoreCase)))
             {
-                string name = ReadAssemblyDefinition(path).Name;
+                var definition = ReadAssemblyDefinition(path);
+                string name = definition.Name;
+                if (definition.EditorOnly || definition.TestOnly)
+                {
+                    editorOnly.Add(name);
+                }
                 owners.Add(Path.GetDirectoryName(path)!, name);
                 if (File.Exists(path + ".meta"))
                 {
