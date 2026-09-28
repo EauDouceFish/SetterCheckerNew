@@ -1787,6 +1787,33 @@ namespace SetterChecker.Core.Tests
             }
         }
 
+        // T28（R10）：外层写入全部经由显式 [LogTrack] 的内层函数完成时，外层裸 NLT 不报缺少 Reason；直接写入的裸 NLT 仍报。
+        /// <summary></summary>
+        [TestMethod]
+        public async Task LoggedInnerSetterKeepsOuterNoLogTrack()
+        {
+            using TestProject project = TestProject.Create(Attributes + """
+                namespace KH
+                {
+                    public sealed class LogTrackAttribute : System.Attribute { public LogTrackAttribute(long flag = 0) { } }
+                    public class Model
+                    {
+                        private int m_x;
+                        [LogTrack(1)] private void x_checksum_setter(int value) { m_x = value; }
+                        [NoLogTrack] public void SetX(int value) { x_checksum_setter(value); }
+                        [NoLogTrack] public void SetDirect(int value) { m_x = value; }
+                    }
+                }
+                """);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(project.Request(4));
+            AnnotationMethod wrapped = run.Annotations.Methods.Single(method => method.Name == "SetX");
+            AnnotationMethod direct = run.Annotations.Methods.Single(method => method.Name == "SetDirect");
+            Assert.AreEqual(MethodEffectKind.Setter, wrapped.Actual);
+            Assert.IsFalse(wrapped.MissingReason);
+            Assert.AreEqual(MethodEffectKind.Setter, direct.Actual);
+            Assert.IsTrue(direct.MissingReason);
+        }
+
         // T27（R9）：带参数的空函数是日志打点，保持记录；无参数的空函数照常建议 NoLogTrack。
         /// <summary></summary>
         [TestMethod]
@@ -1988,6 +2015,20 @@ namespace SetterChecker.Core.Tests
                 public static System.Collections.Generic.List<int> Entry() { {{body}} }
             }
             """, MethodEffectKind.Setter);
+
+        // T29（R2 放宽）：懒加载分支中新建后只填充这个新对象不算修改；分支内把 F 改指向已有对象再修改，仍为 Setter。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow("if (s_list == null) { s_list = new System.Collections.Generic.List<int>(); for (int i = 0; i < 3; i++) { s_list.Add(0); } }", false)]
+        [DataRow("if (s_list == null) { s_list = new System.Collections.Generic.List<int>(); s_list = s_shared; s_list.Add(0); }", true)]
+        public Task LazyFillOnlyTouchesNewObject(string body, bool setter) => AssertEntry($$"""
+            public class Calls
+            {
+                private static System.Collections.Generic.List<int> s_list;
+                private static System.Collections.Generic.List<int> s_shared = new System.Collections.Generic.List<int>();
+                public static System.Collections.Generic.List<int> Entry() { {{body}} return s_list; }
+            }
+            """, setter ? MethodEffectKind.Setter : MethodEffectKind.Getter);
 
         // T15：与诊断类型同名但程序集不同的类型仍按普通代码分析。
         /// <summary></summary>

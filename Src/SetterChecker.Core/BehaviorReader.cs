@@ -130,6 +130,7 @@ namespace SetterChecker.Core
             private readonly List<BehaviorValue> m_values = new();
             private readonly List<BehaviorAssignment> m_assignments = new();
             private readonly List<BehaviorWrite> m_writes = new();
+            private readonly List<(IFieldSymbol Field, int Start, int End, int Value)> m_lazyFills = new();
             private readonly List<BehaviorCall> m_calls = new();
             private readonly List<BehaviorReturn> m_returns = new();
             private readonly List<string> m_failures = new();
@@ -320,7 +321,9 @@ namespace SetterChecker.Core
                 StatementSyntax body = statement;
                 if (holder is BlockSyntax block)
                 {
-                    if (block.Statements.Count(item => item is not EmptyStatementSyntax) != 1)
+                    // R2 放宽：新建语句必须是分支第一句；其后只要不再改写或传出 F，其余语句照常分析。
+                    if (block.Statements.FirstOrDefault(item => item is not EmptyStatementSyntax) != statement
+                        || block.DescendantNodes().Any(node => node != assignment && WritesField(node, field.Field)))
                     {
                         return false;
                     }
@@ -329,6 +332,28 @@ namespace SetterChecker.Core
                 }
                 return holder is IfStatementSyntax branch && branch.Else == null && branch.Statement == body
                     && IsNullCheckOf(branch.Condition, field.Field);
+            }
+
+            // 语法节点改写字段 F，或以 ref/out 传出 F。
+            private bool WritesField(SyntaxNode node, IFieldSymbol field) => node switch
+            {
+                AssignmentExpressionSyntax other => IsSameField(other.Left, field),
+                ArgumentSyntax argument => !argument.RefKindKeyword.IsKind(SyntaxKind.None) && IsSameField(argument.Expression, field),
+                PrefixUnaryExpressionSyntax or PostfixUnaryExpressionSyntax => node.ChildNodes().OfType<ExpressionSyntax>().Any(operand => IsSameField(operand, field)),
+                _ => false,
+            };
+
+            // R2 放宽：懒加载分支中新建赋值之后读取 F，得到的就是刚新建的对象。
+            private int? ReadLazyFill(IFieldReferenceOperation field)
+            {
+                foreach (var (symbol, start, end, value) in this.m_lazyFills)
+                {
+                    if (SymbolEqualityComparer.Default.Equals(symbol, field.Field) && field.Syntax.SpanStart >= start && field.Syntax.Span.End <= end)
+                    {
+                        return value;
+                    }
+                }
+                return null;
             }
 
             // 只接受裸字段名或 this.F，other.F 或 Type.F 不适用。
@@ -542,6 +567,10 @@ namespace SetterChecker.Core
                         return Write(increment.Target, increment.OperatorMethod == null ? Add(BehaviorValueKind.Computation, increment.Type, new[] { old })
                             : AddCall(increment.OperatorMethod, null, new[] { new BehaviorArgument(old, RefKind.None) }));
                     case IFieldReferenceOperation field:
+                        if (field.Instance is null or IInstanceReferenceOperation && ReadLazyFill(field) is int fresh)
+                        {
+                            return fresh;
+                        }
                         return Add(BehaviorValueKind.FieldRead, field.Type, field.Instance == null ? Array.Empty<int>() : new[] { ReadOperation(field.Instance) },
                             member: this.m_catalog.ReadSourceMemberReference(field.Field, this.m_method.AssemblyPath!));
                     case IPropertyReferenceOperation property:
@@ -917,11 +946,16 @@ namespace SetterChecker.Core
                         this.m_assignments.Add(new BehaviorAssignment(parameterSlot, value, Point()));
                         break;
                     case IFieldReferenceOperation field:
+                        bool lazy = IsLazyInitialization(field);
                         this.m_writes.Add(new BehaviorWrite(BehaviorWriteKind.Field, field.Instance == null ? null : ReadOperation(field.Instance),
                             this.m_catalog.ReadSourceMemberReference(field.Field, this.m_method.AssemblyPath!), Array.Empty<int>(), value, Point())
                         {
-                            IsLazyInitialization = IsLazyInitialization(field),
+                            IsLazyInitialization = lazy,
                         });
+                        if (lazy && field.Syntax.Parent?.Parent?.Parent is BlockSyntax fill)
+                        {
+                            this.m_lazyFills.Add((field.Field, field.Syntax.Parent.Parent.Span.End, fill.Span.End, value));
+                        }
                         break;
                     case IPropertyReferenceOperation property:
                         ReadAccessorCall(property.Property.SetMethod ?? throw new AnalysisException($"属性没有写入函数：{property.Property}"),

@@ -15,6 +15,45 @@ namespace SetterChecker.Core
         {
             Stopwatch watch = Stopwatch.StartNew();
             Dictionary<string, MethodEffect> facts = effects.Methods.ToDictionary(method => method.MethodId);
+            Dictionary<string, MethodEntry> entries = (calls?.Methods ?? Array.Empty<MethodEntry>()).GroupBy(method => method.Id, StringComparer.Ordinal)
+                .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
+            ILookup<string, ResolvedCall> callsByCaller = (calls?.Calls ?? Array.Empty<ResolvedCall>()).ToLookup(call => call.CallerMethodId, StringComparer.Ordinal);
+            Dictionary<string, bool> loggedOnly = new(StringComparer.Ordinal);
+
+            // R10：函数自身没有写入，可能写入的调用都指向显式 [LogTrack] 函数或同样满足本条的函数时，它的战斗写入都会被记录。
+            bool WritesOnlyThroughLogged(string id, HashSet<string> visiting)
+            {
+                if (loggedOnly.TryGetValue(id, out bool known))
+                {
+                    return known;
+                }
+                if (calls == null || !visiting.Add(id) || !calls.Behaviors.MethodsById.TryGetValue(id, out MethodBehavior? body) || body.Failure != null)
+                {
+                    return false;
+                }
+                ResolvedCall[] own = callsByCaller[id].ToArray();
+                HashSet<BehaviorFlowPoint> resolved = own.Select(call => call.Call.Point).ToHashSet();
+                bool result = body.Writes.All(write => write.IsLazyInitialization) && body.Calls.All(call => resolved.Contains(call.Point));
+                foreach (ResolvedCall call in own)
+                {
+                    if (!result)
+                    {
+                        break;
+                    }
+                    if (call.ValuesOnly || call.RuntimeRule != null && call.RuntimeRule.Operation != RuntimeOperation.WriteCollection)
+                    {
+                        continue;
+                    }
+                    result = call.RuntimeRule == null && !call.InvokesUnboundParameter && call.Failure == null && call.Targets.All(target =>
+                        facts.GetValueOrDefault(target.MethodId)?.Kind == MethodEffectKind.Getter
+                        || entries.TryGetValue(target.MethodId, out MethodEntry? callee) && callee.SourceSymbol != null
+                            && FindAttribute(callee.SourceSymbol, "KH.LogTrackAttribute") != null
+                        || WritesOnlyThroughLogged(target.MethodId, visiting));
+                }
+                visiting.Remove(id);
+                loggedOnly[id] = result;
+                return result;
+            }
             List<AnnotationMethod> methods = new();
             foreach (MethodEntry method in roots.OrderBy(method => method.Id, StringComparer.Ordinal))
             {
@@ -42,10 +81,11 @@ namespace SetterChecker.Core
                     && calls != null && calls.Behaviors.MethodsById.TryGetValue(method.Id, out MethodBehavior? body)
                     && body.Failure == null && body.Writes.Count == 0 && body.Calls.Count == 1
                     && body.Calls[0].Target.SourceSymbol?.ContainingType.TypeKind == TypeKind.Interface;
+                bool logged = sourceNlt && failure == null && actual == MethodEffectKind.Setter && WritesOnlyThroughLogged(method.Id, new(StringComparer.Ordinal));
                 methods.Add(new AnnotationMethod(method.Id, method.TypeName, method.Name, method.SourcePath!, method.Line,
                     sourceNlt, actual, decision, failure,
-                    failure == null && actual == MethodEffectKind.Setter && nlt != null && !reason && !nltClass,
-                    failure == null && actual == MethodEffectKind.Setter && (reason || nltClass),
+                    failure == null && actual == MethodEffectKind.Setter && nlt != null && !reason && !nltClass && !logged,
+                    failure == null && actual == MethodEffectKind.Setter && (reason || nltClass) && !logged,
                     method.IsReportable && failure == null && actual == MethodEffectKind.Getter
                         && !sourceNlt && !log && decision == "NoLogTrack",
                     facts.GetValueOrDefault(method.Id)?.Evidence ?? effects.Failures.GetValueOrDefault(method.Id))
