@@ -662,6 +662,7 @@ namespace SetterChecker.Core.Tests
                 namespace KH
                 {
                     public interface IRuntimeMethodProxy { }
+                    public static class Store { public static int state; }
                     public class RuntimeMethodProxy<TInterface, TInstance>
                         where TInterface : IRuntimeMethodProxy where TInstance : new()
                     {
@@ -689,7 +690,8 @@ namespace SetterChecker.Core.Tests
                 {
                     public static void Init() { KH.ConfigProxy.SetImpl(new Second()); }
                 }
-                """.Replace("CHANGE", writes ? "count++;" : ""));
+                """.Replace("CHANGE", writes ? "KH.Store.state++;" : ""));
+            // V3 归属规则：Assembly-CSharp 自身的静态字段不是战斗状态，实现改写 khengine 的 Store 以保持测试意图。
             var result = await project.AnalyzeAsync("KH.ConfigProxy", "GetBasePath");
             Assert.AreEqual(writes ? MethodEffectKind.Setter : MethodEffectKind.Getter, result.Effects.Methods.Single().Kind);
             MethodEntry root = result.Calls.Methods.Single(method => method.Id == result.Effects.Methods.Single().MethodId);
@@ -710,6 +712,7 @@ namespace SetterChecker.Core.Tests
                 namespace KH
                 {
                     public class KHScript { }
+                    public static class Store { public static int state; }
                     public static class KHScriptManager
                     {
                         public delegate System.Type ExternalGetScriptType(int scriptType);
@@ -741,18 +744,18 @@ namespace SetterChecker.Core.Tests
                 using ExternalLibrary;
                 public static class Mode
                 {
-                    private static int state;
                     public static void Init()
                     {
-                        state++;
+                        KH.Store.state++;
                         KH.KHScriptManager.RegisterModeHook(GetScriptType, GetScript, GetScriptId);
                     }
                     private static System.Type GetScriptType(int id) { CHANGE return typeof(KH.KHScript); }
-                    private static KH.KHScript GetScript(int id) { state++; return null; }
-                    private static int GetScriptId(System.Type type) { state++; return 1; }
+                    private static KH.KHScript GetScript(int id) { KH.Store.state++; return null; }
+                    private static int GetScriptId(System.Type type) { KH.Store.state++; return 1; }
+                    // V3 归属规则：Assembly-CSharp 自身的静态字段不是战斗状态，各槽改写 khengine 的 Store 以保持测试意图。
                     public static void Unrelated() { "editor".RegisterModeHook<int>(_ => { }); }
                 }
-                """.Replace("CHANGE", writes ? "state++;" : ""), librarySource: """
+                """.Replace("CHANGE", writes ? "KH.Store.state++;" : ""), librarySource: """
                 namespace ExternalLibrary
                 {
                     public static class Extensions
@@ -1162,6 +1165,7 @@ namespace SetterChecker.Core.Tests
                 using System;
                 namespace KH
                 {
+                    public static class Store { public static int state; }
                     public class Handler
                     {
                         private Action _callback;
@@ -1172,11 +1176,11 @@ namespace SetterChecker.Core.Tests
                 """, registrations: """
                 public static class Register
                 {
-                    private static int state;
-                    private static void Write() { state++; }
+                    private static void Write() { KH.Store.state++; }
                     public static void Setup() { new KH.Handler(Write); }
                 }
                 """);
+            // V3 归属规则：Assembly-CSharp 自身的静态字段不是战斗状态，回调改写 khengine 的 Store 以保持测试意图。
             var result = await project.AnalyzeAsync("KH.Handler", "Run");
             Assert.AreEqual(MethodEffectKind.Setter, result.Effects.Methods.Single().Kind);
         }
@@ -1190,6 +1194,7 @@ namespace SetterChecker.Core.Tests
                 using System;
                 namespace KH
                 {
+                    public static class Store { public static int state; }
                     public class Handler
                     {
                         private Action _callback;
@@ -1200,8 +1205,7 @@ namespace SetterChecker.Core.Tests
                 """, registrations: """
                 public static class Register
                 {
-                    private static int state;
-                    private static void Write() { state++; }
+                    private static void Write() { KH.Store.state++; }
                     public static void Setup()
                     {
                         KH.Handler handler = new KH.Handler();
@@ -1209,6 +1213,7 @@ namespace SetterChecker.Core.Tests
                     }
                 }
                 """);
+            // V3 归属规则：Assembly-CSharp 自身的静态字段不是战斗状态，回调改写 khengine 的 Store 以保持测试意图。
             var result = await project.AnalyzeAsync("KH.Handler", "Run");
             Assert.AreEqual(MethodEffectKind.Setter, result.Effects.Methods.Single().Kind);
         }

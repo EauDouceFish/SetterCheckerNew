@@ -349,7 +349,9 @@ namespace SetterChecker.Core
         private static bool IsReadOnlyMember(string name) => name.StartsWith("Contains", StringComparison.Ordinal)
             || name.StartsWith("get_", StringComparison.Ordinal) || name.StartsWith("Find", StringComparison.Ordinal)
             || name is "TryGetValue" or "IndexOf" or "LastIndexOf" or "Exists" or "TrueForAll" or "BinarySearch" or "GetEnumerator"
-                or "ToArray" or "CopyTo" or "Equals" or "GetHashCode" or "ToString" or "GetType";
+                or "ToArray" or "CopyTo" or "Equals" or "GetHashCode" or "ToString" or "GetType" or "Peek" or "TryPeek" or "GetRange"
+                or "ConvertAll" or "AsReadOnly" or "IsSubsetOf" or "IsSupersetOf" or "IsProperSubsetOf" or "IsProperSupersetOf" or "Overlaps"
+                or "SetEquals" or "CompareTo";
 
         // 标准集合或实现了 ICollection<T>、IList、IDictionary 的外部类型。
         private static bool IsCollectionType(MethodCatalogResult catalog, TypeEntry type)
@@ -364,7 +366,7 @@ namespace SetterChecker.Core
             || name.StartsWith("System.Collections.Concurrent.", StringComparison.Ordinal);
 
         // 从类型身份 A{n}:{程序集}T{m}:{元数据名} 取出最外层元数据名；原始类型、泛型参数身份原样截取。
-        private static string ReadMetadataName(string identity)
+        internal static string ReadMetadataName(string identity)
         {
             if (identity.Length > 1 && identity[0] == 'A' && char.IsAsciiDigit(identity[1]))
             {

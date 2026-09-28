@@ -1575,7 +1575,18 @@ namespace SetterChecker.Core
             {
                 using var callbackTiming = sources.Timing.Measure(AnalysisTiming.Part.Dispatch);
                 BehaviorValueReference[] contents = libraryTarget.Receiver.Concat(libraryTarget.Arguments.SelectMany(values => values)).Distinct().ToArray();
-                foreach (BehaviorValueReference value in contents)
+                MethodEntry libraryMethod = sources.ReadMethod(libraryTarget.MethodId);
+                TypeEntry libraryOwner = catalog.TypesById[libraryMethod.TypeId];
+                HashSet<string> receiverVisible = new(s_frameworkProtocols, StringComparer.Ordinal) { RuntimeOperations.ReadMetadataName(libraryOwner.LogicalId) };
+                receiverVisible.UnionWith(catalog.ReadInheritedTypes(libraryOwner).Select(relation => RuntimeOperations.ReadMetadataName(relation.Definition.LogicalId)));
+                // 库函数只能经它看得到的静态类型调用虚成员：接收对象按声明类型及其祖先，实参按形参声明类型，另加框架通用协议。
+                IEnumerable<(BehaviorValueReference Value, IReadOnlySet<string> Visible)> visibleValues = libraryTarget.Receiver
+                    .Select(value => (value, (IReadOnlySet<string>)receiverVisible))
+                    .Concat(libraryTarget.Arguments.SelectMany((values, index) => values.Select(value => (value, (IReadOnlySet<string>)new HashSet<string>(s_frameworkProtocols, StringComparer.Ordinal)
+                    {
+                        RuntimeOperations.ReadMetadataName(index < libraryMethod.Parameters.Count ? libraryMethod.Parameters[index].TypeId : "System.Object"),
+                    }))));
+                foreach (var (value, visible) in visibleValues)
                 {
                     ValueOrigin[] local = (sources.ReadFixedReceiver(value) is ValueOrigin fixedValue ? new[] { fixedValue }
                         : sources.ReadLocalOrigins(value)).ToArray();
@@ -1634,7 +1645,7 @@ namespace SetterChecker.Core
                             }
                             continue;
                         }
-                        foreach (ResolvedMethodDefinition implementation in ReadFrameworkCallbacks(catalog, origin, dispatch))
+                        foreach (ResolvedMethodDefinition implementation in ReadFrameworkCallbacks(catalog, origin, visible, dispatch))
                         {
                             if (await AddTarget(Callback(implementation, new[] { value }, null, contents)).ConfigureAwait(false))
                             {
@@ -1680,14 +1691,16 @@ namespace SetterChecker.Core
         }
 
         // 值的实际类型范围（新对象只取自身，其余含全部派生类型，以及它们的源码祖先）中，重写或实现外部库虚成员的源码函数。
-        private static IReadOnlyList<ResolvedMethodDefinition> ReadFrameworkCallbacks(MethodCatalogResult catalog, ValueOrigin origin, DispatchIndex dispatch)
+        private static IReadOnlyList<ResolvedMethodDefinition> ReadFrameworkCallbacks(MethodCatalogResult catalog, ValueOrigin origin, IReadOnlySet<string> visible,
+            DispatchIndex dispatch)
         {
             BehaviorTypeReference? type = origin.Value.Type;
             bool known = type != null && !type.Id.StartsWith('!') && !type.Id.EndsWith(']') && !type.Id.EndsWith('*') && !type.Id.EndsWith('&');
             TypeEntry definition = known ? catalog.ResolveTypeDefinition(type!) : catalog.ReadPrimitiveType("System.Object");
             IReadOnlyList<TypeIdentityTemplate> arguments = known ? catalog.ReadResolvedTypeArguments(type!) : Array.Empty<TypeIdentityTemplate>();
             bool exact = known && origin.Value.Kind == BehaviorValueKind.NewObject;
-            string key = (exact ? "exact:" : "derived:") + definition.Id + "|" + string.Join(',', arguments.Select(argument => argument.Text));
+            string key = (exact ? "exact:" : "derived:") + definition.Id + "|" + string.Join(',', arguments.Select(argument => argument.Text))
+                + "|" + string.Join(',', visible.Order(StringComparer.Ordinal));
             if (dispatch.Callbacks.TryGetValue(key, out IReadOnlyList<ResolvedMethodDefinition>? cached))
             {
                 return cached;
@@ -1716,8 +1729,12 @@ namespace SetterChecker.Core
             HashSet<string> seen = new(StringComparer.Ordinal);
             foreach (var (candidate, candidateArguments) in range.Where(item => item.Type.SourceSymbol != null && item.Type.IsCandidate))
             {
-                foreach (IMethodSymbol symbol in ReadFrameworkOverrides(catalog, candidate, dispatch))
+                foreach (var (symbol, contracts) in ReadFrameworkOverrides(catalog, candidate, dispatch))
                 {
+                    if (!contracts.Overlaps(visible))
+                    {
+                        continue;
+                    }
                     MethodEntry method = catalog.ReadSourceDeclaration(symbol, candidate.AssemblyPath!);
                     if (seen.Add(method.Id + "|" + string.Join(',', candidateArguments.Select(argument => argument.Text))))
                     {
@@ -1730,22 +1747,30 @@ namespace SetterChecker.Core
         }
 
         // 源码类型中重写外部库虚函数或实现外部库接口成员的函数，每个类型只计算一次。
-        private static IReadOnlyList<IMethodSymbol> ReadFrameworkOverrides(MethodCatalogResult catalog, TypeEntry type, DispatchIndex dispatch)
+        private static IReadOnlyList<(IMethodSymbol Member, IReadOnlySet<string> Contracts)> ReadFrameworkOverrides(MethodCatalogResult catalog, TypeEntry type, DispatchIndex dispatch)
         {
-            if (dispatch.FrameworkOverrides.TryGetValue(type.Id, out IReadOnlyList<IMethodSymbol>? known))
+            if (dispatch.FrameworkOverrides.TryGetValue(type.Id, out IReadOnlyList<(IMethodSymbol, IReadOnlySet<string>)>? known))
             {
                 return known;
             }
             INamedTypeSymbol symbol = type.SourceSymbol!;
-            List<IMethodSymbol> result = new();
+            Dictionary<IMethodSymbol, HashSet<string>> result = new(SymbolEqualityComparer.Default);
+            void Add(IMethodSymbol member, string contract)
+            {
+                IMethodSymbol key = member.OriginalDefinition;
+                if (!result.TryGetValue(key, out HashSet<string>? contracts))
+                {
+                    result.Add(key, contracts = new(StringComparer.Ordinal));
+                }
+                contracts.Add(contract);
+            }
             foreach (IMethodSymbol member in symbol.GetMembers().OfType<IMethodSymbol>().Where(member => member.IsOverride))
             {
                 for (IMethodSymbol? overridden = member.OverriddenMethod; overridden != null; overridden = overridden.OverriddenMethod)
                 {
                     if (catalog.IsLibraryAssembly(overridden.ContainingAssembly.Name))
                     {
-                        result.Add(member);
-                        break;
+                        Add(member, MetadataName(overridden.ContainingType));
                     }
                 }
             }
@@ -1754,23 +1779,47 @@ namespace SetterChecker.Core
                 foreach (IMethodSymbol member in contract.GetMembers().OfType<IMethodSymbol>())
                 {
                     if (symbol.FindImplementationForInterfaceMember(member) is IMethodSymbol implementation
-                        && implementation.Locations.Any(location => location.IsInSource) && !result.Contains(implementation, SymbolEqualityComparer.Default))
+                        && implementation.Locations.Any(location => location.IsInSource))
                     {
-                        result.Add(implementation);
+                        Add(implementation, MetadataName(contract));
                     }
                 }
             }
-            IMethodSymbol[] ordered = result.Select(method => method.OriginalDefinition).Distinct<IMethodSymbol>(SymbolEqualityComparer.Default)
-                .OrderBy(method => method.ToDisplayString(), StringComparer.Ordinal).ToArray();
+            (IMethodSymbol, IReadOnlySet<string>)[] ordered = result.OrderBy(pair => pair.Key.ToDisplayString(), StringComparer.Ordinal)
+                .Select(pair => (pair.Key, (IReadOnlySet<string>)pair.Value)).ToArray();
             dispatch.FrameworkOverrides.Add(type.Id, ordered);
             return ordered;
         }
+
+        // 外部库类型的元数据全名（命名空间加元数据名，嵌套类型用 + 连接），与类型身份中的名称一致。
+        private static string MetadataName(INamedTypeSymbol type)
+        {
+            INamedTypeSymbol definition = type.OriginalDefinition;
+            string name = definition.MetadataName;
+            for (INamedTypeSymbol? outer = definition.ContainingType; outer != null; outer = outer.ContainingType)
+            {
+                name = outer.MetadataName + "+" + name;
+            }
+            return definition.ContainingNamespace is { IsGlobalNamespace: false } space ? space.ToDisplayString() + "." + name : name;
+        }
+
+        // 框架代码对任意对象都可能经由这些通用协议调用业务实现（比较、相等、格式化、枚举、释放、集合访问）。
+        private static readonly HashSet<string> s_frameworkProtocols = new(StringComparer.Ordinal)
+        {
+            "System.Object", "System.IComparable", "System.IComparable`1", "System.IEquatable`1", "System.IFormattable", "System.IConvertible",
+            "System.ICloneable", "System.IDisposable", "System.Collections.IEnumerable", "System.Collections.IEnumerator",
+            "System.Collections.Generic.IEnumerable`1", "System.Collections.Generic.IEnumerator`1", "System.Collections.ICollection",
+            "System.Collections.IList", "System.Collections.IDictionary", "System.Collections.Generic.ICollection`1",
+            "System.Collections.Generic.IList`1", "System.Collections.Generic.IDictionary`2", "System.Collections.Generic.IReadOnlyCollection`1",
+            "System.Collections.Generic.IReadOnlyList`1", "System.Collections.IComparer", "System.Collections.Generic.IComparer`1",
+            "System.Collections.IEqualityComparer", "System.Collections.Generic.IEqualityComparer`1",
+        };
 
         /// <summary>候选范围和单个类型的匹配结果分开复用，不保存调用路径。</summary>
         private sealed class DispatchIndex
         {
             internal Dictionary<string, IReadOnlyList<ResolvedMethodDefinition>> Callbacks { get; } = new(StringComparer.Ordinal);
-            internal Dictionary<string, IReadOnlyList<IMethodSymbol>> FrameworkOverrides { get; } = new(StringComparer.Ordinal);
+            internal Dictionary<string, IReadOnlyList<(IMethodSymbol, IReadOnlySet<string>)>> FrameworkOverrides { get; } = new(StringComparer.Ordinal);
             internal Dictionary<string, TargetCandidates> Ranges { get; } = new(StringComparer.Ordinal);
             internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Starts), TargetCandidates> Traversals { get; } = new();
             internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Type, TemplateList Arguments), ResolvedMethodDefinition?> Implementations { get; } = new();

@@ -137,7 +137,8 @@ namespace SetterChecker.Core
                         written &= written - 1;
                         IReadOnlyList<BehaviorValueReference>? actual = slot == 0 ? target.Receiver
                             : slot - 1 < target.Arguments.Count ? target.Arguments[slot - 1] : null;
-                        bool deep = owner == Owner.Combat || target.IsCallback && slot > 0;
+                        // 剪枝只能少下结论：战斗写入也按浅写换算，经新对象别名的深写留给摘要判定。
+                        bool deep = target.IsCallback && slot > 0;
                         foreach (BehaviorValueReference value in actual ?? Array.Empty<BehaviorValueReference>())
                         {
                             if (value.MethodId != caller)
@@ -361,6 +362,7 @@ namespace SetterChecker.Core
         private const int StaticBit = 128;
         private const int UnknownBit = 129;
         private const int CombatBit = 130;
+        private const int CombatDeepBit = 194;
         private const int ReturnSlot = 63;
         private const int MaxParameterSlot = 62;
 
@@ -738,7 +740,11 @@ namespace SetterChecker.Core
                     }
                     foreach (int slot in Bits(callee.Combat))
                     {
-                        MapSlot(state, target, slot, true, Owner.Combat, true, new(call.Point, target.MethodId, CombatBit + slot, string.Empty));
+                        MapSlot(state, target, slot, target.IsCallback && slot > 0, Owner.Combat, false, new(call.Point, target.MethodId, CombatBit + slot, string.Empty));
+                    }
+                    foreach (int slot in Bits(callee.CombatDeep))
+                    {
+                        MapSlot(state, target, slot, true, Owner.Combat, true, new(call.Point, target.MethodId, CombatDeepBit + slot, string.Empty));
                     }
                     if (callee.Into == null)
                     {
@@ -885,7 +891,7 @@ namespace SetterChecker.Core
                 {
                     case EffectRootKind.Receiver:
                     case EffectRootKind.Parameter:
-                        summary.SetBit(root.Owner == Owner.Combat ? CombatBit + root.Slot : deep ? 64 + root.Slot : root.Slot, cause);
+                        summary.SetBit(root.Owner == Owner.Combat ? (deep ? CombatDeepBit : CombatBit) + root.Slot : deep ? 64 + root.Slot : root.Slot, cause);
                         break;
                     case EffectRootKind.Static:
                         if (root.Owner == Owner.Combat)
@@ -894,7 +900,11 @@ namespace SetterChecker.Core
                         }
                         break;
                     case EffectRootKind.Foreign:
-                        summary.SetBit(StaticBit, cause);
+                        // 其他函数中的对象来源不明，按战斗静态处理；路径上已确定为非战斗归属的写入不计。
+                        if (root.Owner != Owner.Other)
+                        {
+                            summary.SetBit(StaticBit, cause);
+                        }
                         break;
                     case EffectRootKind.Fresh:
                         if (deep && visiting.Add(root.Site))
@@ -1215,6 +1225,23 @@ namespace SetterChecker.Core
                 return result;
             }
 
+            // 值的已知类型是按值传递的结构体；ref 返回、指针、开放泛型参数和无法解析的类型都不按副本处理。
+            private bool IsValueCopy(BehaviorTypeReference? type)
+            {
+                if (type == null || type.Id.StartsWith('!') || type.Id.EndsWith('&') || type.Id.EndsWith('*') || type.Id.EndsWith(']'))
+                {
+                    return false;
+                }
+                try
+                {
+                    return this.m_catalog.ResolveTypeDefinition(type).IsValueType;
+                }
+                catch (AnalysisException)
+                {
+                    return false;
+                }
+            }
+
             // 调用结果按被调函数的返回（或 out 写出）摘要对应到本调用的实参；回调的返回值不是调用结果。
             private IEnumerable<(Walk? Next, EffectRoot? Root)> ReadCallResult(MethodState state, ValueOrigin origin, Walk walk)
             {
@@ -1240,6 +1267,12 @@ namespace SetterChecker.Core
                     {
                         yield return (null, EffectRoot.UnknownOf("未固定回调的返回值来源尚未确定"));
                     }
+                    yield break;
+                }
+                if (!walk.Deep && IsValueCopy(origin.Value.Type))
+                {
+                    // 按值返回的结构体是副本（如集合枚举器），原地修改只写副本；经副本中保存的引用做深写仍追回来源。
+                    yield return (null, EffectRoot.FreshOf(origin.Reference.ValueId, walk));
                     yield break;
                 }
                 Walk settled = walk;
@@ -1447,18 +1480,20 @@ namespace SetterChecker.Core
             internal ulong Shallow;
             internal ulong Deep;
             internal ulong Combat;
+            internal ulong CombatDeep;
             internal bool Static;
             internal string? Unknown;
             internal Dictionary<int, ulong>? Into;
             internal ValueSummary Return;
             internal Dictionary<int, ValueSummary>? Outs;
-            internal readonly SummaryCause?[] Causes = new SummaryCause?[CombatBit + 64];
+            internal readonly SummaryCause?[] Causes = new SummaryCause?[CombatDeepBit + 64];
 
-            internal bool IsSetter => this.Static || (this.Shallow | this.Deep | this.Combat) != 0;
+            internal bool IsSetter => this.Static || (this.Shallow | this.Deep | this.Combat | this.CombatDeep) != 0;
 
-            // 证据优先取静态写入，其次最低的战斗、浅写、深写槽位。
+            // 证据优先取静态写入，其次最低的战斗浅写、战斗深写、浅写、深写槽位。
             internal int EvidenceBit => this.Static ? StaticBit
                 : this.Combat != 0 ? CombatBit + BitOperations.TrailingZeroCount(this.Combat)
+                : this.CombatDeep != 0 ? CombatDeepBit + BitOperations.TrailingZeroCount(this.CombatDeep)
                 : this.Shallow != 0 ? BitOperations.TrailingZeroCount(this.Shallow)
                 : 64 + BitOperations.TrailingZeroCount(this.Deep);
 
@@ -1468,6 +1503,10 @@ namespace SetterChecker.Core
                 if (bit == StaticBit)
                 {
                     this.Static = true;
+                }
+                else if (bit >= CombatDeepBit)
+                {
+                    this.CombatDeep |= 1UL << (bit - CombatDeepBit);
                 }
                 else if (bit >= CombatBit)
                 {
@@ -1511,7 +1550,8 @@ namespace SetterChecker.Core
             // 收敛只比较会影响调用者的内容。
             internal bool SameAs(MethodSummary other)
             {
-                if (this.Shallow != other.Shallow || this.Deep != other.Deep || this.Combat != other.Combat || this.Static != other.Static
+                if (this.Shallow != other.Shallow || this.Deep != other.Deep || this.Combat != other.Combat || this.CombatDeep != other.CombatDeep
+                    || this.Static != other.Static
                     || (this.Unknown == null) != (other.Unknown == null) || !this.Return.SameAs(other.Return))
                 {
                     return false;
