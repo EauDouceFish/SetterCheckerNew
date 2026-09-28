@@ -280,7 +280,8 @@ namespace SetterChecker.Core
                             sources.ReadBody(body);
                             effects.ReadDirect(body);
                             Schedule(body.MethodId);
-                        }                    }
+                        }
+                    }
                     if (!ready.TryDequeue(out string? current))
                     {
                         if (deferred.Count != 0)
@@ -1782,7 +1783,9 @@ namespace SetterChecker.Core
                 if (!visited.Add((type.Id, new(candidate.Arguments), candidate.Expand)))
                 {
                     continue;
-                }                ResolvedMethodDefinition? selected = null;
+                }
+
+                ResolvedMethodDefinition? selected = null;
                 if (!owner.IsInterface && declaration.DeclaringTypeArguments.Count == 0
                     && candidate.Inherited is { DeclaringTypeArguments.Count: 0 } inherited
                     && !catalog.HasDeclaredOverride(type, declaration.Method.Name))
