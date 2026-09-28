@@ -244,8 +244,8 @@ namespace SetterChecker.Core
                 return new(RuntimeOperation.ConvertValue, "解析值并写入局部输出，不修改业务对象。",
                     "https://learn.microsoft.com/dotnet/api/system.int32.tryparse");
             }
-            if (declaringType.IsValueType && method.Name == "ToString" && parameters.Length == 0
-                && method.ReturnTypeId == "System.String")
+            if (declaringType.IsValueType && method.Name == "ToString" && method.ReturnTypeId == "System.String" && !hasRefParameter
+                && parameters.All(parameter => parameter is "System.String" or "System.IFormatProvider"))
             {
                 return new(RuntimeOperation.ConvertValue, "把值转换为新字符串，不修改业务对象。",
                     "https://learn.microsoft.com/dotnet/api/system.object.tostring");

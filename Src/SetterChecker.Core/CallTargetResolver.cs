@@ -756,7 +756,9 @@ namespace SetterChecker.Core
                         {
                             foreach (ResolvedMethodDefinition implementation in VirtualTargets(declaration2, value))
                             {
-                                if (implementation.Method.AssemblyPath == objectType.AssemblyPath || RuntimeOperations.Find(catalog, implementation.Method) != null)
+                                // 只连接有源码的业务类型实现；标准库和外部工具 DLL（如 Bee）的 ToString 不属于战斗逻辑。
+                                if (implementation.Method.SourceSymbol == null || implementation.Method.AssemblyPath == objectType.AssemblyPath
+                                    || RuntimeOperations.Find(catalog, implementation.Method) != null)
                                 {
                                     continue;
                                 }
