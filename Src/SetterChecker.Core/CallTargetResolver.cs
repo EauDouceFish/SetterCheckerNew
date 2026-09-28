@@ -595,7 +595,8 @@ namespace SetterChecker.Core
                 if (runtimeRule.Operation == RuntimeOperation.ConvertValue && method.Name is "Format" or "Concat" or "Join"
                     && catalog.TypesById[method.TypeId].FullName == "System.String")
                 {
-                    await ReadFormattedArguments().ConfigureAwait(false);
+                    // string 格式化会调用对象实参的 ToString 或 IFormattable.ToString：登记为外部库调用，按通用库模型的回调规则绑定。
+                    Bind(declaration, receiver, arguments);
                 }
             }
             else if (await ReadIterator().ConfigureAwait(false) || await ReadReflection().ConfigureAwait(false))
@@ -725,71 +726,6 @@ namespace SetterChecker.Core
                 ValuesOnly = valuesOnly,
                 RuntimeRule = runtimeRule,
             };
-
-            // string 格式化会调用对象实参的 ToString 或 IFormattable.ToString；只连接业务代码中的实现，标准库实现按纯转换处理。
-            async ValueTask ReadFormattedArguments()
-            {
-                TypeEntry objectType = catalog.ReadPrimitiveType("System.Object");
-                List<ResolvedMethodDefinition> declarations = new();
-                foreach (TypeEntry? type in new TypeEntry?[] { objectType, catalog.ReadNamedRuntimeType("System.IFormattable", caller) })
-                {
-                    MethodEntry? entry = type == null ? null : catalog.GetMethods(type).FirstOrDefault(candidate => candidate.Name == "ToString" && !candidate.IsStatic
-                        && (type == objectType ? candidate.Parameters.Count == 0 : candidate.Parameters.Count == 2));
-                    if (entry != null)
-                    {
-                        declarations.Add(catalog.ResolveMethodDefinition(catalog.ReadMethodReference(entry), true));
-                    }
-                }
-                for (int index = 0; index < method.Parameters.Count && index < arguments.Count; index++)
-                {
-                    string parameterType = method.Parameters[index].TypeId;
-                    IReadOnlyList<IReadOnlyList<BehaviorValueReference>> values;
-                    if (parameterType == "System.Object")
-                    {
-                        values = new[] { arguments[index] };
-                    }
-                    else if (parameterType == "System.Object[]" && arguments[index].Count == 1)
-                    {
-                        try
-                        {
-                            values = sources.ReadArrayArguments(arguments[index][0], sources.ReadArrayLength(arguments[index][0]));
-                        }
-                        catch (AnalysisException)
-                        {
-                            failure = "格式化参数数组来源尚未确定";
-                            continue;
-                        }
-                    }
-                    else
-                    {
-                        continue;
-                    }
-                    foreach (IReadOnlyList<BehaviorValueReference> value in values)
-                    {
-                        foreach (ResolvedMethodDefinition declaration2 in declarations)
-                        {
-                            foreach (ResolvedMethodDefinition implementation in VirtualTargets(declaration2, value))
-                            {
-                                // 只连接有源码的业务类型实现；标准库和外部工具 DLL（如 Bee）的 ToString 不属于战斗逻辑。
-                                if (implementation.Method.SourceSymbol == null || implementation.Method.AssemblyPath == objectType.AssemblyPath
-                                    || RuntimeOperations.Find(catalog, implementation.Method) != null)
-                                {
-                                    continue;
-                                }
-                                IReadOnlyList<IReadOnlyList<BehaviorValueReference>> parameters = implementation.Method.Parameters
-                                    .Select(_ => (IReadOnlyList<BehaviorValueReference>)Array.Empty<BehaviorValueReference>()).ToArray();
-                                sources.Include(implementation.Method);
-                                if (await AddTarget(new ResolvedCallTarget(implementation.Method.Id,
-                                    catalog.ReadMethodReference(implementation.Method, implementation.DeclaringTypeArguments, implementation.MethodTypeArguments),
-                                    value, parameters, implementation.DeclaringTypeArguments.Select(type => type.Text).ToArray())).ConfigureAwait(false))
-                                {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
 
             // 枚举对象保存延迟函数及原实参；只有 MoveNext 执行该函数体。
             async ValueTask<bool> ReadIterator()
@@ -1459,6 +1395,28 @@ namespace SetterChecker.Core
                 return stopped;
             }
 
+            // 外部库新建并返回的对象只能是库类型：返回类型为 object、含泛型参数或属于 UnityEngine（引擎可返回场景中的业务组件）时不据此收窄。
+            bool IsLibraryCreated(ValueOrigin origin)
+            {
+                if (origin.Value.Kind != BehaviorValueKind.CallResult || origin.Value.ParameterIndex != null
+                    || sources.ReadResolvedResult(origin.Reference) is not ResolvedCall resolved || resolved.RuntimeRule != null
+                    || resolved.Targets.All(target => target.IsCallback))
+                {
+                    return false;
+                }
+                foreach (ResolvedCallTarget target in resolved.Targets.Where(target => !target.IsCallback))
+                {
+                    MethodEntry method = sources.ReadMethod(target.MethodId);
+                    string returned = RuntimeOperations.ReadMetadataName(method.ReturnTypeId);
+                    if (!catalog.IsLibraryMethod(method) || method.ReturnTypeId.Contains('!') || returned == "System.Object"
+                        || returned.StartsWith("UnityEngine.", StringComparison.Ordinal))
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
             // 普通调用和反射调用共用虚函数候选表，不能把反射得到的父类声明当成最终实现。
             IEnumerable<ResolvedMethodDefinition> VirtualTargets(ResolvedMethodDefinition declared, IReadOnlyList<BehaviorValueReference> actualReceiver)
             {
@@ -1483,8 +1441,10 @@ namespace SetterChecker.Core
                 {
                     return ReadCandidates(origins);
                 }
-                return origins.DistinctBy(origin => (origin.Value.Kind == BehaviorValueKind.NewObject, origin.Value.Type!.Id))
-                    .SelectMany(origin => ReadCandidates(new[] { origin }));
+                return origins.DistinctBy(origin => (origin.Value.Kind == BehaviorValueKind.NewObject, origin.Value.Type!.Id, IsLibraryCreated(origin)))
+                    .SelectMany(origin => IsLibraryCreated(origin)
+                        ? ReadCandidates(new[] { origin }).Where(target => target.Method.SourceSymbol == null)
+                        : ReadCandidates(new[] { origin }));
 
                 // 每个接收类型独立复用实现列表，新增类型不使旧类型重新匹配。
                 IEnumerable<ResolvedMethodDefinition> ReadCandidates(ValueOrigin[] receivers)
@@ -1577,15 +1537,32 @@ namespace SetterChecker.Core
                 BehaviorValueReference[] contents = libraryTarget.Receiver.Concat(libraryTarget.Arguments.SelectMany(values => values)).Distinct().ToArray();
                 MethodEntry libraryMethod = sources.ReadMethod(libraryTarget.MethodId);
                 TypeEntry libraryOwner = catalog.TypesById[libraryMethod.TypeId];
-                HashSet<string> receiverVisible = new(s_frameworkProtocols, StringComparer.Ordinal) { RuntimeOperations.ReadMetadataName(libraryOwner.LogicalId) };
+                HashSet<string> receiverVisible = new(StringComparer.Ordinal) { "System.Object", RuntimeOperations.ReadMetadataName(libraryOwner.LogicalId) };
                 receiverVisible.UnionWith(catalog.ReadInheritedTypes(libraryOwner).Select(relation => RuntimeOperations.ReadMetadataName(relation.Definition.LogicalId)));
-                // 库函数只能经它看得到的静态类型调用虚成员：接收对象按声明类型及其祖先，实参按形参声明类型，另加框架通用协议。
+                // 库函数只能经它看得到的静态类型调用虚成员：接收对象按声明类型及其祖先，实参按形参声明类型；object 与泛型形参另含框架据以比较、格式化的协议。
                 IEnumerable<(BehaviorValueReference Value, IReadOnlySet<string> Visible)> visibleValues = libraryTarget.Receiver
                     .Select(value => (value, (IReadOnlySet<string>)receiverVisible))
-                    .Concat(libraryTarget.Arguments.SelectMany((values, index) => values.Select(value => (value, (IReadOnlySet<string>)new HashSet<string>(s_frameworkProtocols, StringComparer.Ordinal)
+                    .Concat(libraryTarget.Arguments.SelectMany((values, index) => values.Select(value =>
+                        (value, ReadParameterProtocols(index < libraryMethod.Parameters.Count ? libraryMethod.Parameters[index].TypeId : "System.Object")))))
+                    .Concat(libraryTarget.Arguments.SelectMany((values, index) => IsObjectArray(index)
+                        ? values.SelectMany(ReadArrayElements).Select(element => (element, ReadParameterProtocols(libraryMethod.Parameters[index].TypeId[..^2])))
+                        : Enumerable.Empty<(BehaviorValueReference, IReadOnlySet<string>)>()));
+                // 元素类型为 object 或泛型参数的数组形参（如 params object[]），其元素可能是带源码重写的业务对象。
+                bool IsObjectArray(int index) => index < libraryMethod.Parameters.Count && libraryMethod.Parameters[index].TypeId is var type
+                    && type.EndsWith("[]", StringComparison.Ordinal) && (type.StartsWith('!') || RuntimeOperations.ReadMetadataName(type[..^2]) == "System.Object");
+                // 数组实参（如 params object[]）中的元素同样可能被框架回调；元素来源确定不了时如实报告未证明。
+                IEnumerable<BehaviorValueReference> ReadArrayElements(BehaviorValueReference array)
+                {
+                    try
                     {
-                        RuntimeOperations.ReadMetadataName(index < libraryMethod.Parameters.Count ? libraryMethod.Parameters[index].TypeId : "System.Object"),
-                    }))));
+                        return sources.ReadArrayArguments(array, sources.ReadArrayLength(array)).SelectMany(element => element).ToArray();
+                    }
+                    catch (AnalysisException)
+                    {
+                        failure = "库函数数组实参的元素来源尚未确定";
+                        return Array.Empty<BehaviorValueReference>();
+                    }
+                }
                 foreach (var (value, visible) in visibleValues)
                 {
                     ValueOrigin[] local = (sources.ReadFixedReceiver(value) is ValueOrigin fixedValue ? new[] { fixedValue }
@@ -1627,7 +1604,9 @@ namespace SetterChecker.Core
                     }
                     foreach (ValueOrigin origin in local)
                     {
-                        if (IsNull(origin) || origin.Value.Kind == BehaviorValueKind.Function)
+                        // 常量、类型对象和库函数新建的对象都不可能是带源码重写的业务对象。
+                        if (IsNull(origin) || origin.Value.Kind is BehaviorValueKind.Function or BehaviorValueKind.Constant
+                            or BehaviorValueKind.Computation or BehaviorValueKind.Type || IsLibraryCreated(origin))
                         {
                             continue;
                         }
@@ -1764,7 +1743,8 @@ namespace SetterChecker.Core
                 }
                 contracts.Add(contract);
             }
-            foreach (IMethodSymbol member in symbol.GetMembers().OfType<IMethodSymbol>().Where(member => member.IsOverride))
+            // 终结器由垃圾回收在不确定时机执行，不是框架函数的回调。
+            foreach (IMethodSymbol member in symbol.GetMembers().OfType<IMethodSymbol>().Where(member => member.IsOverride && member.MethodKind != MethodKind.Destructor))
             {
                 for (IMethodSymbol? overridden = member.OverriddenMethod; overridden != null; overridden = overridden.OverriddenMethod)
                 {
@@ -1803,17 +1783,24 @@ namespace SetterChecker.Core
             return definition.ContainingNamespace is { IsGlobalNamespace: false } space ? space.ToDisplayString() + "." + name : name;
         }
 
-        // 框架代码对任意对象都可能经由这些通用协议调用业务实现（比较、相等、格式化、枚举、释放、集合访问）。
-        private static readonly HashSet<string> s_frameworkProtocols = new(StringComparer.Ordinal)
+        // object 形参只经 Object 成员及格式化、转换、比较协议被框架调用；泛型形参另经 Comparer<T>、EqualityComparer<T> 的泛型协议。
+        private static readonly IReadOnlySet<string> s_objectProtocols = new HashSet<string>(StringComparer.Ordinal)
         {
-            "System.Object", "System.IComparable", "System.IComparable`1", "System.IEquatable`1", "System.IFormattable", "System.IConvertible",
-            "System.ICloneable", "System.IDisposable", "System.Collections.IEnumerable", "System.Collections.IEnumerator",
-            "System.Collections.Generic.IEnumerable`1", "System.Collections.Generic.IEnumerator`1", "System.Collections.ICollection",
-            "System.Collections.IList", "System.Collections.IDictionary", "System.Collections.Generic.ICollection`1",
-            "System.Collections.Generic.IList`1", "System.Collections.Generic.IDictionary`2", "System.Collections.Generic.IReadOnlyCollection`1",
-            "System.Collections.Generic.IReadOnlyList`1", "System.Collections.IComparer", "System.Collections.Generic.IComparer`1",
-            "System.Collections.IEqualityComparer", "System.Collections.Generic.IEqualityComparer`1",
+            "System.Object", "System.IFormattable", "System.IConvertible", "System.IComparable",
         };
+        private static readonly IReadOnlySet<string> s_genericProtocols = new HashSet<string>(s_objectProtocols, StringComparer.Ordinal)
+        {
+            "System.IComparable`1", "System.IEquatable`1",
+        };
+
+        // 库函数形参可见的虚成员所在类型：object 与泛型参数按协议集合，其余按形参声明类型本身。
+        private static IReadOnlySet<string> ReadParameterProtocols(string parameterType)
+        {
+            string name = RuntimeOperations.ReadMetadataName(parameterType);
+            return parameterType.StartsWith('!') ? s_genericProtocols
+                : name == "System.Object" ? s_objectProtocols
+                : new HashSet<string>(StringComparer.Ordinal) { "System.Object", name };
+        }
 
         /// <summary>候选范围和单个类型的匹配结果分开复用，不保存调用路径。</summary>
         private sealed class DispatchIndex
@@ -3219,6 +3206,10 @@ namespace SetterChecker.Core
         // 找到产生某个调用结果（含 out 结果）的调用位置。
         internal bool TryReadValueCall(BehaviorValueReference value, out BehaviorCall? call)
             => this.m_valueCalls.TryGetValue(Normalize(value), out call);
+
+        // 值是某个调用的普通返回结果时，给出该调用当前的解析结果。
+        internal ResolvedCall? ReadResolvedResult(BehaviorValueReference value) => this.m_valueCalls.TryGetValue(Normalize(value), out BehaviorCall? call)
+            && this.m_calls.TryGetValue((value.MethodId, call.Point), out ResolvedCall? resolved) ? resolved : null;
 
         // 反射写入沿用普通写入判断。
         internal IEnumerable<BehaviorWrite> ReadReflectionWrites(string method) => this.m_callsByMethod.TryGetValue(method, out var calls)
