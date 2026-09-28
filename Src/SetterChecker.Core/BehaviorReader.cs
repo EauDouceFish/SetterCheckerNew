@@ -49,9 +49,13 @@ namespace SetterChecker.Core
             return Task.FromResult(new BehaviorReadResult(results, stopwatch.Elapsed));
         }
 
-        // 读取单个函数时直接复用目录，不重建整个项目的程序集分组。
+        // 读取单个函数时直接复用目录，不重建整个项目的程序集分组；外部库函数不读指令，由通用库模型描述。
         private static MethodBehavior ReadAvailableBehavior(MethodCatalogResult catalog, MethodEntry method)
         {
+            if (catalog.IsLibraryMethod(method))
+            {
+                return MethodBehavior.Empty(method.Id, MethodBodyKind.LibraryModel);
+            }
             try
             {
                 return catalog.ReadMethodBehavior(method);
@@ -1999,6 +2003,8 @@ namespace SetterChecker.Core
         PlatformInvocation,
         /// <summary>函数行为由运行时内部实现。</summary>
         RuntimeImplementation,
+        /// <summary>外部库函数不读取函数体，效果、回调和返回来源按 V3 设计 3.2 节的通用库模型。</summary>
+        LibraryModel,
     }
 
     /// <summary>

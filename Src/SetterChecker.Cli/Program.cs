@@ -67,7 +67,7 @@ namespace SetterChecker.Cli
         // 解析项目路径和全程序共用的最大并行数。
         private static (MaterialRequest Request, string Output, string? SaveBaseline) ParseArguments(string[] arguments)
         {
-            string? projectPath = null;
+            List<string> projectPaths = new();
             int jobs = 4;
             string output = Path.Combine(Environment.CurrentDirectory, "reports");
             string? baseline = null;
@@ -85,7 +85,7 @@ namespace SetterChecker.Cli
 
                 if (argument == "--project")
                 {
-                    projectPath = ReadValue(arguments, ref index, "--project");
+                    projectPaths.Add(ReadValue(arguments, ref index, "--project"));
 
                     continue;
                 }
@@ -128,7 +128,7 @@ namespace SetterChecker.Cli
                 throw new AnalysisException($"不支持的参数：{argument}");
             }
 
-            return (new MaterialRequest(projectPath ?? throw new AnalysisException("缺少 --project 项目路径。"), jobs)
+            return (new MaterialRequest(projectPaths.Count != 0 ? projectPaths : throw new AnalysisException("缺少 --project 项目路径。"), jobs)
             { ManualBaselinePath = baseline, CaptureManualBaseline = saveBaseline != null, UseReflectionBaseline = reflectionBaseline }, output, saveBaseline);
         }
 

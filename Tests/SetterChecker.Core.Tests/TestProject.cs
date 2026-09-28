@@ -10,6 +10,9 @@ namespace SetterChecker.Core.Tests
     {
         private static readonly UTF8Encoding s_encoding = new(false);
 
+        /// <summary>测试工程的战斗程序集：被测源码所在的 khengine.runtime 与 external 模式的 External.dll；Tools 为非战斗库。</summary>
+        internal static readonly IReadOnlySet<string> CombatAssemblies = new HashSet<string>(StringComparer.Ordinal) { "khengine.runtime", "External" };
+
         // 保存本次测试独占的临时目录。
         private TestProject(string rootPath)
         {
@@ -20,8 +23,9 @@ namespace SetterChecker.Core.Tests
         public string RootPath { get; }
         public string AssemblyDefinitionPath { get; }
 
-        // 外围注册单独放在上层源码程序集，不要求 Unity 先编译游戏。
-        internal static TestProject Create(string source, bool external = false, string? registrations = null, string? librarySource = null)
+        // 外围注册单独放在上层源码程序集；非战斗工具库可以是源码程序集或真实 DLL。
+        internal static TestProject Create(string source, bool external = false, string? registrations = null, string? librarySource = null,
+            string? toolSource = null, bool toolAsDll = false)
         {
             TestProject project = new(Path.Combine(Path.GetTempPath(), $"SetterChecker-key-{Guid.NewGuid():N}"));
             Directory.CreateDirectory(Path.GetDirectoryName(project.AssemblyDefinitionPath)!);
@@ -30,9 +34,23 @@ namespace SetterChecker.Core.Tests
             project.Write("Packages/khengine/package.json", "{\"name\":\"khengine\"}");
             string core = typeof(object).Assembly.Location;
             List<string> references = new() { core };
+            if (toolSource != null)
+            {
+                if (toolAsDll)
+                {
+                    references.Add(project.AddLibrary("Tools.dll", "Tools", toolSource));
+                }
+                else
+                {
+                    string toolPath = project.Write("Assets/Tools/Tools.cs", toolSource);
+                    project.Write("Assets/Tools/Tools.asmdef", "{\"name\":\"Tools\"}");
+                    project.WriteResponse("Tools", toolPath, new[] { core });
+                    references.Add(Path.Combine(project.RootPath, "Library/Bee/artifacts/build/Tools.dll"));
+                }
+            }
             if (external || librarySource != null)
             {
-                string dll = project.AddLibrary("External.dll", "External", librarySource ?? source);
+                string dll = project.AddLibrary("External.dll", "External", librarySource ?? source, references.Skip(1).ToArray());
                 references.Add(dll);
                 if (external)
                 {
@@ -50,12 +68,16 @@ namespace SetterChecker.Core.Tests
             return project;
         }
 
+        // 本测试工程的读取请求，声明测试自己的战斗程序集。
+        internal MaterialRequest Request(int jobs) => new(new[] { this.AssemblyDefinitionPath }, jobs) { CombatAssemblies = CombatAssemblies };
+
         // 生成测试自己的真实 DLL，用于核对编译引用与同目录候选文件的区别。
-        internal string AddLibrary(string fileName, string assemblyName, string source)
+        internal string AddLibrary(string fileName, string assemblyName, string source, params string[] references)
         {
             string path = Path.Combine(this.RootPath, fileName);
             CSharpCompilation compilation = CSharpCompilation.Create(assemblyName,
-                new[] { CSharpSyntaxTree.ParseText(source) }, new[] { MetadataReference.CreateFromFile(typeof(object).Assembly.Location) },
+                new[] { CSharpSyntaxTree.ParseText(source) },
+                references.Prepend(typeof(object).Assembly.Location).Select(reference => MetadataReference.CreateFromFile(reference)),
                 new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
             using FileStream stream = File.Create(path);
             var result = compilation.Emit(stream);
@@ -68,7 +90,7 @@ namespace SetterChecker.Core.Tests
             AnalyzeAsync(string typeName, string methodName, int jobs = 4, bool crossMethodOrigins = true)
         {
             using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(15));
-            MaterialSet material = await new MaterialLoader().LoadAsync(new(this.AssemblyDefinitionPath, jobs), deadline.Token);
+            MaterialSet material = await new MaterialLoader().LoadAsync(Request(jobs), deadline.Token);
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, jobs, deadline.Token);
             MethodEntry root = catalog.GetMethods(catalog.Types.Single(type => type.FullName == typeName))
                 .Single(method => method.Name == methodName);

@@ -99,7 +99,12 @@ namespace SetterChecker.Core
                 material.ExternalAssemblies,
                 assemblyAliases,
                 stopwatch,
-                jobs);
+                jobs)
+            {
+                CombatAssemblies = material.CombatAssemblies,
+                AnalyzedAssemblies = material.CombatAssemblies.Concat(material.SourceAssemblies
+                    .Where(assembly => assembly.IsReportAssembly).Select(assembly => assembly.Name)).ToHashSet(StringComparer.Ordinal),
+            };
         }
 
         // 仅对同名候选校验完整内容；相同文件共用定义，原引用路径仍保留为别名。
@@ -1186,6 +1191,18 @@ namespace SetterChecker.Core
             });
         }
 
+        // 只读元数据标记判断值类型成员是否声明为 readonly，不读取函数体。
+        internal bool IsReadOnlyStructMember(MethodEntry method)
+        {
+            Cecil.ModuleDefinition module = GetManagedModule(method.AssemblyPath!);
+            lock (module)
+            {
+                Cecil.MethodDefinition definition = (Cecil.MethodDefinition)module.LookupToken(method.MetadataToken);
+                return definition.CustomAttributes.Concat(definition.DeclaringType.CustomAttributes)
+                    .Any(attribute => attribute.AttributeType.FullName == "System.Runtime.CompilerServices.IsReadOnlyAttribute");
+            }
+        }
+
         internal ConcurrentDictionary<IMethodSymbol, Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowGraph> SourceGraphs { get; } = new(SymbolEqualityComparer.Default);
         private readonly ConcurrentDictionary<string, MethodEntry> m_methodsById = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<IMethodSymbol, MethodEntry> m_sourceMethodsBySymbol = new(SymbolEqualityComparer.Default);
@@ -1424,6 +1441,18 @@ namespace SetterChecker.Core
 
         /// <summary>建立总表所用的时间。</summary>
         public TimeSpan Elapsed { get; }
+
+        /// <summary>声明字段属于战斗状态的程序集（V3 设计 2.1 节）。</summary>
+        internal IReadOnlySet<string> CombatAssemblies { get; init; } = new HashSet<string>(StringComparer.Ordinal);
+
+        /// <summary>读取函数体的程序集：战斗程序集与报告程序集。</summary>
+        internal IReadOnlySet<string> AnalyzedAssemblies { get; init; } = new HashSet<string>(StringComparer.Ordinal);
+
+        // V3 设计 3.1 节：不属于战斗或报告程序集的 DLL 函数不读函数体，改用通用库模型。
+        internal bool IsLibraryMethod(MethodEntry method) => method.SourceSymbol == null && !this.AnalyzedAssemblies.Contains(method.AssemblyName);
+
+        // 程序集既不是源码也不属于战斗或报告程序集时，其中声明的虚成员属于外部库。
+        internal bool IsLibraryAssembly(string name) => !this.m_sourceContextsByAssembly.ContainsKey(name) && !this.AnalyzedAssemblies.Contains(name);
 
         // 读取源码类型函数，或按需读取并缓存托管类型函数。
         /// <summary>

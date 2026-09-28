@@ -60,7 +60,7 @@ namespace SetterChecker.Core.Tests
             Directory.CreateDirectory(excluded);
             File.WriteAllText(Path.Combine(excluded, "Other.asmdef"), "{\"name\":\"Other\"}", new System.Text.UTF8Encoding(false));
             File.WriteAllText(Path.Combine(excluded, "Other.cs"), "invalid outside active assembly", new System.Text.UTF8Encoding(false));
-            MaterialSet material = await new MaterialLoader().LoadAsync(new(project.AssemblyDefinitionPath, 4));
+            MaterialSet material = await new MaterialLoader().LoadAsync(project.Request(4));
             CollectionAssert.AreEquivalent(new[] { moved, added }, material.SourceAssemblies.Single().SourcePaths.ToArray());
         }
 
@@ -84,7 +84,7 @@ namespace SetterChecker.Core.Tests
                 {"Inputs":["a.txt"],"Outputs":["Library/Bee/artifacts/build/Other.dll"],"Annotation":"CscLike"},
                 {{cscNodes}}],"Tail":[{"Annotation":"Csc Late"}]}
                 """, new System.Text.UTF8Encoding(false));
-            MaterialSet material = await new MaterialLoader().LoadAsync(new(project.AssemblyDefinitionPath, 4));
+            MaterialSet material = await new MaterialLoader().LoadAsync(project.Request(4));
             CollectionAssert.AreEqual(new[] { "Assembly-CSharp", "khengine.runtime" }, material.SourceAssemblies.Select(assembly => assembly.Name).ToArray());
             Assert.IsTrue(material.SourceAssemblies[0].Compilation.References.OfType<Microsoft.CodeAnalysis.CompilationReference>().Any());
         }
@@ -565,7 +565,7 @@ namespace SetterChecker.Core.Tests
                 }
                 """);
             using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(15));
-            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new(project.AssemblyDefinitionPath, 4), deadline.Token);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(project.Request(4), deadline.Token);
             Assert.IsFalse(run.Complete);
             Assert.IsNull(run.Annotations.Methods.Single().Actual);
             // 规则 R5：返回值来源本身不再使函数未证明；未知来自调用原生函数，按原生边界采用当前人工标签。
@@ -608,7 +608,7 @@ namespace SetterChecker.Core.Tests
                 }
                 """);
             using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(15));
-            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new(project.AssemblyDefinitionPath, jobs), deadline.Token);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(project.Request(jobs), deadline.Token);
             Assert.IsTrue(run.Complete, run.Failure ?? string.Join("; ", run.Annotations.Methods.Select(method => method.Failure)));
             CollectionAssert.AreEqual(new[] { "LoadData", "ReleaseData" },
                 run.Annotations.Methods.Where(method => method.Actual == MethodEffectKind.Setter).Select(method => method.Name).Order().ToArray());
@@ -805,7 +805,7 @@ namespace SetterChecker.Core.Tests
                 }
                 """);
             using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(15));
-            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new(project.AssemblyDefinitionPath, 4), deadline.Token);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(project.Request(4), deadline.Token);
             Assert.IsTrue(run.Complete, run.Failure ?? string.Join("; ", run.Annotations.Methods.Select(method => method.Name + ": " + method.Failure)
                 .Concat(run.Calls!.PendingCalls.Select(call => call.Failure)).Concat(run.Calls.Behaviors.Methods.Select(body => body.Failure))));
             Assert.AreEqual(MethodEffectKind.Setter, run.Annotations.Methods.Single(method => method.Name == "CreateInstance").Actual);
@@ -1539,7 +1539,7 @@ namespace SetterChecker.Core.Tests
                 }
                 """);
             using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(15));
-            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new(project.AssemblyDefinitionPath, 4), deadline.Token);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(project.Request(4), deadline.Token);
             Assert.IsFalse(run.Complete);
             AnnotationMethod method = run.Annotations.Methods.Single();
             Assert.IsNull(method.Actual);
@@ -1590,7 +1590,7 @@ namespace SetterChecker.Core.Tests
                 }
                 """);
             using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(15));
-            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new(project.AssemblyDefinitionPath, 4), deadline.Token);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(project.Request(4), deadline.Token);
             Assert.IsFalse(run.Complete);
             Assert.IsNull(run.Annotations.Methods.Single(method => method.Name == "Read").Actual);
             Assert.AreEqual(MethodEffectKind.Setter, run.Annotations.Methods.Single(method => method.Name == "Write").Actual);
@@ -1661,7 +1661,7 @@ namespace SetterChecker.Core.Tests
                 }
                 """, external);
             using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(15));
-            MaterialSet material = await new MaterialLoader().LoadAsync(new(project.AssemblyDefinitionPath, 4), deadline.Token);
+            MaterialSet material = await new MaterialLoader().LoadAsync(project.Request(4), deadline.Token);
             MethodCatalogResult catalog = await new MethodCatalog().BuildAsync(material, 4, deadline.Token);
             MethodEntry root = catalog.GetMethods(catalog.Types.Single(type => type.FullName == "KH.Calls"))
                 .Single(method => method.Name == "Entry");
@@ -1762,7 +1762,7 @@ namespace SetterChecker.Core.Tests
             using TestProject project = TestProject.Create("namespace KH { public static class Calls { public static int Read() => 1; } }",
                 registrations: withConsumer ? "public static class Consumer { public static int Read() => KH.Calls.Read(); }" : null);
             MaterialLoader loader = new();
-            MaterialRequest request = new(project.AssemblyDefinitionPath, 4);
+            MaterialRequest request = project.Request(4);
             MaterialSet first = await loader.LoadAsync(request);
             MaterialSet second = await loader.LoadAsync(request);
             foreach (var pair in first.SourceAssemblies.Zip(second.SourceAssemblies))
@@ -1797,7 +1797,7 @@ namespace SetterChecker.Core.Tests
                     }
                 }
                 """);
-            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new(project.AssemblyDefinitionPath, 4));
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(project.Request(4));
             AnnotationMethod point = run.Annotations.Methods.Single(method => method.Name == "LogPoint");
             AnnotationMethod hook = run.Annotations.Methods.Single(method => method.Name == "Hook");
             Assert.AreEqual(MethodEffectKind.Getter, point.Actual);
@@ -2057,7 +2057,7 @@ namespace SetterChecker.Core.Tests
                 """.Replace("CLASS", label == "class" ? "[NoLogTrack]" : "")
                 .Replace("METHOD", label == "class" ? "" : label == "reason" ? "[NoLogTrack(\"cache\")]" : "[NoLogTrack]"));
             using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(15));
-            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new(project.AssemblyDefinitionPath, 4), deadline.Token);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(project.Request(4), deadline.Token);
             Assert.IsTrue(run.Complete, run.Failure);
             AnnotationMethod entry = run.Annotations.Methods.Single(method => method.Name == "Entry");
             AnnotationMethod cache = run.Annotations.Methods.Single(method => method.Name == "Read");

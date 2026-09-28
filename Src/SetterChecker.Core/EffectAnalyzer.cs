@@ -17,13 +17,13 @@ namespace SetterChecker.Core
             return result with { Elapsed = watch.Elapsed };
         }
 
-        /// <summary>解析期间只记录能确定的写入槽位，用于安全剪枝；最终结论仍由摘要计算。</summary>
+        /// <summary>解析期间只记录能确定的写入槽位，用于安全剪枝；归属规则与摘要一致，最终结论仍由摘要计算。</summary>
         internal sealed class TopTracker
         {
             private readonly MethodCatalogResult m_catalog;
             private readonly ValueSourceIndex m_values;
             private readonly Dictionary<string, TopCause> m_top = new(StringComparer.Ordinal);
-            private readonly Dictionary<string, ulong> m_slots = new(StringComparer.Ordinal);
+            private readonly Dictionary<string, (ulong Open, ulong Combat)> m_slots = new(StringComparer.Ordinal);
             private readonly Dictionary<string, List<(string Caller, ResolvedCallTarget Target, int Position)>> m_bindings = new(StringComparer.Ordinal);
             private readonly Queue<string> m_pending = new();
             private readonly HashSet<string> m_queued = new(StringComparer.Ordinal);
@@ -38,21 +38,28 @@ namespace SetterChecker.Core
 
             internal Action<IReadOnlyList<string>>? Settled { get; set; }
 
-            // 已证明写入静态数据或调用了这类函数，其余调用不再影响任何调用者的结论。
+            // 已证明写入战斗静态数据或调用了这类函数，其余调用不再影响任何调用者的结论。
             internal bool IsTop(string method) => this.m_top.ContainsKey(method);
 
             // 读取 TOP 的首个原因，供摘要补全被剪枝函数的证据。
             internal TopCause? ReadCause(string method) => this.m_top.GetValueOrDefault(method);
 
-            // 自身已有确定写入（当前对象、参数或静态数据），函数本身的结论已是 Setter。
-            internal bool IsDecided(string method) => this.m_top.ContainsKey(method) || this.m_slots.GetValueOrDefault(method) != 0;
+            // 自身已有确定写入（当前对象、参数或战斗静态数据），函数本身的结论已是 Setter。
+            internal bool IsDecided(string method) => this.m_top.ContainsKey(method)
+                || this.m_slots.GetValueOrDefault(method) is var slots && (slots.Open | slots.Combat) != 0;
 
-            // 直接写入：静态数据成为 TOP，当前对象或参数记入已确定槽位。
+            // 直接写入：战斗静态数据成为 TOP，当前对象或参数记入已确定槽位；外部库函数按通用模型。
             internal void ReadDirect(MethodBehavior body, IEnumerable<BehaviorWrite>? reflectionWrites = null)
             {
                 using var timing = this.m_values.Timing.Measure(AnalysisTiming.Part.Effects);
                 if (IsTop(body.MethodId))
                 {
+                    return;
+                }
+                if (body.BodyKind == MethodBodyKind.LibraryModel)
+                {
+                    AddSlots(body.MethodId, RuntimeOperations.ReadLibraryEffect(this.m_catalog, this.m_values.ReadMethod(body.MethodId)).Written, 0);
+                    Propagate();
                     return;
                 }
                 foreach (BehaviorWrite write in body.Writes.Concat(reflectionWrites ?? Enumerable.Empty<BehaviorWrite>()))
@@ -61,14 +68,15 @@ namespace SetterChecker.Core
                     {
                         continue;
                     }
-                    var (isStatic, slots) = write.ReceiverValueId is int receiver ? ClassifyRoot(body.MethodId, receiver)
-                        : (!IsFrameworkStatic(this.m_catalog, write.Member), 0UL);
-                    if (isStatic)
+                    var (owner, pending) = ReadWriteOwner(this.m_catalog, write);
+                    var (isTop, open, combat) = write.ReceiverValueId is int receiver ? ClassifyRoot(body.MethodId, receiver, false, owner, pending)
+                        : (ReadStaticOwner(this.m_catalog, Owner.Open, write.Member) == Owner.Combat, 0UL, 0UL);
+                    if (isTop)
                     {
                         AddTop(body.MethodId, new TopCause(null, write.Point.BlockId, write.Member?.Name ?? write.Kind.ToString()));
                         break;
                     }
-                    AddSlots(body.MethodId, slots);
+                    AddSlots(body.MethodId, open, combat);
                 }
                 Propagate();
             }
@@ -84,12 +92,12 @@ namespace SetterChecker.Core
                 }
                 if (call.RuntimeRule?.Operation == RuntimeOperation.WriteCollection && call.Call.ReceiverValueId is int receiver)
                 {
-                    var (isStatic, slots) = ClassifyRoot(caller, receiver);
-                    if (isStatic)
+                    var (isTop, open, combat) = ClassifyRoot(caller, receiver, false, Owner.Open, false);
+                    if (isTop)
                     {
                         AddTop(caller, new TopCause(null, call.Call.Point.BlockId, call.RuntimeRule.Description));
                     }
-                    AddSlots(caller, slots);
+                    AddSlots(caller, open, combat);
                 }
                 if (call.InvokesUnboundParameter)
                 {
@@ -97,10 +105,6 @@ namespace SetterChecker.Core
                 }
                 foreach (ResolvedCallTarget target in call.Targets)
                 {
-                    if (IsStandardCollectionCtor(this.m_catalog, target))
-                    {
-                        continue;
-                    }
                     if (!this.m_bindings.TryGetValue(target.MethodId, out var bindings))
                     {
                         this.m_bindings.Add(target.MethodId, bindings = new());
@@ -111,7 +115,7 @@ namespace SetterChecker.Core
                 Propagate();
             }
 
-            // 目标 TOP 使调用者 TOP；目标写入的槽位若对应调用者已有对象，调用者随之确定。
+            // 目标 TOP 使调用者 TOP；目标写入的槽位按同一归属规则对应到调用者已有对象。
             private void MapBinding(string caller, ResolvedCallTarget target, int position)
             {
                 if (IsTop(caller))
@@ -123,43 +127,49 @@ namespace SetterChecker.Core
                     AddTop(caller, new TopCause(target.MethodId, position, string.Empty));
                     return;
                 }
-                ulong written = this.m_slots.GetValueOrDefault(target.MethodId);
-                while (written != 0)
+                var (targetOpen, targetCombat) = this.m_slots.GetValueOrDefault(target.MethodId);
+                foreach (var (mask, owner) in new[] { (targetOpen, Owner.Open), (targetCombat, Owner.Combat) })
                 {
-                    int slot = BitOperations.TrailingZeroCount(written);
-                    written &= written - 1;
-                    IReadOnlyList<BehaviorValueReference>? actual = slot == 0 ? target.Receiver
-                        : slot - 1 < target.Arguments.Count ? target.Arguments[slot - 1] : null;
-                    foreach (BehaviorValueReference value in actual ?? Array.Empty<BehaviorValueReference>())
+                    ulong written = mask;
+                    while (written != 0)
                     {
-                        if (value.MethodId != caller)
+                        int slot = BitOperations.TrailingZeroCount(written);
+                        written &= written - 1;
+                        IReadOnlyList<BehaviorValueReference>? actual = slot == 0 ? target.Receiver
+                            : slot - 1 < target.Arguments.Count ? target.Arguments[slot - 1] : null;
+                        bool deep = owner == Owner.Combat || target.IsCallback && slot > 0;
+                        foreach (BehaviorValueReference value in actual ?? Array.Empty<BehaviorValueReference>())
                         {
-                            AddTop(caller, new TopCause(target.MethodId, position, string.Empty));
-                            return;
+                            if (value.MethodId != caller)
+                            {
+                                AddTop(caller, new TopCause(target.MethodId, position, string.Empty));
+                                return;
+                            }
+                            if (value.ValueId < 0)
+                            {
+                                continue;
+                            }
+                            var (isTop, open, combat) = ClassifyRoot(caller, value.ValueId, deep, owner, false);
+                            if (isTop)
+                            {
+                                AddTop(caller, new TopCause(target.MethodId, position, string.Empty));
+                                return;
+                            }
+                            AddSlots(caller, open, combat);
                         }
-                        if (value.ValueId < 0)
-                        {
-                            continue;
-                        }
-                        var (isStatic, slots) = ClassifyRoot(caller, value.ValueId);
-                        if (isStatic)
-                        {
-                            AddTop(caller, new TopCause(target.MethodId, position, string.Empty));
-                            return;
-                        }
-                        AddSlots(caller, slots);
                     }
                 }
             }
 
-            // 按摘要同样的规则在函数内回溯写入目标；调用结果与新对象不据此下结论。
-            private (bool Static, ulong Slots) ClassifyRoot(string method, int value)
+            // 按摘要同样的归属规则在函数内回溯写入目标；调用结果、新对象与未知来源不据此下结论。
+            private (bool Top, ulong Open, ulong Combat) ClassifyRoot(string method, int value, bool deep, Owner owner, bool pendingOwner)
             {
-                ulong slots = 0;
-                Queue<(BehaviorValueReference Reference, bool Deep)> pending = new();
-                pending.Enqueue((new BehaviorValueReference(method, value), false));
-                HashSet<(BehaviorValueReference Reference, bool Deep)> visited = new();
-                while (pending.TryDequeue(out var item))
+                ulong open = 0;
+                ulong combat = 0;
+                Queue<Walk> pending = new();
+                pending.Enqueue(new Walk(new BehaviorValueReference(method, value), deep, owner, pendingOwner));
+                HashSet<Walk> visited = new();
+                while (pending.TryDequeue(out Walk item))
                 {
                     if (!visited.Add(item))
                     {
@@ -172,61 +182,74 @@ namespace SetterChecker.Core
                             continue;
                         }
                         BehaviorValue source = origin.Value;
+                        Walk walk = item;
                         BehaviorValueReference input = source.InputValueIds.Count == 0 ? default : origin.Reference with { ValueId = source.InputValueIds[0] };
+                        int slot = -1;
                         switch (source.Kind)
                         {
                             case BehaviorValueKind.CurrentInstance:
-                                slots |= 1UL;
+                                slot = 0;
                                 break;
                             case BehaviorValueKind.Parameter:
                                 if (source.ParameterIndex is int parameter && parameter >= 0 && parameter < MaxParameterSlot)
                                 {
-                                    slots |= 1UL << (parameter + 1);
+                                    slot = parameter + 1;
                                 }
                                 break;
                             case BehaviorValueKind.FieldRead:
                             case BehaviorValueKind.Address:
-                                if (source.Member != null && source.InputValueIds.Count == 0)
+                                if (source.InputValueIds.Count == 0)
                                 {
-                                    if (IsFrameworkStatic(this.m_catalog, source.Member))
+                                    if (source.Member != null && Settle(ref walk)
+                                        && ReadStaticOwner(this.m_catalog, walk.Owner, source.Member) == Owner.Combat)
                                     {
-                                        break;
+                                        return (true, open, combat);
                                     }
-                                    return (true, slots);
                                 }
-                                if (source.InputValueIds.Count != 0)
+                                else if (Step(this.m_catalog, ref walk, source))
                                 {
-                                    pending.Enqueue((input, item.Deep || source.Kind == BehaviorValueKind.FieldRead && source.Member?.IsReferenceStorage != false));
+                                    pending.Enqueue(walk with { Reference = input });
                                 }
                                 break;
                             case BehaviorValueKind.ArrayElementRead:
-                                if (source.InputValueIds.Count != 0)
+                                if (source.InputValueIds.Count != 0 && Settle(ref walk))
                                 {
-                                    pending.Enqueue((input, true));
+                                    pending.Enqueue(walk with { Reference = input, Deep = true });
                                 }
                                 break;
                             case BehaviorValueKind.ValueCopy:
-                                if (item.Deep && source.InputValueIds.Count != 0)
+                                if (walk.Deep && source.InputValueIds.Count != 0 && Settle(ref walk))
                                 {
-                                    pending.Enqueue((input, true));
+                                    pending.Enqueue(walk with { Reference = input });
                                 }
                                 break;
                         }
+                        if (slot >= 0 && Settle(ref walk))
+                        {
+                            if (walk.Owner == Owner.Combat)
+                            {
+                                combat |= 1UL << slot;
+                            }
+                            else
+                            {
+                                open |= 1UL << slot;
+                            }
+                        }
                     }
                 }
-                return (false, slots);
+                return (false, open, combat);
             }
 
             // 已确定槽位只增加；新增后通知调用者重新换算。
-            private void AddSlots(string method, ulong slots)
+            private void AddSlots(string method, ulong open, ulong combat)
             {
-                ulong old = this.m_slots.GetValueOrDefault(method);
-                if ((old | slots) == old || IsTop(method))
+                var old = this.m_slots.GetValueOrDefault(method);
+                if ((old.Open | open) == old.Open && (old.Combat | combat) == old.Combat || IsTop(method))
                 {
                     return;
                 }
-                this.m_slots[method] = old | slots;
-                if (old == 0)
+                this.m_slots[method] = (old.Open | open, old.Combat | combat);
+                if ((old.Open | old.Combat) == 0)
                 {
                     this.m_settled.Add(method);
                 }
@@ -275,46 +298,69 @@ namespace SetterChecker.Core
 
         internal const string UnboundCallbackDetail = "调用未固定目标的委托参数，合法回调允许修改状态";
 
-        private static readonly System.Text.RegularExpressions.Regex s_frameworkTypeId = new(
-            @"^A\d+:(MSCORLIB|NETSTANDARD|SYSTEM(\.[A-Z0-9_]+)*|MICROSOFT\.[A-Z0-9_.]+)T\d+:", System.Text.RegularExpressions.RegexOptions.Compiled);
-
-        // R8：标准库类型自身的静态字段是运行时内部缓存（区域设置、资源字符串等），不属于战斗状态。
-        private static bool IsFrameworkStatic(MethodCatalogResult catalog, BehaviorMemberReference? member)
+        // V3 设计 2.2 节：归属字段在战斗程序集中声明时是战斗状态；声明位置不明时按战斗状态处理。
+        private static Owner ClassifyField(MethodCatalogResult catalog, BehaviorMemberReference member)
         {
-            if (member == null)
+            string? assembly = member.TargetAssemblyIdentity.Length != 0 ? member.TargetAssemblyIdentity.Split(',')[0]
+                : catalog.TypesById.TryGetValue(member.DeclaringTypeDefinitionId, out TypeEntry? type) ? type.AssemblyName : null;
+            return assembly == null || catalog.CombatAssemblies.Contains(assembly) ? Owner.Combat : Owner.Other;
+        }
+
+        // 结构体成员不改变归属；声明类型不明时按结构体成员处理，交由外层存储判定。
+        private static bool IsValueMember(MethodCatalogResult catalog, BehaviorMemberReference member)
+            => member.SourceSymbol?.ContainingType?.IsValueType
+                ?? (catalog.TypesById.TryGetValue(member.DeclaringTypeDefinitionId, out TypeEntry? type) ? type.IsValueType : true);
+
+        // 字段写入：引用类型对象的字段本身决定归属，并待查其容器是否为本函数新对象；结构体成员与元素写入归属未定。
+        private static (Owner Owner, bool Pending) ReadWriteOwner(MethodCatalogResult catalog, BehaviorWrite write)
+            => write.Kind == BehaviorWriteKind.Field && write.Member != null && !IsValueMember(catalog, write.Member)
+                ? (ClassifyField(catalog, write.Member), true) : (Owner.Open, false);
+
+        // 静态存储就是归属字段；未定归属时由它决定，没有字段身份时按战斗状态处理。
+        private static Owner ReadStaticOwner(MethodCatalogResult catalog, Owner owner, BehaviorMemberReference? member)
+            => owner != Owner.Open ? owner : member == null ? Owner.Combat : ClassifyField(catalog, member);
+
+        // 当前值不是本函数新对象：待查的归属就此确定，非战斗归属的路径不再计入。
+        private static bool Settle(ref Walk walk)
+        {
+            if (walk.Pending)
+            {
+                if (walk.Owner == Owner.Other)
+                {
+                    return false;
+                }
+                walk = walk with { Pending = false };
+            }
+            return true;
+        }
+
+        // 回溯经过字段读取或字段地址：归属未定时，首个引用字段或引用类型对象上的字段决定归属；局部与参数地址保持原存储。
+        private static bool Step(MethodCatalogResult catalog, ref Walk walk, BehaviorValue source)
+        {
+            if (source.Kind == BehaviorValueKind.Address && source.Member == null)
+            {
+                return true;
+            }
+            if (!Settle(ref walk))
             {
                 return false;
             }
-            if (catalog.TypesById.TryGetValue(member.DeclaringTypeDefinitionId, out TypeEntry? type))
+            BehaviorMemberReference? member = source.Member;
+            bool reference = source.Kind == BehaviorValueKind.FieldRead && member?.IsReferenceStorage != false;
+            if (walk.Owner == Owner.Open && member != null && (reference || !IsValueMember(catalog, member)))
             {
-                string name = type.AssemblyName;
-                return name is "mscorlib" or "netstandard" or "System.Private.CoreLib"
-                    || name.StartsWith("System.", StringComparison.Ordinal) || name.StartsWith("Microsoft.", StringComparison.Ordinal)
-                    || name == "System";
+                walk = walk with { Owner = ClassifyField(catalog, member), Pending = true };
             }
-            return s_frameworkTypeId.IsMatch(member.DeclaringTypeDefinitionId);
+            if (reference)
+            {
+                walk = walk with { Deep = true };
+            }
+            return true;
         }
 
-        // 标准 List/Dictionary 构造只初始化新容器，与原有规则一致不展开其内部实现。
-        private static bool IsStandardCollectionCtor(MethodCatalogResult catalog, ResolvedCallTarget target)
-        {
-            if (target.Reference.Name != ".ctor")
-            {
-                return false;
-            }
-            // 只认 List/Dictionary 本身；嵌套的 Enumerator、KeyCollection 等构造会保存原集合，必须照常分析。
-            string id = target.Reference.DeclaringTypeDefinitionId;
-            if (catalog.TypesById.TryGetValue(id, out TypeEntry? type))
-            {
-                return !type.FullName.Contains('+')
-                    && (type.FullName is "System.Collections.Generic.List`1" or "System.Collections.Generic.Dictionary`2"
-                        || type.FullName.StartsWith("System.Collections.Generic.List<", StringComparison.Ordinal)
-                        || type.FullName.StartsWith("System.Collections.Generic.Dictionary<", StringComparison.Ordinal));
-            }
-            return System.Text.RegularExpressions.Regex.IsMatch(id, @":System\.Collections\.Generic\.(List`1|Dictionary`2)(\||$)");
-        }
         private const int StaticBit = 128;
         private const int UnknownBit = 129;
+        private const int CombatBit = 130;
         private const int ReturnSlot = 63;
         private const int MaxParameterSlot = 62;
 
@@ -519,6 +565,10 @@ namespace SetterChecker.Core
                     ApplyTop(method, summary);
                     return summary;
                 }
+                if (body.BodyKind == MethodBodyKind.LibraryModel)
+                {
+                    return ReadLibrarySummary(method);
+                }
                 string? failure = body.Failure ?? (body.BodyKind != MethodBodyKind.Executable
                     ? body.NativeBoundary?.ToString() ?? $"没有可读取的托管函数体：{body.BodyKind}" : null);
                 if (failure != null)
@@ -537,8 +587,10 @@ namespace SetterChecker.Core
                         this.m_ignoredLazyWrites++;
                         continue;
                     }
-                    IReadOnlyList<EffectRoot> targets = write.ReceiverValueId is int receiver ? ReadRoots(state, receiver, false)
-                        : IsFrameworkStatic(this.m_catalog, write.Member) ? Array.Empty<EffectRoot>() : new[] { EffectRoot.Static };
+                    var (owner, pendingOwner) = ReadWriteOwner(this.m_catalog, write);
+                    IReadOnlyList<EffectRoot> targets = write.ReceiverValueId is int receiver ? ReadRoots(state, receiver, false, owner, pendingOwner)
+                        : ReadStaticOwner(this.m_catalog, Owner.Open, write.Member) == Owner.Combat ? new[] { EffectRoot.Static(Owner.Combat) }
+                        : Array.Empty<EffectRoot>();
                     SummaryCause cause = new(write.Point, null, -1, write.Member?.Name ?? write.Kind.ToString());
                     foreach (EffectRoot target in targets)
                     {
@@ -583,10 +635,37 @@ namespace SetterChecker.Core
                 {
                     ValueSummary written = ReadValueSummary(state, values, out ulong alias);
                     written.DeepSlots |= alias & ~(1UL << ReturnSlot);
-                    written.Static |= (alias & (1UL << ReturnSlot)) != 0;
+                    written.StaticCombat |= (alias & (1UL << ReturnSlot)) != 0;
                     (summary.Outs ??= new()).Add(index, written);
                 }
                 ApplyTop(method, summary);
+                return summary;
+            }
+
+            // V3 设计 3.2 节：外部库函数按签名建模，返回值可能是新对象、库内全局对象或接收对象与实参所含的任一对象。
+            private MethodSummary ReadLibrarySummary(string method)
+            {
+                MethodEntry entry = this.m_values.ReadMethod(method);
+                LibraryEffect effect = RuntimeOperations.ReadLibraryEffect(this.m_catalog, entry);
+                MethodSummary summary = new();
+                foreach (int slot in Bits(effect.Written))
+                {
+                    summary.SetBit(slot, new SummaryCause(new BehaviorFlowPoint(-1, 0), null, -1, effect.Reasons[slot]));
+                }
+                summary.AddInto(0, effect.StoredIntoReceiver);
+                ulong sources = entry.IsStatic ? 0 : 1UL;
+                for (int index = 0; index < entry.Parameters.Count && index < MaxParameterSlot; index++)
+                {
+                    sources |= 1UL << (index + 1);
+                }
+                summary.Return = new ValueSummary { Fresh = true, Static = entry.IsStatic, DeepSlots = sources };
+                for (int index = 0; index < entry.Parameters.Count && index < MaxParameterSlot; index++)
+                {
+                    if (entry.Parameters[index].RefKind is Microsoft.CodeAnalysis.RefKind.Ref or Microsoft.CodeAnalysis.RefKind.Out)
+                    {
+                        (summary.Outs ??= new()).Add(index, summary.Return);
+                    }
+                }
                 return summary;
             }
 
@@ -600,7 +679,7 @@ namespace SetterChecker.Core
                 }
             }
 
-            // 一次调用：运行时规则、未绑定回调或把被调函数摘要换算到本函数的实参。
+            // 一次调用：运行时规则、未绑定回调或把被调函数摘要换算到本函数的实参；回调的实参是库函数实参所含的内容。
             private void ReadCall(MethodState state, BehaviorCall call)
             {
                 string method = state.Method;
@@ -632,7 +711,7 @@ namespace SetterChecker.Core
                 }
                 if (resolved.InvokesUnboundParameter)
                 {
-                    state.Effects.Add((EffectRoot.Static, false, new(call.Point, null, -1, UnboundCallbackDetail)));
+                    state.Effects.Add((EffectRoot.Static(Owner.Combat), false, new(call.Point, null, -1, UnboundCallbackDetail)));
                 }
                 if (resolved.ValuesOnly)
                 {
@@ -640,18 +719,10 @@ namespace SetterChecker.Core
                 }
                 foreach (ResolvedCallTarget target in resolved.Targets)
                 {
-                    if (IsStandardCollectionConstructor(target))
-                    {
-                        // 标准集合构造不修改已有对象，但复制构造会把实参中的对象引用存进新集合。
-                        Store(state, ReadActualRoots(state, target, 0, false),
-                            call.Arguments.Where(argument => !IsValueTypeValue(state.Method, argument.ValueId))
-                                .SelectMany(argument => ReadRoots(state, argument.ValueId, false)).ToArray());
-                        continue;
-                    }
                     MethodSummary callee = ReadSummary(target.MethodId);
                     if (callee.Static)
                     {
-                        state.Effects.Add((EffectRoot.Static, false, new(call.Point, target.MethodId, StaticBit, string.Empty)));
+                        state.Effects.Add((EffectRoot.Static(Owner.Combat), false, new(call.Point, target.MethodId, StaticBit, string.Empty)));
                     }
                     if (callee.Unknown != null)
                     {
@@ -659,11 +730,15 @@ namespace SetterChecker.Core
                     }
                     foreach (int slot in Bits(callee.Shallow))
                     {
-                        MapSlot(state, call, target, slot, false, new(call.Point, target.MethodId, slot, string.Empty));
+                        MapSlot(state, target, slot, target.IsCallback && slot > 0, Owner.Open, false, new(call.Point, target.MethodId, slot, string.Empty));
                     }
                     foreach (int slot in Bits(callee.Deep))
                     {
-                        MapSlot(state, call, target, slot, true, new(call.Point, target.MethodId, 64 + slot, string.Empty));
+                        MapSlot(state, target, slot, true, Owner.Open, true, new(call.Point, target.MethodId, 64 + slot, string.Empty));
+                    }
+                    foreach (int slot in Bits(callee.Combat))
+                    {
+                        MapSlot(state, target, slot, true, Owner.Combat, true, new(call.Point, target.MethodId, CombatBit + slot, string.Empty));
                     }
                     if (callee.Into == null)
                     {
@@ -676,20 +751,20 @@ namespace SetterChecker.Core
                         {
                             if (source == ReturnSlot)
                             {
-                                values.Add(EffectRoot.Static);
+                                values.Add(EffectRoot.Static(Owner.Combat));
                                 continue;
                             }
-                            values.AddRange(ReadActualRoots(state, target, source, false));
+                            values.AddRange(ReadActualRoots(state, target, source, target.IsCallback && source > 0, Owner.Open));
                         }
                         if (destination == ReturnSlot)
                         {
-                            if (call.ResultValueId is int result)
+                            if (call.ResultValueId is int result && !target.IsCallback)
                             {
                                 state.AddFreshSources(result, values);
                             }
                             continue;
                         }
-                        Store(state, ReadActualRoots(state, target, destination, false), values);
+                        Store(state, ReadActualRoots(state, target, destination, target.IsCallback && destination > 0, Owner.Open), values);
                     }
                 }
             }
@@ -746,17 +821,17 @@ namespace SetterChecker.Core
                 }
             }
 
-            // 被调函数写入的槽位对应到本调用的实参；实参属于其他函数时按静态处理。
-            private void MapSlot(MethodState state, BehaviorCall call, ResolvedCallTarget target, int slot, bool deep, SummaryCause cause)
+            // 被调函数写入的槽位按已定或未定归属对应到本调用的实参；实参属于其他函数时按静态处理。
+            private void MapSlot(MethodState state, ResolvedCallTarget target, int slot, bool deep, Owner owner, bool deepWrite, SummaryCause cause)
             {
-                foreach (EffectRoot root in ReadActualRoots(state, target, slot, false))
+                foreach (EffectRoot root in ReadActualRoots(state, target, slot, deep, owner))
                 {
-                    state.Effects.Add((root, deep, cause));
+                    state.Effects.Add((root, deepWrite, cause));
                 }
             }
 
             // 读取目标函数某个槽位对应实参的根。
-            private IReadOnlyList<EffectRoot> ReadActualRoots(MethodState state, ResolvedCallTarget target, int slot, bool deep)
+            private IReadOnlyList<EffectRoot> ReadActualRoots(MethodState state, ResolvedCallTarget target, int slot, bool deep, Owner owner)
             {
                 IReadOnlyList<BehaviorValueReference>? actual = slot == 0 ? target.Receiver
                     : slot - 1 < target.Arguments.Count ? target.Arguments[slot - 1] : null;
@@ -769,7 +844,7 @@ namespace SetterChecker.Core
                 {
                     if (value.MethodId != state.Method)
                     {
-                        roots.Add(EffectRoot.Foreign);
+                        roots.Add(EffectRoot.ForeignOf(owner));
                         continue;
                     }
                     if (value.ValueId < 0)
@@ -777,7 +852,7 @@ namespace SetterChecker.Core
                         roots.Add(EffectRoot.UnknownOf("实参来源尚未确定"));
                         continue;
                     }
-                    roots.AddRange(ReadRoots(state, value.ValueId, deep));
+                    roots.AddRange(ReadRoots(state, value.ValueId, deep, owner));
                 }
                 return roots;
             }
@@ -802,7 +877,7 @@ namespace SetterChecker.Core
                 }
             }
 
-            // 把一个根上的写入落到摘要；经由新对象的深写传到它的别名根。
+            // 把一个根上的写入落到摘要；经由新对象的深写传到它的别名根，路径已定的战斗归属覆盖别名自身的未定归属。
             private void Apply(MethodState state, MethodSummary summary, EffectRoot root, bool deepWrite, SummaryCause cause, HashSet<int> visiting)
             {
                 bool deep = deepWrite || root.Deep;
@@ -810,9 +885,14 @@ namespace SetterChecker.Core
                 {
                     case EffectRootKind.Receiver:
                     case EffectRootKind.Parameter:
-                        summary.SetBit(deep ? 64 + root.Slot : root.Slot, cause);
+                        summary.SetBit(root.Owner == Owner.Combat ? CombatBit + root.Slot : deep ? 64 + root.Slot : root.Slot, cause);
                         break;
                     case EffectRootKind.Static:
+                        if (root.Owner == Owner.Combat)
+                        {
+                            summary.SetBit(StaticBit, cause);
+                        }
+                        break;
                     case EffectRootKind.Foreign:
                         summary.SetBit(StaticBit, cause);
                         break;
@@ -821,7 +901,7 @@ namespace SetterChecker.Core
                         {
                             foreach (EffectRoot alias in ReadAliasRoots(state, root.Site))
                             {
-                                Apply(state, summary, alias, true, cause, visiting);
+                                Apply(state, summary, root.Owner == Owner.Combat ? alias with { Owner = Owner.Combat } : alias, true, cause, visiting);
                             }
                         }
                         break;
@@ -865,18 +945,23 @@ namespace SetterChecker.Core
                 return result;
             }
 
-            // 返回值或 out 写出值的来源说明；新对象的别名槽位单独返回。
+            // 返回值或 out 写出值的来源说明；新对象的别名槽位单独返回，经新对象成员取得的值按别名自身记入。
             private ValueSummary ReadValueSummary(MethodState state, IEnumerable<EffectRoot> roots, out ulong alias)
             {
                 ValueSummary summary = new();
-                alias = 0;
-                foreach (EffectRoot root in roots)
+                ulong aliases = 0;
+                HashSet<int> visiting = new();
+                void Fold(EffectRoot root)
                 {
                     switch (root.Kind)
                     {
                         case EffectRootKind.Receiver:
                         case EffectRootKind.Parameter:
-                            if (root.Deep)
+                            if (root.Owner == Owner.Combat)
+                            {
+                                summary.CombatSlots |= 1UL << root.Slot;
+                            }
+                            else if (root.Deep)
                             {
                                 summary.DeepSlots |= 1UL << root.Slot;
                             }
@@ -886,11 +971,25 @@ namespace SetterChecker.Core
                             }
                             break;
                         case EffectRootKind.Static:
-                            summary.Static = true;
+                            if (root.Owner == Owner.Combat)
+                            {
+                                summary.StaticCombat = true;
+                            }
+                            else
+                            {
+                                summary.Static = true;
+                            }
                             break;
                         case EffectRootKind.Fresh:
                             summary.Fresh = true;
-                            alias |= SlotsOf(state, ReadAliasRoots(state, root.Site));
+                            aliases |= SlotsOf(state, ReadAliasRoots(state, root.Site));
+                            if (root.Deep && visiting.Add(root.Site))
+                            {
+                                foreach (EffectRoot inner in ReadAliasRoots(state, root.Site))
+                                {
+                                    Fold(root.Owner == Owner.Combat ? inner with { Owner = Owner.Combat } : inner);
+                                }
+                            }
                             break;
                         case EffectRootKind.Foreign:
                             summary.Unknown ??= "返回值来自其他函数的对象";
@@ -900,6 +999,11 @@ namespace SetterChecker.Core
                             break;
                     }
                 }
+                foreach (EffectRoot root in roots)
+                {
+                    Fold(root);
+                }
+                alias = aliases;
                 return summary;
             }
 
@@ -924,15 +1028,15 @@ namespace SetterChecker.Core
             private static BehaviorValueReference[] ReadInputs(ValueOrigin origin)
                 => origin.Value.InputValueIds.Select(input => origin.Reference with { ValueId = input }).ToArray();
 
-            // 值在本函数内的最终来源；调用结果用被调函数的返回摘要换算。
-            private IReadOnlyList<EffectRoot> ReadRoots(MethodState state, int valueId, bool deep)
+            // 值在本函数内的最终来源及归属；调用结果用被调函数的返回摘要换算。
+            private IReadOnlyList<EffectRoot> ReadRoots(MethodState state, int valueId, bool deep, Owner owner = Owner.Open, bool pendingOwner = false)
             {
-                if (state.Roots.TryGetValue((valueId, deep), out List<EffectRoot>? known))
+                if (state.Roots.TryGetValue((valueId, deep, owner, pendingOwner), out List<EffectRoot>? known))
                 {
                     return known;
                 }
                 List<EffectRoot> result = new();
-                state.Roots.Add((valueId, deep), result);
+                state.Roots.Add((valueId, deep, owner, pendingOwner), result);
                 HashSet<EffectRoot> seen = new();
                 void Add(EffectRoot root)
                 {
@@ -941,24 +1045,24 @@ namespace SetterChecker.Core
                         result.Add(root);
                     }
                 }
-                Queue<(BehaviorValueReference Reference, bool Deep)> pending = new();
-                HashSet<(BehaviorValueReference Reference, bool Deep)> visited = new();
-                pending.Enqueue((new BehaviorValueReference(state.Method, valueId), deep));
-                while (pending.TryDequeue(out var item))
+                Queue<Walk> pending = new();
+                HashSet<Walk> visited = new();
+                pending.Enqueue(new Walk(new BehaviorValueReference(state.Method, valueId), deep, owner, pendingOwner));
+                while (pending.TryDequeue(out Walk item))
                 {
                     if (!visited.Add(item))
                     {
                         continue;
                     }
-                    bool d = item.Deep;
                     foreach (ValueOrigin origin in this.m_values.ReadLocalOrigins(item.Reference, state.Method, observe: false))
                     {
                         BehaviorValue value = origin.Value;
+                        Walk walk = item;
                         if (origin.Reference.MethodId != state.Method)
                         {
-                            if (value.Kind is not (BehaviorValueKind.Local or BehaviorValueKind.Constant))
+                            if (value.Kind is not (BehaviorValueKind.Local or BehaviorValueKind.Constant) && Settle(ref walk))
                             {
-                                Add(EffectRoot.Foreign);
+                                Add(EffectRoot.ForeignOf(walk.Owner));
                             }
                             continue;
                         }
@@ -966,16 +1070,19 @@ namespace SetterChecker.Core
                         switch (value.Kind)
                         {
                             case BehaviorValueKind.CurrentInstance:
-                                Add(new(EffectRootKind.Receiver, 0, 0, d, null));
+                                if (Settle(ref walk))
+                                {
+                                    Add(new(EffectRootKind.Receiver, 0, 0, walk.Deep, walk.Owner, null));
+                                }
                                 break;
                             case BehaviorValueKind.Parameter:
-                                if (value.ParameterIndex is int parameter && parameter >= 0 && parameter < MaxParameterSlot)
-                                {
-                                    Add(new(EffectRootKind.Parameter, parameter + 1, 0, d, null));
-                                }
-                                else
+                                if (value.ParameterIndex is not int parameter || parameter < 0 || parameter >= MaxParameterSlot)
                                 {
                                     Add(EffectRoot.UnknownOf("参数超出摘要可表示范围"));
+                                }
+                                else if (Settle(ref walk))
+                                {
+                                    Add(new(EffectRootKind.Parameter, parameter + 1, 0, walk.Deep, walk.Owner, null));
                                 }
                                 break;
                             case BehaviorValueKind.Local:
@@ -988,10 +1095,10 @@ namespace SetterChecker.Core
                             case BehaviorValueKind.NewObject:
                             case BehaviorValueKind.NewArray:
                             case BehaviorValueKind.Iterator:
-                                Add(new(EffectRootKind.Fresh, 0, origin.Reference.ValueId, d, null));
+                                Add(EffectRoot.FreshOf(origin.Reference.ValueId, walk));
                                 break;
                             case BehaviorValueKind.ShallowCopy:
-                                Add(new(EffectRootKind.Fresh, 0, origin.Reference.ValueId, d, null));
+                                Add(EffectRoot.FreshOf(origin.Reference.ValueId, walk));
                                 if (!state.CopySources.Contains(origin.Reference.ValueId))
                                 {
                                     state.CopySources.Add(origin.Reference.ValueId);
@@ -999,7 +1106,7 @@ namespace SetterChecker.Core
                                     foreach (BehaviorValueReference source in origin.BoundReceiver
                                         ?? ReadInputs(origin))
                                     {
-                                        copied.AddRange(source.MethodId != state.Method ? new[] { EffectRoot.Foreign }
+                                        copied.AddRange(source.MethodId != state.Method ? new[] { EffectRoot.ForeignOf(Owner.Open) }
                                             : source.ValueId < 0 ? new[] { EffectRoot.UnknownOf("浅复制来源尚未确定") }
                                             : ReadRoots(state, source.ValueId, true));
                                     }
@@ -1009,70 +1116,86 @@ namespace SetterChecker.Core
                             case BehaviorValueKind.FieldRead:
                                 if (value.InputValueIds.Count == 0)
                                 {
-                                    if (!IsFrameworkStatic(this.m_catalog, value.Member))
+                                    if (!Settle(ref walk))
                                     {
-                                        Add(value.Member != null ? EffectRoot.Static : EffectRoot.UnknownOf(value.Reference ?? "写入对象来源尚未确定"));
+                                        break;
+                                    }
+                                    if (value.Member == null)
+                                    {
+                                        Add(EffectRoot.UnknownOf(value.Reference ?? "写入对象来源尚未确定"));
+                                    }
+                                    else if (ReadStaticOwner(this.m_catalog, walk.Owner, value.Member) == Owner.Combat)
+                                    {
+                                        Add(EffectRoot.Static(Owner.Combat));
                                     }
                                 }
-                                else
+                                else if (Step(this.m_catalog, ref walk, value))
                                 {
-                                    pending.Enqueue((firstInput, d || value.Member?.IsReferenceStorage != false));
+                                    pending.Enqueue(walk with { Reference = firstInput });
                                 }
                                 break;
                             case BehaviorValueKind.ArrayElementRead:
+                                if (!Settle(ref walk))
+                                {
+                                    break;
+                                }
                                 if (value.InputValueIds.Count == 0)
                                 {
                                     Add(EffectRoot.UnknownOf("写入对象来源尚未确定"));
                                 }
                                 else
                                 {
-                                    pending.Enqueue((firstInput, true));
+                                    pending.Enqueue(walk with { Reference = firstInput, Deep = true });
                                 }
                                 break;
                             case BehaviorValueKind.Address:
                                 if (value.Member != null && value.InputValueIds.Count == 0)
                                 {
-                                    if (!IsFrameworkStatic(this.m_catalog, value.Member))
+                                    if (Settle(ref walk) && ReadStaticOwner(this.m_catalog, walk.Owner, value.Member) == Owner.Combat)
                                     {
-                                        Add(EffectRoot.Static);
+                                        Add(EffectRoot.Static(Owner.Combat));
                                     }
                                 }
                                 else if (value.InputValueIds.Count != 0)
                                 {
-                                    pending.Enqueue((firstInput, d));
-                                    // 经局部变量地址做深写时，要追到赋给该变量的值（例如结构体枚举器中保存的原集合）。
-                                    if (d && value.Member == null && this.m_bodies.TryGetValue(origin.Reference.MethodId, out MethodBehavior? owner))
+                                    if (!Step(this.m_catalog, ref walk, value))
                                     {
-                                        foreach (BehaviorAssignment assignment in owner.Assignments)
+                                        break;
+                                    }
+                                    pending.Enqueue(walk with { Reference = firstInput });
+                                    // 经局部变量地址做深写时，要追到赋给该变量的值（例如结构体枚举器中保存的原集合）。
+                                    if (walk.Deep && value.Member == null && this.m_bodies.TryGetValue(origin.Reference.MethodId, out MethodBehavior? body))
+                                    {
+                                        foreach (BehaviorAssignment assignment in body.Assignments)
                                         {
                                             if (assignment.TargetValueId == firstInput.ValueId)
                                             {
-                                                pending.Enqueue((origin.Reference with { ValueId = assignment.ValueId }, true));
+                                                pending.Enqueue(walk with { Reference = origin.Reference with { ValueId = assignment.ValueId } });
                                             }
                                         }
                                     }
                                 }
-                                else if (d)
+                                else if (walk.Deep && Settle(ref walk))
                                 {
                                     Add(EffectRoot.UnknownOf("写入对象来源尚未确定"));
                                 }
                                 break;
                             case BehaviorValueKind.ValueCopy:
-                                if (d)
+                                if (walk.Deep && Settle(ref walk))
                                 {
                                     foreach (BehaviorValueReference source in origin.BoundReceiver
                                         ?? ReadInputs(origin))
                                     {
-                                        pending.Enqueue((source, true));
+                                        pending.Enqueue(walk with { Reference = source });
                                     }
                                 }
                                 break;
                             case BehaviorValueKind.CallResult:
-                                foreach (var mapped in ReadCallResult(state, origin, d))
+                                foreach (var mapped in ReadCallResult(state, origin, walk))
                                 {
-                                    if (mapped.Reference is BehaviorValueReference next)
+                                    if (mapped.Next is Walk next)
                                     {
-                                        pending.Enqueue((next, mapped.Deep));
+                                        pending.Enqueue(next);
                                     }
                                     else
                                     {
@@ -1081,7 +1204,10 @@ namespace SetterChecker.Core
                                 }
                                 break;
                             default:
-                                Add(EffectRoot.UnknownOf("写入对象来源尚未确定"));
+                                if (Settle(ref walk))
+                                {
+                                    Add(EffectRoot.UnknownOf("写入对象来源尚未确定"));
+                                }
                                 break;
                         }
                     }
@@ -1089,35 +1215,37 @@ namespace SetterChecker.Core
                 return result;
             }
 
-            // 调用结果按被调函数的返回（或 out 写出）摘要对应到本调用的实参。
-            private IEnumerable<(BehaviorValueReference? Reference, bool Deep, EffectRoot? Root)> ReadCallResult(MethodState state, ValueOrigin origin, bool deep)
+            // 调用结果按被调函数的返回（或 out 写出）摘要对应到本调用的实参；回调的返回值不是调用结果。
+            private IEnumerable<(Walk? Next, EffectRoot? Root)> ReadCallResult(MethodState state, ValueOrigin origin, Walk walk)
             {
                 if (!this.m_values.TryReadValueCall(origin.Reference, out BehaviorCall? call))
                 {
-                    yield return (null, false, EffectRoot.UnknownOf("调用结果来源尚未确定"));
+                    yield return (null, EffectRoot.UnknownOf("调用结果来源尚未确定"));
                     yield break;
                 }
                 this.m_pending.TryGetValue((state.Method, call!.Point), out PendingCall? pending);
                 if (!this.m_calls.TryGetValue((state.Method, call.Point), out ResolvedCall? resolved))
                 {
-                    yield return (null, false, EffectRoot.UnknownOf(pending?.Failure ?? "调用目标尚未确定"));
+                    yield return (null, EffectRoot.UnknownOf(pending?.Failure ?? "调用目标尚未确定"));
                     yield break;
                 }
                 string? failure = pending?.Failure ?? resolved.Failure;
                 if (failure != null)
                 {
-                    yield return (null, false, EffectRoot.UnknownOf(failure));
+                    yield return (null, EffectRoot.UnknownOf(failure));
                 }
-                if (resolved.RuntimeRule != null || resolved.InvokesUnboundParameter && resolved.Targets.Count == 0)
+                if (resolved.RuntimeRule != null || resolved.InvokesUnboundParameter && resolved.Targets.All(target => target.IsCallback))
                 {
                     if (resolved.InvokesUnboundParameter)
                     {
-                        yield return (null, false, EffectRoot.UnknownOf("未固定回调的返回值来源尚未确定"));
+                        yield return (null, EffectRoot.UnknownOf("未固定回调的返回值来源尚未确定"));
                     }
                     yield break;
                 }
+                Walk settled = walk;
+                bool live = Settle(ref settled);
                 int? output = origin.Value.ParameterIndex;
-                foreach (ResolvedCallTarget target in resolved.Targets)
+                foreach (ResolvedCallTarget target in resolved.Targets.Where(target => !target.IsCallback))
                 {
                     MethodSummary callee = ReadSummary(target.MethodId);
                     ValueSummary? returned = output is int index
@@ -1125,22 +1253,26 @@ namespace SetterChecker.Core
                         : callee.Return;
                     if (returned is not ValueSummary value)
                     {
-                        yield return (null, false, EffectRoot.UnknownOf("out 参数写出来源尚未确定"));
+                        yield return (null, EffectRoot.UnknownOf("out 参数写出来源尚未确定"));
                         continue;
                     }
                     if (value.Unknown != null)
                     {
-                        yield return (null, false, EffectRoot.UnknownOf(value.Unknown));
+                        yield return (null, EffectRoot.UnknownOf(value.Unknown));
                     }
-                    if (value.Static)
+                    if (value.Static && live)
                     {
-                        yield return (null, false, EffectRoot.Static);
+                        yield return (null, EffectRoot.Static(settled.Owner));
+                    }
+                    if (value.StaticCombat && live)
+                    {
+                        yield return (null, EffectRoot.Static(settled.Owner == Owner.Open ? Owner.Combat : settled.Owner));
                     }
                     if (value.Fresh)
                     {
-                        yield return (null, false, new EffectRoot(EffectRootKind.Fresh, 0, origin.Reference.ValueId, deep, null));
+                        yield return (null, EffectRoot.FreshOf(origin.Reference.ValueId, walk));
                     }
-                    foreach (var (mask, forceDeep) in new[] { (value.Slots, false), (value.DeepSlots, true) })
+                    foreach (var (mask, kind) in new[] { (value.Slots, 0), (value.DeepSlots, 1), (value.CombatSlots, 2) })
                     {
                         foreach (int slot in Bits(mask))
                         {
@@ -1148,22 +1280,40 @@ namespace SetterChecker.Core
                                 : slot - 1 < target.Arguments.Count ? target.Arguments[slot - 1] : null;
                             if (actual == null)
                             {
-                                yield return (null, false, EffectRoot.UnknownOf("调用实参与目标参数不对应"));
+                                yield return (null, EffectRoot.UnknownOf("调用实参与目标参数不对应"));
                                 continue;
                             }
                             foreach (BehaviorValueReference input in actual)
                             {
-                                yield return input.MethodId != state.Method ? (null, false, EffectRoot.Foreign)
-                                    : input.ValueId < 0 ? (null, false, EffectRoot.UnknownOf("实参来源尚未确定"))
-                                    : (input, deep || forceDeep, null);
+                                if (input.MethodId != state.Method)
+                                {
+                                    if (live)
+                                    {
+                                        yield return (null, EffectRoot.ForeignOf(settled.Owner));
+                                    }
+                                }
+                                else if (input.ValueId < 0)
+                                {
+                                    yield return (null, EffectRoot.UnknownOf("实参来源尚未确定"));
+                                }
+                                else if (kind == 0)
+                                {
+                                    yield return (walk with { Reference = input }, null);
+                                }
+                                else if (live)
+                                {
+                                    yield return (settled with
+                                    {
+                                        Reference = input,
+                                        Deep = true,
+                                        Owner = kind == 2 && settled.Owner == Owner.Open ? Owner.Combat : settled.Owner,
+                                    }, null);
+                                }
                             }
                         }
                     }
                 }
             }
-
-            // 标准 List/Dictionary 构造只初始化新容器。
-            private bool IsStandardCollectionConstructor(ResolvedCallTarget target) => IsStandardCollectionCtor(this.m_catalog, target);
 
             // 沿首个原因还原一条调用证据链。
             private EffectEvidence ReadEvidence(string method, int bit)
@@ -1206,7 +1356,7 @@ namespace SetterChecker.Core
         private sealed class MethodState(string method)
         {
             internal string Method { get; } = method;
-            internal Dictionary<(int Value, bool Deep), List<EffectRoot>> Roots { get; } = new();
+            internal Dictionary<(int Value, bool Deep, Owner Owner, bool Pending), List<EffectRoot>> Roots { get; } = new();
             internal List<(EffectRoot Root, bool Deep, SummaryCause Cause)> Effects { get; } = new();
             internal List<(int Slot, IReadOnlyList<EffectRoot> Values)> Stores { get; } = new();
             internal Dictionary<int, List<EffectRoot>> FreshSources { get; } = new();
@@ -1230,12 +1380,22 @@ namespace SetterChecker.Core
         /// <summary>解析期 TOP 的首个原因。</summary>
         internal sealed record TopCause(string? Callee, int Position, string Detail);
 
-        /// <summary>值在本函数内的最终来源。</summary>
-        private readonly record struct EffectRoot(EffectRootKind Kind, int Slot, int Site, bool Deep, string? Reason)
+        /// <summary>被写存储的归属：未定（交给调用方）、战斗状态、非战斗状态（V3 设计 2.2 节）。</summary>
+        private enum Owner : byte { Open, Combat, Other }
+
+        /// <summary>回溯中的一个值：是否已经过引用成员、当前归属，以及归属字段的容器是否仍待确认不是本函数新对象。</summary>
+        private readonly record struct Walk(BehaviorValueReference Reference, bool Deep, Owner Owner, bool Pending);
+
+        /// <summary>值在本函数内的最终来源及写入归属。</summary>
+        private readonly record struct EffectRoot(EffectRootKind Kind, int Slot, int Site, bool Deep, Owner Owner, string? Reason)
         {
-            internal static EffectRoot Static => new(EffectRootKind.Static, 0, 0, false, null);
-            internal static EffectRoot Foreign => new(EffectRootKind.Foreign, 0, 0, false, null);
-            internal static EffectRoot UnknownOf(string reason) => new(EffectRootKind.Unknown, 0, 0, false, reason);
+            internal static EffectRoot Static(Owner owner) => new(EffectRootKind.Static, 0, 0, false, owner, null);
+            internal static EffectRoot ForeignOf(Owner owner) => new(EffectRootKind.Foreign, 0, 0, false, owner, null);
+            internal static EffectRoot UnknownOf(string reason) => new(EffectRootKind.Unknown, 0, 0, false, Owner.Open, reason);
+
+            // 归属字段就在这个新对象上时，改由新对象保存的别名决定归属。
+            internal static EffectRoot FreshOf(int site, Walk walk) => new(EffectRootKind.Fresh, 0, site, walk.Deep,
+                walk.Pending ? Owner.Open : walk.Owner, null);
         }
 
         private enum EffectRootKind { Local, Receiver, Parameter, Static, Fresh, Foreign, Unknown }
@@ -1263,37 +1423,42 @@ namespace SetterChecker.Core
             }
         }
 
-        /// <summary>返回值或 out 写出值的来源。</summary>
+        /// <summary>返回值或 out 写出值的来源：槽位对象本身、槽位所含对象（归属未定或已定为战斗）、新对象、库内全局对象、战斗静态数据。</summary>
         private struct ValueSummary
         {
             internal ulong Slots;
             internal ulong DeepSlots;
+            internal ulong CombatSlots;
             internal bool Fresh;
             internal bool Static;
+            internal bool StaticCombat;
             internal string? Unknown;
 
             // 比较来源类别，原因文本不参与收敛判断。
             internal readonly bool SameAs(ValueSummary other) => this.Slots == other.Slots && this.DeepSlots == other.DeepSlots
-                && this.Fresh == other.Fresh && this.Static == other.Static && (this.Unknown == null) == (other.Unknown == null);
+                && this.CombatSlots == other.CombatSlots && this.Fresh == other.Fresh && this.Static == other.Static
+                && this.StaticCombat == other.StaticCombat && (this.Unknown == null) == (other.Unknown == null);
         }
 
-        /// <summary>一个函数的效果摘要：浅写与深写的槽位、静态写入、未知原因、存储关系、返回和 out 来源。</summary>
+        /// <summary>一个函数的效果摘要：归属未定的浅写与深写、已定为战斗状态的写入槽位、战斗静态写入、未知原因、存储关系、返回和 out 来源。</summary>
         private sealed class MethodSummary
         {
             internal static readonly MethodSummary Empty = new();
             internal ulong Shallow;
             internal ulong Deep;
+            internal ulong Combat;
             internal bool Static;
             internal string? Unknown;
             internal Dictionary<int, ulong>? Into;
             internal ValueSummary Return;
             internal Dictionary<int, ValueSummary>? Outs;
-            internal readonly SummaryCause?[] Causes = new SummaryCause?[130];
+            internal readonly SummaryCause?[] Causes = new SummaryCause?[CombatBit + 64];
 
-            internal bool IsSetter => this.Static || this.Shallow != 0 || this.Deep != 0;
+            internal bool IsSetter => this.Static || (this.Shallow | this.Deep | this.Combat) != 0;
 
-            // 证据优先取静态写入，其次最低的浅写、深写槽位。
+            // 证据优先取静态写入，其次最低的战斗、浅写、深写槽位。
             internal int EvidenceBit => this.Static ? StaticBit
+                : this.Combat != 0 ? CombatBit + BitOperations.TrailingZeroCount(this.Combat)
                 : this.Shallow != 0 ? BitOperations.TrailingZeroCount(this.Shallow)
                 : 64 + BitOperations.TrailingZeroCount(this.Deep);
 
@@ -1303,6 +1468,10 @@ namespace SetterChecker.Core
                 if (bit == StaticBit)
                 {
                     this.Static = true;
+                }
+                else if (bit >= CombatBit)
+                {
+                    this.Combat |= 1UL << (bit - CombatBit);
                 }
                 else if (bit >= 64)
                 {
@@ -1342,7 +1511,7 @@ namespace SetterChecker.Core
             // 收敛只比较会影响调用者的内容。
             internal bool SameAs(MethodSummary other)
             {
-                if (this.Shallow != other.Shallow || this.Deep != other.Deep || this.Static != other.Static
+                if (this.Shallow != other.Shallow || this.Deep != other.Deep || this.Combat != other.Combat || this.Static != other.Static
                     || (this.Unknown == null) != (other.Unknown == null) || !this.Return.SameAs(other.Return))
                 {
                     return false;

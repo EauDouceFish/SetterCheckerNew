@@ -480,7 +480,10 @@ namespace SetterChecker.Core
                 PendingCalls = failures.Values.Where(call => NeedsBehavior(call.CallerMethodId) || sources.NeedsValues(call.CallerMethodId))
                     .OrderBy(call => call.CallerMethodId, StringComparer.Ordinal).ThenBy(call => call.Call.Point.BlockId).ToArray(),
             };
-            sources.Timing.Count("不同函数体读取次数", bodies.Count);
+            int libraryModels = bodies.Values.Count(body => body.BodyKind == MethodBodyKind.LibraryModel);
+            sources.Timing.Count("不同函数体读取次数", bodies.Count - libraryModels);
+            sources.Timing.Count("外部库模型函数数", libraryModels);
+            sources.Timing.Count("外部库回调目标数", calls.Values.Sum(call => call.Targets.Count(target => target.IsCallback)));
             sources.Timing.Count("行为需求状态更新次数", demandUpdates);
             sources.Timing.Count("行为需求登记及更新访问次数", demandVisits);
             sources.Timing.Count("函数调度请求次数", scheduleRequests);
@@ -492,7 +495,7 @@ namespace SetterChecker.Core
             sources.Timing.Count("调用目标实际解析次数", resolvedCalls);
             sources.Timing.Count("调用关系实际更新次数", changedCalls);
             sources.Timing.Count("等待结束后函数入队次数", resumedMethods);
-            progress?.Invoke($"函数体读取 {bodies.Count} 次；固定调用 {calls.Count} 个；未确定目标 {result.PendingCalls.Count} 个。");
+            progress?.Invoke($"函数体读取 {bodies.Count - libraryModels} 次，外部库模型 {libraryModels} 个；固定调用 {calls.Count} 个；未确定目标 {result.PendingCalls.Count} 个。");
             if (requireCompleteCalls && result.PendingCalls.FirstOrDefault(call => !effects.IsTop(call.CallerMethodId)) is PendingCall failure)
             {
                 throw new AnalysisException(failure.Failure!);
@@ -526,6 +529,7 @@ namespace SetterChecker.Core
             bool valuesOnly = false;
             string? failure = null;
             bool stopped = false;
+            List<ResolvedCallTarget> library = new();
             RuntimeOperationRule? runtimeRule = RuntimeOperations.Find(catalog, method);
             if (runtimeRule != null)
             {
@@ -699,6 +703,14 @@ namespace SetterChecker.Core
             else
             {
                 targets.Add(Bind(declaration, receiver, arguments));
+            }
+            foreach (ResolvedCallTarget libraryTarget in registrationBinding ? Array.Empty<ResolvedCallTarget>() : library.ToArray())
+            {
+                dynamicBinding = true;
+                if (stopped || await ReadLibraryCallbacks(libraryTarget).ConfigureAwait(false))
+                {
+                    break;
+                }
             }
 
             return new ResolvedCall(caller.Id, call, targets.Count <= 1 ? targets.ToArray()
@@ -1548,15 +1560,217 @@ namespace SetterChecker.Core
                         + $"实参 {actualArguments.Count}，形参 {target.Method.Parameters.Count}");
                 }
                 sources.Include(target.Method);
-                return new ResolvedCallTarget(target.Method.Id, catalog.ReadMethodReference(target.Method, target.DeclaringTypeArguments, target.MethodTypeArguments), actualReceiver,
+                ResolvedCallTarget bound = new(target.Method.Id, catalog.ReadMethodReference(target.Method, target.DeclaringTypeArguments, target.MethodTypeArguments), actualReceiver,
                     actualArguments, target.DeclaringTypeArguments.Select(type => type.Text).ToArray())
                 { MethodTypeArguments = target.MethodTypeArguments.Select(type => type.Text).ToArray() };
+                if (catalog.IsLibraryMethod(target.Method))
+                {
+                    library.Add(bound);
+                }
+                return bound;
             }
+
+            // V3 设计 3.2 节：外部库函数只能经传入的委托，或经接收对象与实参中源码类型对外部库虚成员的重写回调业务代码。
+            async ValueTask<bool> ReadLibraryCallbacks(ResolvedCallTarget libraryTarget)
+            {
+                using var callbackTiming = sources.Timing.Measure(AnalysisTiming.Part.Dispatch);
+                BehaviorValueReference[] contents = libraryTarget.Receiver.Concat(libraryTarget.Arguments.SelectMany(values => values)).Distinct().ToArray();
+                foreach (BehaviorValueReference value in contents)
+                {
+                    ValueOrigin[] local = (sources.ReadFixedReceiver(value) is ValueOrigin fixedValue ? new[] { fixedValue }
+                        : sources.ReadLocalOrigins(value)).ToArray();
+                    if (local.Any(origin => origin.Value.Kind == BehaviorValueKind.Function || IsDelegateValue(origin)))
+                    {
+                        foreach (ValueOrigin origin in sources.GetOrigins(value))
+                        {
+                            if (IsNull(origin))
+                            {
+                                continue;
+                            }
+                            if (origin.Value.Kind != BehaviorValueKind.Function || origin.Value.Method == null)
+                            {
+                                if (origin.Value.Kind == BehaviorValueKind.Parameter && origin.Reference.MethodId == caller.Id)
+                                {
+                                    invokesUnboundParameter = true;
+                                }
+                                else
+                                {
+                                    failure = $"库函数的委托实参来源尚未闭合：{caller.Id} @ {call.Point.BlockId}；{origin.Value.Kind}：{origin.Value.Reference}";
+                                }
+                                continue;
+                            }
+                            ResolvedMethodDefinition delegateTarget = catalog.ResolveMethodDefinition(origin.Value.Method, true);
+                            IReadOnlyList<BehaviorValueReference> bound = origin.BoundReceiver
+                                ?? origin.Value.InputValueIds.Select(input => origin.Reference with { ValueId = input }).ToArray();
+                            foreach (ResolvedMethodDefinition implementation in origin.Value.UsesVirtualDispatch ? VirtualTargets(delegateTarget, bound) : new[] { delegateTarget })
+                            {
+                                bool isStatic = implementation.Method.IsStatic;
+                                if (await AddTarget(Callback(implementation, isStatic ? Array.Empty<BehaviorValueReference>() : bound,
+                                    isStatic && bound.Count != 0 ? bound : null, contents)).ConfigureAwait(false))
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    foreach (ValueOrigin origin in local)
+                    {
+                        if (IsNull(origin) || origin.Value.Kind == BehaviorValueKind.Function)
+                        {
+                            continue;
+                        }
+                        if (origin.Value.Kind == BehaviorValueKind.Iterator && origin.Value.Method != null)
+                        {
+                            ResolvedMethodDefinition body = catalog.ResolveMethodDefinition(origin.Value.Method, false);
+                            IReadOnlyList<BehaviorValueReference> capturedReceiver = origin.BoundReceiver
+                                ?? (body.Method.IsStatic ? Array.Empty<BehaviorValueReference>() : new[] { origin.Reference with { ValueId = origin.Value.InputValueIds[0] } });
+                            IReadOnlyList<IReadOnlyList<BehaviorValueReference>> capturedArguments = origin.IteratorArguments
+                                ?? origin.Value.InputValueIds.Skip(body.Method.IsStatic ? 0 : 1)
+                                    .Select(input => (IReadOnlyList<BehaviorValueReference>)new[] { origin.Reference with { ValueId = input } }).ToArray();
+                            if (await AddTarget(Bind(body, capturedReceiver, capturedArguments) with { IsCallback = true }).ConfigureAwait(false))
+                            {
+                                return true;
+                            }
+                            continue;
+                        }
+                        foreach (ResolvedMethodDefinition implementation in ReadFrameworkCallbacks(catalog, origin, dispatch))
+                        {
+                            if (await AddTarget(Callback(implementation, new[] { value }, null, contents)).ConfigureAwait(false))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            }
+
+            // 值的已知类型为委托类型；开放泛型或尚未载入的类型不据此判断。
+            bool IsDelegateValue(ValueOrigin origin)
+            {
+                if (origin.Value.Type is not BehaviorTypeReference type || type.Id.StartsWith('!') || type.Id.EndsWith(']'))
+                {
+                    return false;
+                }
+                try
+                {
+                    return catalog.IsDelegateType(catalog.ResolveTypeDefinition(type));
+                }
+                catch (AnalysisException)
+                {
+                    return false;
+                }
+            }
+
+            // 回调以库函数接收对象和实参所含内容为实参；静态目标可带委托绑定的首个实参。
+            ResolvedCallTarget Callback(ResolvedMethodDefinition target, IReadOnlyList<BehaviorValueReference> actualReceiver,
+                IReadOnlyList<BehaviorValueReference>? firstArgument, IReadOnlyList<BehaviorValueReference> contents)
+            {
+                sources.Include(target.Method);
+                IReadOnlyList<BehaviorValueReference>[] actualArguments = target.Method.Parameters
+                    .Select((_, index) => index == 0 && firstArgument != null ? firstArgument : contents).ToArray();
+                return new ResolvedCallTarget(target.Method.Id, catalog.ReadMethodReference(target.Method, target.DeclaringTypeArguments, target.MethodTypeArguments),
+                    actualReceiver, actualArguments, target.DeclaringTypeArguments.Select(type => type.Text).ToArray())
+                {
+                    MethodTypeArguments = target.MethodTypeArguments.Select(type => type.Text).ToArray(),
+                    IsCallback = true,
+                };
+            }
+        }
+
+        // 值的实际类型范围（新对象只取自身，其余含全部派生类型，以及它们的源码祖先）中，重写或实现外部库虚成员的源码函数。
+        private static IReadOnlyList<ResolvedMethodDefinition> ReadFrameworkCallbacks(MethodCatalogResult catalog, ValueOrigin origin, DispatchIndex dispatch)
+        {
+            BehaviorTypeReference? type = origin.Value.Type;
+            bool known = type != null && !type.Id.StartsWith('!') && !type.Id.EndsWith(']') && !type.Id.EndsWith('*') && !type.Id.EndsWith('&');
+            TypeEntry definition = known ? catalog.ResolveTypeDefinition(type!) : catalog.ReadPrimitiveType("System.Object");
+            IReadOnlyList<TypeIdentityTemplate> arguments = known ? catalog.ReadResolvedTypeArguments(type!) : Array.Empty<TypeIdentityTemplate>();
+            bool exact = known && origin.Value.Kind == BehaviorValueKind.NewObject;
+            string key = (exact ? "exact:" : "derived:") + definition.Id + "|" + string.Join(',', arguments.Select(argument => argument.Text));
+            if (dispatch.Callbacks.TryGetValue(key, out IReadOnlyList<ResolvedMethodDefinition>? cached))
+            {
+                return cached;
+            }
+            List<(TypeEntry Type, IReadOnlyList<TypeIdentityTemplate> Arguments)> range = new() { (definition, arguments) };
+            range.AddRange(catalog.ReadInheritedTypes(definition, arguments, includeInterfaces: false)
+                .Select(relation => (relation.Definition, (IReadOnlyList<TypeIdentityTemplate>)relation.TypeArguments)));
+            if (!exact)
+            {
+                HashSet<string> visited = new(StringComparer.Ordinal) { definition.Id };
+                Queue<TypeEntry> pending = new(new[] { definition });
+                while (pending.TryDequeue(out TypeEntry? current))
+                {
+                    foreach (TypeEntry child in catalog.DerivedTypesByBaseId.GetValueOrDefault(current.Id, Array.Empty<TypeEntry>())
+                        .Concat(catalog.ImplementingTypesByInterfaceId.GetValueOrDefault(current.Id, Array.Empty<TypeEntry>())))
+                    {
+                        if (visited.Add(child.Id))
+                        {
+                            range.Add((child, Placeholders(child.GenericParameters.Count)));
+                            pending.Enqueue(child);
+                        }
+                    }
+                }
+            }
+            List<ResolvedMethodDefinition> callbacks = new();
+            HashSet<string> seen = new(StringComparer.Ordinal);
+            foreach (var (candidate, candidateArguments) in range.Where(item => item.Type.SourceSymbol != null && item.Type.IsCandidate))
+            {
+                foreach (IMethodSymbol symbol in ReadFrameworkOverrides(catalog, candidate, dispatch))
+                {
+                    MethodEntry method = catalog.ReadSourceDeclaration(symbol, candidate.AssemblyPath!);
+                    if (seen.Add(method.Id + "|" + string.Join(',', candidateArguments.Select(argument => argument.Text))))
+                    {
+                        callbacks.Add(new ResolvedMethodDefinition(method, candidateArguments) { MethodTypeArguments = Placeholders(method.GenericArity) });
+                    }
+                }
+            }
+            dispatch.Callbacks.Add(key, callbacks);
+            return callbacks;
+        }
+
+        // 源码类型中重写外部库虚函数或实现外部库接口成员的函数，每个类型只计算一次。
+        private static IReadOnlyList<IMethodSymbol> ReadFrameworkOverrides(MethodCatalogResult catalog, TypeEntry type, DispatchIndex dispatch)
+        {
+            if (dispatch.FrameworkOverrides.TryGetValue(type.Id, out IReadOnlyList<IMethodSymbol>? known))
+            {
+                return known;
+            }
+            INamedTypeSymbol symbol = type.SourceSymbol!;
+            List<IMethodSymbol> result = new();
+            foreach (IMethodSymbol member in symbol.GetMembers().OfType<IMethodSymbol>().Where(member => member.IsOverride))
+            {
+                for (IMethodSymbol? overridden = member.OverriddenMethod; overridden != null; overridden = overridden.OverriddenMethod)
+                {
+                    if (catalog.IsLibraryAssembly(overridden.ContainingAssembly.Name))
+                    {
+                        result.Add(member);
+                        break;
+                    }
+                }
+            }
+            foreach (INamedTypeSymbol contract in symbol.AllInterfaces.Where(contract => catalog.IsLibraryAssembly(contract.ContainingAssembly.Name)))
+            {
+                foreach (IMethodSymbol member in contract.GetMembers().OfType<IMethodSymbol>())
+                {
+                    if (symbol.FindImplementationForInterfaceMember(member) is IMethodSymbol implementation
+                        && implementation.Locations.Any(location => location.IsInSource) && !result.Contains(implementation, SymbolEqualityComparer.Default))
+                    {
+                        result.Add(implementation);
+                    }
+                }
+            }
+            IMethodSymbol[] ordered = result.Select(method => method.OriginalDefinition).Distinct<IMethodSymbol>(SymbolEqualityComparer.Default)
+                .OrderBy(method => method.ToDisplayString(), StringComparer.Ordinal).ToArray();
+            dispatch.FrameworkOverrides.Add(type.Id, ordered);
+            return ordered;
         }
 
         /// <summary>候选范围和单个类型的匹配结果分开复用，不保存调用路径。</summary>
         private sealed class DispatchIndex
         {
+            internal Dictionary<string, IReadOnlyList<ResolvedMethodDefinition>> Callbacks { get; } = new(StringComparer.Ordinal);
+            internal Dictionary<string, IReadOnlyList<IMethodSymbol>> FrameworkOverrides { get; } = new(StringComparer.Ordinal);
             internal Dictionary<string, TargetCandidates> Ranges { get; } = new(StringComparer.Ordinal);
             internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Starts), TargetCandidates> Traversals { get; } = new();
             internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Type, TemplateList Arguments), ResolvedMethodDefinition?> Implementations { get; } = new();
@@ -1707,7 +1921,7 @@ namespace SetterChecker.Core
             + string.Join(',', target.DeclaringTypeArguments) + "|" + string.Join(',', target.MethodTypeArguments) + "|"
             + string.Join(',', target.Receiver.Select(value => value.MethodOrdinal + ":" + value.ValueId)) + "|"
             + string.Join(';', target.Arguments.Select(argument => string.Join(',', argument.Select(value => value.MethodOrdinal + ":" + value.ValueId))))
-            + "|" + target.DelegateDeclarationId);
+            + "|" + target.DelegateDeclarationId + (target.IsCallback ? "|callback" : string.Empty));
 
         internal sealed record TargetDescription(IReadOnlyList<TypeIdentityTemplate> TypeArguments, IReadOnlyList<TypeIdentityTemplate> MethodArguments);
 
@@ -2558,6 +2772,9 @@ namespace SetterChecker.Core
         // 所有调用者共用原函数编号。
         internal int GetMethodOrdinal(string method) => this.m_functions[method];
 
+        // 读取已登记函数的目录记录。
+        internal MethodEntry ReadMethod(string method) => this.m_definitions[method];
+
         // 统一引用编号，防止同一个原始值重复进入字典。
         private BehaviorValueReference Normalize(BehaviorValueReference value) => value with { MethodOrdinal = GetMethodOrdinal(value.MethodId) };
 
@@ -3122,7 +3339,7 @@ namespace SetterChecker.Core
                     {
                         yield return origin;
                     }
-                    foreach (ResolvedCallTarget target in resolved.Targets)
+                    foreach (ResolvedCallTarget target in resolved.Targets.Where(target => !target.IsCallback))
                     {
                         if (tracking && this.m_definitions[target.MethodId].HasNoLogTrackExemption)
                         {
@@ -3337,7 +3554,7 @@ namespace SetterChecker.Core
                             if (this.m_calls.TryGetValue((slot.MethodId, call.Point), out ResolvedCall? resolved)
                                 && resolved.Targets.Count != 0)
                             {
-                                foreach (ResolvedCallTarget target in resolved.Targets)
+                                foreach (ResolvedCallTarget target in resolved.Targets.Where(target => !target.IsCallback))
                                 {
                                     if (!RequireBody(target.MethodId, query))
                                     {
@@ -3718,6 +3935,9 @@ namespace SetterChecker.Core
 
         /// <summary>委托最初绑定的声明，用于把实际重写的修改对应回同一委托来源。</summary>
         public string? DelegateDeclarationId { get; init; }
+
+        /// <summary>外部库函数可能执行的业务回调：实参是库函数接收对象和实参所含的内容，返回值不是调用结果。</summary>
+        public bool IsCallback { get; init; }
     }
 
     /// <summary>一个调用位置及其全部合法目标，不按上游入口重复保存。</summary>

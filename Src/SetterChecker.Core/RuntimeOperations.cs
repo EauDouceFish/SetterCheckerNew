@@ -106,6 +106,9 @@ namespace SetterChecker.Core
     /// <summary>一条经过核对的基础操作说明；适用当前材料对应的实际核心库。</summary>
     public sealed record RuntimeOperationRule(RuntimeOperation Operation, string Description, string Source);
 
+    /// <summary>外部库函数的通用模型：可能被写内容的槽位（0 为接收对象）及写入原因，存入接收对象的实参槽位。</summary>
+    internal sealed record LibraryEffect(ulong Written, IReadOnlyDictionary<int, string> Reasons, ulong StoredIntoReceiver);
+
     /// <summary>按实际类型和完整签名识别基础操作；其余方法交还普通源码或 IL 分析。</summary>
     internal static class RuntimeOperations
     {
@@ -286,6 +289,94 @@ namespace SetterChecker.Core
                 return name is "Push" or "Pop" or "Clear" && (name is "Pop" or "Clear" ? parameters.Length == 0 : parameters.Length == 1);
             }
             return false;
+        }
+
+        private static readonly string[] s_collectionTypeNames =
+        {
+            "System.Collections.Generic.List`1", "System.Collections.Generic.Dictionary`2", "System.Collections.Generic.HashSet`1",
+            "System.Collections.Generic.Queue`1", "System.Collections.Generic.Stack`1", "System.Collections.Generic.LinkedList`1",
+            "System.Collections.Generic.SortedList`2", "System.Collections.Generic.SortedDictionary`2", "System.Collections.Generic.SortedSet`1",
+            "System.Collections.Generic.ICollection`1", "System.Collections.Generic.IList`1", "System.Collections.Generic.IDictionary`2",
+            "System.Collections.Generic.ISet`1", "System.Collections.ArrayList", "System.Collections.Hashtable", "System.Collections.Queue",
+            "System.Collections.Stack", "System.Collections.SortedList", "System.Collections.IList", "System.Collections.IDictionary",
+        };
+
+        // V3 设计 3.2 节的通用库模型：集合接收对象、数组与集合实参、ref/out 实参可能被写；值类型接收对象按原地修改处理。
+        internal static LibraryEffect ReadLibraryEffect(MethodCatalogResult catalog, MethodEntry method)
+        {
+            ulong written = 0;
+            ulong stored = 0;
+            Dictionary<int, string> reasons = new();
+            TypeEntry owner = catalog.TypesById[method.TypeId];
+            if (!method.IsStatic && !IsReadOnlyMember(method.Name))
+            {
+                string? reason = IsCollectionType(catalog, owner) ? "库函数模型：修改集合内容"
+                    : owner.IsValueType && !catalog.IsReadOnlyStructMember(method) ? "库函数模型：原地修改值类型接收对象" : null;
+                if (reason != null)
+                {
+                    written |= 1UL;
+                    reasons.Add(0, reason);
+                    for (int index = 0; index < method.Parameters.Count && index < 62; index++)
+                    {
+                        stored |= 1UL << (index + 1);
+                    }
+                }
+            }
+            string ownerName = ReadMetadataName(owner.LogicalId);
+            bool readsArrays = ownerName == "System.String" && method.Name is "Join" or "Concat" or "Format" or ".ctor"
+                || ownerName == "System.Array" && (method.Name is "IndexOf" or "LastIndexOf" or "BinarySearch" or "Exists" or "TrueForAll"
+                    || method.Name.StartsWith("Find", StringComparison.Ordinal))
+                || ownerName.StartsWith("System.Text.", StringComparison.Ordinal) && ownerName.EndsWith("Encoding", StringComparison.Ordinal)
+                    && method.Name is "GetString" or "GetCharCount";
+            for (int index = 0; index < method.Parameters.Count && index < 62; index++)
+            {
+                ParameterEntry parameter = method.Parameters[index];
+                string? reason = parameter.RefKind is Microsoft.CodeAnalysis.RefKind.Ref or Microsoft.CodeAnalysis.RefKind.Out ? "库函数模型：写 ref/out 实参"
+                    : readsArrays ? null
+                    : parameter.TypeId.EndsWith(']') ? "库函数模型：可能写数组实参内容"
+                    : method.Kind != Microsoft.CodeAnalysis.MethodKind.Constructor && IsCollectionName(ReadMetadataName(parameter.TypeId))
+                        ? "库函数模型：可能写集合实参内容" : null;
+                if (reason != null)
+                {
+                    written |= 1UL << (index + 1);
+                    reasons.Add(index + 1, reason);
+                }
+            }
+            return new LibraryEffect(written, reasons, stored);
+        }
+
+        // 集合与值类型接收对象上不修改内容的成员（V3 设计 3.2 节只读成员清单）。
+        private static bool IsReadOnlyMember(string name) => name.StartsWith("Contains", StringComparison.Ordinal)
+            || name.StartsWith("get_", StringComparison.Ordinal) || name.StartsWith("Find", StringComparison.Ordinal)
+            || name is "TryGetValue" or "IndexOf" or "LastIndexOf" or "Exists" or "TrueForAll" or "BinarySearch" or "GetEnumerator"
+                or "ToArray" or "CopyTo" or "Equals" or "GetHashCode" or "ToString" or "GetType";
+
+        // 标准集合或实现了 ICollection<T>、IList、IDictionary 的外部类型。
+        private static bool IsCollectionType(MethodCatalogResult catalog, TypeEntry type)
+        {
+            string name = ReadMetadataName(type.LogicalId);
+            return IsCollectionName(name) || !type.IsInterface && catalog.ReadInheritedTypes(type)
+                .Any(relation => IsCollectionName(ReadMetadataName(relation.Definition.LogicalId)));
+        }
+
+        // 按完整元数据名识别标准集合及集合接口。
+        private static bool IsCollectionName(string name) => s_collectionTypeNames.Contains(name)
+            || name.StartsWith("System.Collections.Concurrent.", StringComparison.Ordinal);
+
+        // 从类型身份 A{n}:{程序集}T{m}:{元数据名} 取出最外层元数据名；原始类型、泛型参数身份原样截取。
+        private static string ReadMetadataName(string identity)
+        {
+            if (identity.Length > 1 && identity[0] == 'A' && char.IsAsciiDigit(identity[1]))
+            {
+                int colon = identity.IndexOf(':');
+                int assemblyLength = int.Parse(identity.AsSpan(1, colon - 1), System.Globalization.CultureInfo.InvariantCulture);
+                int typeStart = colon + 1 + assemblyLength;
+                int typeColon = identity.IndexOf(':', typeStart);
+                int nameLength = int.Parse(identity.AsSpan(typeStart + 1, typeColon - typeStart - 1), System.Globalization.CultureInfo.InvariantCulture);
+                return identity.Substring(typeColon + 1, nameLength);
+            }
+            int end = identity.IndexOfAny(new[] { '<', '[', '&', '*' });
+            return end < 0 ? identity : identity[..end];
         }
 
         // 诊断边界仅针对用户确认的完整类型和程序集简单名。

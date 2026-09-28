@@ -45,10 +45,23 @@ namespace SetterChecker.Core
                 Stopwatch stage = Stopwatch.StartNew();
 
                 ValidateRequest(request);
-                string assemblyDefinitionPath = Path.GetFullPath(request.AssemblyDefinitionPath);
-                string projectRoot = FindProjectRoot(assemblyDefinitionPath);
-                string reportRoot = FindReportRoot(assemblyDefinitionPath, projectRoot);
-                string assemblyName = ReadAssemblyDefinition(assemblyDefinitionPath).Name;
+                string[] assemblyDefinitionPaths = request.AssemblyDefinitionPaths.Select(Path.GetFullPath).ToArray();
+                string projectRoot = FindProjectRoot(assemblyDefinitionPaths[0]);
+                Dictionary<string, string> reportRoots = new(StringComparer.Ordinal);
+                foreach (string path in assemblyDefinitionPaths)
+                {
+                    if (!string.Equals(FindProjectRoot(path), projectRoot, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new AnalysisException($"报告程序集不属于同一个 Unity 工程：{path}；{projectRoot}");
+                    }
+                    string name = ReadAssemblyDefinition(path).Name;
+                    if (!reportRoots.TryAdd(name, FindReportRoot(path, projectRoot)))
+                    {
+                        throw new AnalysisException($"重复指定报告程序集：{name}");
+                    }
+                    FindRootResponse(projectRoot, name);
+                }
+                string assemblyName = ReadAssemblyDefinition(assemblyDefinitionPaths[0]).Name;
                 string responsePath = FindRootResponse(projectRoot, assemblyName);
                 HashSet<string> editorOnlyAssemblies = new(StringComparer.Ordinal) { "Assembly-CSharp-Editor", "Assembly-CSharp-Editor-firstpass" };
                 IReadOnlyList<CompilerResponse> responses = ReadResponseClosure(
@@ -58,9 +71,9 @@ namespace SetterChecker.Core
                     request.Jobs,
                     editorOnlyAssemblies,
                     cancellationToken);
-                if (editorOnlyAssemblies.Contains(assemblyName))
+                if (reportRoots.Keys.FirstOrDefault(editorOnlyAssemblies.Contains) is string editorReport)
                 {
-                    throw new AnalysisException($"分析目标被声明为编辑器或测试程序集：{assemblyName}");
+                    throw new AnalysisException($"分析目标被声明为编辑器或测试程序集：{editorReport}");
                 }
                 editorOnlyAssemblies.IntersectWith(responses.Select(response => response.AssemblyName));
                 responses = SelectPlayerAssemblies(responses, editorOnlyAssemblies);
@@ -119,7 +132,7 @@ namespace SetterChecker.Core
                                 CSharpCompilation compilation = reused ? previous!.Material.Compilation : BuildCompilation(response,
                                     trees, references, generators.GetOrAdd(string.Join('\0', response.AnalyzerPaths),
                                         _ => new Lazy<ISourceGenerator[]>(() => LoadGenerators(response.AnalyzerPaths))).Value, cancellationToken);
-                                string[] reportPaths = editorOnlyAssemblies.Contains(response.AssemblyName) ? Array.Empty<string>()
+                                string[] reportPaths = !reportRoots.TryGetValue(response.AssemblyName, out string? reportRoot) ? Array.Empty<string>()
                                     : response.SourcePaths.Where(path => IsUnderDirectory(path, reportRoot)).ToArray();
                                 SourceAssemblyMaterial source = new(response.AssemblyName, reportPaths.Length > 0, compilation,
                                     response.SourcePaths, reportPaths, response.OutputPath,
@@ -190,7 +203,7 @@ namespace SetterChecker.Core
                             return path + ":" + Convert.ToHexString(SHA512.HashData(stream));
                         }).Order(StringComparer.Ordinal).ToArray();
                     // 工具重新编译不应让同一份已确认人工基线无故失效；语义变更时手动提升此版本号。
-                    string inputs = assemblyDefinitionPath + "\n" + "setterchecker-v2-baseline-1" + "\n"
+                    string inputs = string.Join("\n", assemblyDefinitionPaths) + "\n" + "setterchecker-v2-baseline-1" + "\n"
                         + string.Join("\n", builtAssemblies.OrderBy(pair => pair.Key, StringComparer.Ordinal).Select(pair => pair.Key + ":" + pair.Value.Key))
                         + "\n" + string.Join("\n", dllInputs);
                     baselineInputKey = Convert.ToHexString(SHA512.HashData(System.Text.Encoding.UTF8.GetBytes(inputs)));
@@ -215,6 +228,7 @@ namespace SetterChecker.Core
                     ExplicitRuntimeAssemblyPaths = external.ExplicitRuntimeAssemblyPaths,
                     BaselineInputKey = baselineInputKey,
                     ExcludedEditorAssemblies = editorOnlyAssemblies.Order(StringComparer.Ordinal).ToArray(),
+                    CombatAssemblies = request.CombatAssemblies,
                 };
             }
             finally
@@ -865,17 +879,22 @@ namespace SetterChecker.Core
                 throw new AnalysisException("工作数量必须是正整数。");
             }
 
-            if (!File.Exists(request.AssemblyDefinitionPath))
+            if (request.AssemblyDefinitionPaths.Count == 0)
             {
-                throw new AnalysisException($"程序集定义文件不存在：{request.AssemblyDefinitionPath}");
+                throw new AnalysisException("缺少报告程序集定义文件。");
             }
 
-            if (!string.Equals(
-                Path.GetExtension(request.AssemblyDefinitionPath),
-                ".asmdef",
-                StringComparison.OrdinalIgnoreCase))
+            foreach (string path in request.AssemblyDefinitionPaths)
             {
-                throw new AnalysisException($"输入必须是 Unity 程序集定义文件：{request.AssemblyDefinitionPath}");
+                if (!File.Exists(path))
+                {
+                    throw new AnalysisException($"程序集定义文件不存在：{path}");
+                }
+
+                if (!string.Equals(Path.GetExtension(path), ".asmdef", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new AnalysisException($"输入必须是 Unity 程序集定义文件：{path}");
+                }
             }
         }
 

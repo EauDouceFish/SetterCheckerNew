@@ -179,7 +179,8 @@ namespace SetterChecker.Core
                 AnalysisCost = new
                 {
                     DistinctMethods = run.Calls?.Methods.Count ?? 0,
-                    BodyReads = run.Calls?.Behaviors.Methods.Count ?? 0,
+                    BodyReads = run.Calls?.Behaviors.Methods.Count(body => body.BodyKind != MethodBodyKind.LibraryModel) ?? 0,
+                    LibraryModels = run.Calls?.Behaviors.Methods.Count(body => body.BodyKind == MethodBodyKind.LibraryModel) ?? 0,
                     FixedCallSites = (run.Calls?.Calls.Select(call => (call.CallerMethodId, call.Call.Point)) ?? Enumerable.Empty<(string, BehaviorFlowPoint)>())
                         .Concat(run.Calls?.PendingCalls.Select(call => (call.CallerMethodId, call.Call.Point)) ?? Enumerable.Empty<(string, BehaviorFlowPoint)>()).Distinct().Count(),
                     run.SummaryUpdates,

@@ -250,8 +250,17 @@ namespace SetterChecker.Core
     /// <summary>
     /// 表示一次材料读取请求。
     /// </summary>
-    public sealed record MaterialRequest(string AssemblyDefinitionPath, int Jobs)
+    public sealed record MaterialRequest(IReadOnlyList<string> AssemblyDefinitionPaths, int Jobs)
     {
+        /// <summary>V3 设计 2.1 节：声明字段属于战斗状态的源码程序集，依据见 Docs/V3-DESIGN.md。</summary>
+        public static readonly IReadOnlySet<string> DefaultCombatAssemblies = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "khengine.runtime", "khengine.define", "morefun.lockstep.Runtime", "kihan.common.runtime", "kihan.proto",
+        };
+
+        /// <summary>声明字段属于战斗状态的程序集；这些程序集的 DLL 函数也读取函数体。</summary>
+        public IReadOnlySet<string> CombatAssemblies { get; init; } = DefaultCombatAssemblies;
+
         /// <summary>编辑器当前文本覆盖；路径必须属于本轮真实编译输入，不写回游戏。</summary>
         public IReadOnlyDictionary<string, string> SourceTexts { get; init; } = new Dictionary<string, string>();
 
@@ -330,5 +339,8 @@ namespace SetterChecker.Core
 
         /// <summary>按 R4 排除的编辑器或测试程序集名称。</summary>
         public IReadOnlyList<string> ExcludedEditorAssemblies { get; init; } = Array.Empty<string>();
+
+        /// <summary>本轮请求声明的战斗程序集。</summary>
+        public IReadOnlySet<string> CombatAssemblies { get; init; } = MaterialRequest.DefaultCombatAssemblies;
     }
 }
