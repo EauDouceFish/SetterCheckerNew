@@ -11,6 +11,7 @@ namespace SetterChecker.Core
     public sealed class CallTargetResolver
     {
         private static readonly ConditionalWeakTable<ResolvedCallTarget, TargetDescription> s_targetDescriptions = new();
+        private static readonly ConditionalWeakTable<ResolvedCallTarget, string> s_targetIdentities = new();
 
         // 每份函数体只读一次，固定关系只在新增事实时通知使用方。
         /// <summary>连接共享调用关系；Setter 立即向上通知，Getter 在关系闭合后确认。</summary>
@@ -279,7 +280,8 @@ namespace SetterChecker.Core
                             sources.ReadBody(body);
                             effects.ReadDirect(body);
                             Schedule(body.MethodId);
-                        }                    }
+                        }
+                    }
                     if (!ready.TryDequeue(out string? current))
                     {
                         if (deferred.Count != 0)
@@ -699,7 +701,8 @@ namespace SetterChecker.Core
                 targets.Add(Bind(declaration, receiver, arguments));
             }
 
-            return new ResolvedCall(caller.Id, call, targets.DistinctBy(TargetIdentity).OrderBy(TargetIdentity, StringComparer.Ordinal).ToArray())
+            return new ResolvedCall(caller.Id, call, targets.Count <= 1 ? targets.ToArray()
+                : targets.DistinctBy(TargetIdentity).OrderBy(TargetIdentity, StringComparer.Ordinal).ToArray())
             {
                 IsMetadataBinding = !dynamicBinding && call.Kind is BehaviorCallKind.Direct or BehaviorCallKind.ObjectCreation,
                 CompletesWithoutTarget = completesWithoutTarget,
@@ -1555,9 +1558,34 @@ namespace SetterChecker.Core
         private sealed class DispatchIndex
         {
             internal Dictionary<string, TargetCandidates> Ranges { get; } = new(StringComparer.Ordinal);
-            internal Dictionary<string, ResolvedMethodDefinition?> Implementations { get; } = new(StringComparer.Ordinal);
-            internal Dictionary<string, (MethodCatalogResult.InheritedTypeRelation[] Types, int IntroductionDepth)> Hierarchies { get; } = new(StringComparer.Ordinal);
+            internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Starts), TargetCandidates> Traversals { get; } = new();
+            internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Type, TemplateList Arguments), ResolvedMethodDefinition?> Implementations { get; } = new();
+            internal Dictionary<(string Owner, TemplateList OwnerArguments, string Type, TemplateList Arguments), (MethodCatalogResult.InheritedTypeRelation[] Types, int IntroductionDepth)> Hierarchies { get; } = new();
         }
+
+        /// <summary>按文本逐项比较的泛型实参列表，作字典键时不拼接字符串。</summary>
+        private readonly record struct TemplateList(IReadOnlyList<TypeIdentityTemplate> Items)
+        {
+            // 个数相同且每项文本相同才视为同一组实参。
+            public bool Equals(TemplateList other) => this.Items.SequenceEqual(other.Items);
+
+            // 与逐项文本比较一致的哈希。
+            public override int GetHashCode()
+            {
+                HashCode hash = new();
+                for (int index = 0; index < this.Items.Count; index++)
+                {
+                    hash.Add(this.Items[index].Text, StringComparer.Ordinal);
+                }
+                return hash.ToHashCode();
+            }
+        }
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, TypeIdentityTemplate[]> s_placeholders = new();
+
+        // 开放泛型类型的占位实参 !0、!1…… 按个数共用同一数组。
+        private static TypeIdentityTemplate[] Placeholders(int count) => s_placeholders.GetOrAdd(count,
+            static count => Enumerable.Range(0, count).Select(index => new TypeIdentityTemplate("!" + index)).ToArray());
 
         /// <summary>共用已找到的实现；提前停止后保留枚举位置，其他调用可以继续查。</summary>
         private sealed class TargetCandidates
@@ -1648,7 +1676,7 @@ namespace SetterChecker.Core
                     continue;
                 }
                 IReadOnlyList<TypeIdentityTemplate> arguments = type.Id == declared.Id ? declaredArguments
-                    : Enumerable.Range(0, type.GenericParameters.Count).Select(index => new TypeIdentityTemplate("!" + index)).ToArray();
+                    : Placeholders(type.GenericParameters.Count);
                 MethodCatalogResult.InheritedTypeRelation? relation = type.Id == declared.Id ? null
                     : catalog.ReadInheritedTypes(type, arguments).FirstOrDefault(parent => parent.Definition.Id == declared.Id);
                 if (relation != null)
@@ -1675,19 +1703,18 @@ namespace SetterChecker.Core
         }
 
         // 同一函数绑定不同对象仍是不同合法候选，但不复制函数体或分析环境。
-        internal static string TargetIdentity(ResolvedCallTarget target) => ReadTargetDescription(target).Identity;
+        internal static string TargetIdentity(ResolvedCallTarget target) => s_targetIdentities.GetValue(target, static target => target.MethodId + "|"
+            + string.Join(',', target.DeclaringTypeArguments) + "|" + string.Join(',', target.MethodTypeArguments) + "|"
+            + string.Join(',', target.Receiver.Select(value => value.MethodOrdinal + ":" + value.ValueId)) + "|"
+            + string.Join(';', target.Arguments.Select(argument => string.Join(',', argument.Select(value => value.MethodOrdinal + ":" + value.ValueId))))
+            + "|" + target.DelegateDeclarationId);
 
-        internal sealed record TargetDescription(string Identity, IReadOnlyList<TypeIdentityTemplate> TypeArguments,
-            IReadOnlyList<TypeIdentityTemplate> MethodArguments);
+        internal sealed record TargetDescription(IReadOnlyList<TypeIdentityTemplate> TypeArguments, IReadOnlyList<TypeIdentityTemplate> MethodArguments);
 
-        // 一个固定目标的身份和泛型模板只整理一次，来源换算直接复用。
+        // 一个固定目标的泛型模板只整理一次，来源换算直接复用。
         internal static TargetDescription ReadTargetDescription(ResolvedCallTarget target)
         {
-            return s_targetDescriptions.GetValue(target, static target => new(target.MethodId + "|" + string.Join(',', target.DeclaringTypeArguments) + "|"
-                + string.Join(',', target.MethodTypeArguments) + "|"
-                + string.Join(',', target.Receiver.Select(value => value.MethodOrdinal + ":" + value.ValueId)) + "|"
-                + string.Join(';', target.Arguments.Select(argument => string.Join(',', argument.Select(value => value.MethodOrdinal + ":" + value.ValueId))))
-                + "|" + target.DelegateDeclarationId,
+            return s_targetDescriptions.GetValue(target, static target => new(
                 target.DeclaringTypeArguments.Select(argument => new TypeIdentityTemplate(argument)).ToArray(),
                 target.MethodTypeArguments.Select(argument => new TypeIdentityTemplate(argument)).ToArray()));
         }
@@ -1697,11 +1724,8 @@ namespace SetterChecker.Core
             IReadOnlyList<ValueOrigin> receivers, AnalysisTiming timing, DispatchIndex dispatch)
         {
             TypeEntry owner = catalog.TypesById[declaration.Method.TypeId];
-            string ownerKey = owner.Id + "|" + string.Join(',', declaration.DeclaringTypeArguments.Select(argument => argument.Text));
             MethodIdentityTemplate targetSignature = catalog.ReadMethodSignature(declaration.Method)
                 .Instantiate(new(owner.Id), declaration.DeclaringTypeArguments);
-            string declarationKey = declaration.Method.Id + "|" + string.Join(',', declaration.DeclaringTypeArguments.Select(argument => argument.Text))
-                + "|" + string.Join(',', declaration.MethodTypeArguments.Select(argument => argument.Text));
             List<(TypeEntry Type, IReadOnlyList<TypeIdentityTemplate> Arguments, bool Expand)> bounds = new();
             bool allKnown = receivers.Count != 0;
             foreach (ValueOrigin origin in receivers)
@@ -1715,11 +1739,35 @@ namespace SetterChecker.Core
                 bool expand = origin.Value.Kind != BehaviorValueKind.NewObject && !type.IsSealed && !type.IsValueType;
                 bounds.Add((type, catalog.ReadResolvedTypeArguments(origin.Value.Type), expand));
             }
+            if (!allKnown)
+            {
+                bounds = [(owner, declaration.DeclaringTypeArguments, true)];
+            }
+            // 不同接收范围解析出相同起点时（如 Object 与未知类型）共用同一遍历，结果序列不变。
+            var key = (declaration.Method.Id, new TemplateList(declaration.DeclaringTypeArguments), new TemplateList(declaration.MethodTypeArguments),
+                string.Concat(bounds.Select(bound => $"{bound.Type.Id.Length}:{bound.Type.Id}{bound.Arguments.Count}:"
+                    + string.Concat(bound.Arguments.Select(argument => $"{argument.Text.Length}:{argument.Text}")) + (bound.Expand ? '+' : '-'))));
+            if (!dispatch.Traversals.TryGetValue(key, out TargetCandidates? traversal))
+            {
+                traversal = new TargetCandidates(Traverse(catalog, declaration, owner, targetSignature, bounds, timing, dispatch));
+                dispatch.Traversals.Add(key, traversal);
+            }
+            foreach (ResolvedMethodDefinition implementation in traversal.Read())
+            {
+                yield return implementation;
+            }
+        }
+
+        // 从起点类型沿子类型展开，逐个匹配实现；同一构造声明与具体类型只匹配一次。
+        private static IEnumerable<ResolvedMethodDefinition> Traverse(MethodCatalogResult catalog, ResolvedMethodDefinition declaration, TypeEntry owner,
+            MethodIdentityTemplate targetSignature, List<(TypeEntry Type, IReadOnlyList<TypeIdentityTemplate> Arguments, bool Expand)> starts,
+            AnalysisTiming timing, DispatchIndex dispatch)
+        {
+            TemplateList ownerArguments = new(declaration.DeclaringTypeArguments);
             Queue<(TypeEntry Type, IReadOnlyList<TypeIdentityTemplate> Arguments, bool Expand, ResolvedMethodDefinition? Inherited)> pending = new(
-                (allKnown ? bounds.AsEnumerable() : new[] { (owner, declaration.DeclaringTypeArguments, true) })
-                    .Select(bound => (bound.Item1, bound.Item2, bound.Item3, (ResolvedMethodDefinition?)null)));
-            HashSet<string> visited = new(StringComparer.Ordinal);
-            HashSet<string> result = new(StringComparer.Ordinal);
+                starts.Select(bound => (bound.Type, bound.Arguments, bound.Expand, (ResolvedMethodDefinition?)null)));
+            HashSet<(string Type, TemplateList Arguments, bool Expand)> visited = new();
+            HashSet<(string Method, TemplateList Arguments)> result = new();
             bool expandAny = pending.Any(candidate => candidate.Expand);
             IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> children;
             IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> implementations;
@@ -1732,7 +1780,7 @@ namespace SetterChecker.Core
             {
                 timing.Count("接口候选类型访问");
                 TypeEntry type = candidate.Type;
-                if (!visited.Add(type.Id + "|" + string.Join(',', candidate.Arguments.Select(argument => argument.Text)) + "|" + candidate.Expand))
+                if (!visited.Add((type.Id, new(candidate.Arguments), candidate.Expand)))
                 {
                     continue;
                 }
@@ -1760,14 +1808,14 @@ namespace SetterChecker.Core
                     foreach (TypeEntry child in (children.GetValueOrDefault(type.Id) ?? Array.Empty<TypeEntry>())
                         .Concat(implementations.GetValueOrDefault(type.Id) ?? Array.Empty<TypeEntry>()))
                     {
-                        pending.Enqueue((child, Enumerable.Range(0, child.GenericParameters.Count).Select(index => new TypeIdentityTemplate("!" + index)).ToArray(), true, selected));
+                        pending.Enqueue((child, Placeholders(child.GenericParameters.Count), true, selected));
                     }
                 }
                 if (type.IsInterface || type.IsAbstract)
                 {
                     continue;
                 }
-                if (selected != null && result.Add(selected.Method.Id + "|" + string.Join(',', selected.DeclaringTypeArguments.Select(argument => argument.Text))))
+                if (selected != null && result.Add((selected.Method.Id, new(selected.DeclaringTypeArguments))))
                 {
                     yield return selected;
                 }
@@ -1776,7 +1824,7 @@ namespace SetterChecker.Core
             // 子类与基类共用匹配结果，不按每个具体子类重复扫描继承链。
             ResolvedMethodDefinition? ResolveImplementation(TypeEntry type, IReadOnlyList<TypeIdentityTemplate> arguments)
             {
-                string implementationKey = declarationKey + "|" + type.Id + "|" + string.Join(',', arguments.Select(argument => argument.Text));
+                var implementationKey = (declaration.Method.Id, ownerArguments, new TemplateList(declaration.MethodTypeArguments), type.Id, new TemplateList(arguments));
                 if (!dispatch.Implementations.TryGetValue(implementationKey, out ResolvedMethodDefinition? selected))
                 {
                     timing.Count("接口具体类型实际匹配");
@@ -1798,7 +1846,7 @@ namespace SetterChecker.Core
                         return ResolveImplementation(parent.Definition, parent.TypeArguments);
                     }
                 }
-                string hierarchyKey = ownerKey + "|" + type.Id + "|" + string.Join(',', arguments.Select(argument => argument.Text));
+                var hierarchyKey = (owner.Id, ownerArguments, type.Id, new TemplateList(arguments));
                 if (!dispatch.Hierarchies.TryGetValue(hierarchyKey, out var binding))
                 {
                     binding = BindHierarchy(type, arguments);
@@ -1877,9 +1925,13 @@ namespace SetterChecker.Core
                 {
                     return (Array.Empty<MethodCatalogResult.InheritedTypeRelation>(), 0);
                 }
-                arguments = arguments.Select((argument, index) => substitutions.GetValueOrDefault(index) ?? argument).ToArray();
-                hierarchy = catalog.ReadInheritedTypes(type, arguments, owner.IsInterface)
-                    .Prepend(new MethodCatalogResult.InheritedTypeRelation(type, arguments, false, true, 0)).ToArray();
+                TypeIdentityTemplate[] bound = arguments.Select((argument, index) => substitutions.GetValueOrDefault(index) ?? argument).ToArray();
+                if (!new TemplateList(bound).Equals(new TemplateList(arguments)))
+                {
+                    arguments = bound;
+                    hierarchy = catalog.ReadInheritedTypes(type, arguments, owner.IsInterface)
+                        .Prepend(new MethodCatalogResult.InheritedTypeRelation(type, arguments, false, true, 0)).ToArray();
+                }
                 int introductionDepth = !owner.IsInterface ? 0 : hierarchy.Where(relation => !relation.IsInterface
                     && catalog.ReadInheritedTypes(relation.Definition, relation.TypeArguments).Any(parent => parent.CanImplementInterface
                         && parent.Definition.Id == owner.Id && parent.TypeArguments.SequenceEqual(declaration.DeclaringTypeArguments)))
@@ -2406,8 +2458,6 @@ namespace SetterChecker.Core
     /// <summary>函数说明中的原始值，不保存父调用环境。</summary>
     public sealed record ValueOrigin(BehaviorValueReference Reference, BehaviorValue Value)
     {
-        /// <summary>仅证明返回对象是新分配的，不包含其成员初始化来源。</summary>
-        public bool IsAllocationSummary { get; init; }
         /// <summary>委托绑定的对象，与函数地址分开保存。</summary>
         public IReadOnlyList<BehaviorValueReference>? BoundReceiver { get; init; }
 
@@ -2431,7 +2481,6 @@ namespace SetterChecker.Core
         private readonly Dictionary<(string Method, BehaviorFlowPoint Point, int Index), BehaviorValueReference> m_outResults = new();
         private readonly Dictionary<BehaviorValueReference, IReadOnlyList<ValueOrigin>> m_results = new();
         private readonly Dictionary<(string Method, bool Tracking), ValueOrigin[]> m_returns = new();
-        private readonly Dictionary<string, ValueOrigin[]> m_directReturns = new(StringComparer.Ordinal);
         private readonly Dictionary<string, Dictionary<(string Caller, BehaviorFlowPoint Point), ResolvedCallTarget[]>> m_incoming = new(StringComparer.Ordinal);
         private readonly Dictionary<string, List<(string Method, BehaviorWrite Write)>> m_writes = new(StringComparer.Ordinal);
         private readonly Dictionary<ISymbol, List<BehaviorValueReference>> m_sourceSlots = new(SymbolEqualityComparer.Default);
@@ -2449,7 +2498,7 @@ namespace SetterChecker.Core
         private readonly HashSet<string> m_requestedMethods = new(StringComparer.Ordinal);
         private readonly HashSet<string> m_completedRegistrations = new(StringComparer.Ordinal);
         private readonly Dictionary<(string Method, int Slot, int Block), BehaviorAssignment[]> m_slotWrites = new();
-        private readonly Dictionary<string, ILookup<int, int>> m_predecessors = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, Dictionary<int, List<int>>> m_predecessors = new(StringComparer.Ordinal);
         private readonly Dictionary<BehaviorValueReference, int[]> m_reaching = new();
         private readonly Dictionary<OriginKey, BehaviorValueReference> m_stored = new();
         private readonly Dictionary<(BehaviorTypeReference Source, BehaviorTypeReference Target), BehaviorTypeReference> m_convertedTypes = new();
@@ -2516,9 +2565,22 @@ namespace SetterChecker.Core
         internal void ReadBody(MethodBehavior body)
         {
             this.m_pendingCalls.Add(body.MethodId, body.Calls.Select(call => call.Point).ToHashSet());
-            this.m_predecessors.Add(body.MethodId, body.Blocks.SelectMany(block => block.Successors
-                .Where(edge => edge.TargetBlockId.HasValue).Select(edge => (Target: edge.TargetBlockId!.Value, block.Id)))
-                .ToLookup(pair => pair.Target, pair => pair.Id));
+            Dictionary<int, List<int>> predecessors = new();
+            foreach (BehaviorFlowBlock block in body.Blocks)
+            {
+                for (int index = 0; index < block.Successors.Count; index++)
+                {
+                    if (block.Successors[index].TargetBlockId is int target)
+                    {
+                        if (!predecessors.TryGetValue(target, out List<int>? sources))
+                        {
+                            predecessors.Add(target, sources = new());
+                        }
+                        sources.Add(block.Id);
+                    }
+                }
+            }
+            this.m_predecessors.Add(body.MethodId, predecessors);
             List<BehaviorAssignment> assignments = new(body.Assignments);
             foreach (BehaviorCall call in body.Calls)
             {
@@ -2541,9 +2603,14 @@ namespace SetterChecker.Core
                     assignments.Add(new(address.InputValueIds[0], output.ValueId, call.Point));
                 }
             }
-            foreach (var group in assignments.GroupBy(assignment => (assignment.TargetValueId, assignment.Point.BlockId)))
+            BehaviorAssignment[] sorted = assignments.OrderBy(item => item.TargetValueId).ThenBy(item => item.Point.BlockId).ThenBy(item => item.Point.Order).ToArray();
+            for (int start = 0, end = 0; start < sorted.Length; start = end)
             {
-                this.m_slotWrites.Add((body.MethodId, group.Key.TargetValueId, group.Key.BlockId), group.OrderBy(item => item.Point.Order).ToArray());
+                while (end < sorted.Length && sorted[end].TargetValueId == sorted[start].TargetValueId && sorted[end].Point.BlockId == sorted[start].Point.BlockId)
+                {
+                    end++;
+                }
+                this.m_slotWrites.Add((body.MethodId, sorted[start].TargetValueId, sorted[start].Point.BlockId), sorted[start..end]);
             }
             foreach (BehaviorValue value in body.Values)
             {
@@ -2993,125 +3060,6 @@ namespace SetterChecker.Core
             }
         }
 
-        // 仅为实际写入归并已有对象的根，固定参数映射不保存调用路径。
-        private IEnumerable<ValueOrigin> ReadExistingWriteOrigins(BehaviorValueReference reference, string reader, ResolvedCallTarget binding)
-        {
-            Query query = new(reader);
-            Dictionary<BehaviorValueReference, HashSet<(BehaviorValueKind Kind, int? Parameter)>> roots = new();
-            Dictionary<BehaviorValueReference, HashSet<BehaviorValueReference>> users = new();
-            Queue<BehaviorValueReference> pending = new();
-            HashSet<BehaviorValueReference> queued = new();
-
-            // 每个原始值只保存接收对象、参数或静态根，不携带调用路径。
-            HashSet<(BehaviorValueKind Kind, int? Parameter)> Read(BehaviorValueReference value, BehaviorValueReference? user = null)
-            {
-                value = Normalize(value);
-                if (!roots.TryGetValue(value, out var result))
-                {
-                    roots.Add(value, result = new());
-                    pending.Enqueue(value);
-                    queued.Add(value);
-                }
-                if (user.HasValue)
-                {
-                    if (!users.TryGetValue(value, out var readers))
-                    {
-                        users.Add(value, readers = new());
-                    }
-                    readers.Add(user.Value);
-                }
-                return result;
-            }
-
-            // 被调用函数的根只映射到当前固定调用的实参。
-            IEnumerable<(BehaviorValueKind Kind, int? Parameter)> Map(
-                (BehaviorValueKind Kind, int? Parameter) root, ResolvedCallTarget target, BehaviorValueReference? user = null)
-            {
-                if (root.Kind == BehaviorValueKind.FieldRead)
-                {
-                    yield return root;
-                    yield break;
-                }
-                var inputs = root.Kind == BehaviorValueKind.CurrentInstance ? target.Receiver : target.Arguments[root.Parameter!.Value];
-                foreach (BehaviorValueReference input in inputs)
-                {
-                    foreach (var source in Read(input, user))
-                    {
-                        yield return source;
-                    }
-                }
-            }
-
-            Read(reference);
-            foreach (BehaviorValueReference input in binding.Receiver.Concat(binding.Arguments.SelectMany(argument => argument)))
-            {
-                Read(input);
-            }
-            while (pending.TryDequeue(out BehaviorValueReference current))
-            {
-                queued.Remove(current);
-                HashSet<(BehaviorValueKind Kind, int? Parameter)> result = new(roots[current]);
-                foreach (ValueOrigin origin in ReadLocalOrigins(current, reader))
-                {
-                    if (origin.Value.Kind is BehaviorValueKind.CurrentInstance or BehaviorValueKind.Parameter)
-                    {
-                        result.Add((origin.Value.Kind, origin.Value.ParameterIndex));
-                    }
-                    else if (origin.Value.Kind is BehaviorValueKind.FieldRead or BehaviorValueKind.ArrayElementRead or BehaviorValueKind.Address)
-                    {
-                        if (origin.Value.Kind == BehaviorValueKind.FieldRead && origin.Value.Member?.IsReferenceStorage == false)
-                        {
-                            continue;
-                        }
-                        if (origin.Value.InputValueIds.Count == 0 && origin.Value.Member != null)
-                        {
-                            result.Add((BehaviorValueKind.FieldRead, null));
-                        }
-                        else if (origin.Value.InputValueIds.Count != 0)
-                        {
-                            result.UnionWith(Read(origin.Reference with { ValueId = origin.Value.InputValueIds[0] }, current));
-                        }
-                    }
-                    else if (origin.Value.Kind == BehaviorValueKind.CallResult
-                        && this.m_valueCalls.TryGetValue(origin.Reference, out BehaviorCall? call))
-                    {
-                        RequireCall(origin.Reference.MethodId, call, query);
-                        if (this.m_calls.TryGetValue((origin.Reference.MethodId, call.Point), out ResolvedCall? resolved))
-                        {
-                            foreach (ResolvedCallTarget target in resolved.Targets)
-                            {
-                                if (RequireBody(target.MethodId, query) && this.m_bodies[target.MethodId].Failure == null)
-                                {
-                                    foreach (BehaviorValueReference returned in ReadCallValues(target.MethodId, origin.Value.ParameterIndex))
-                                    {
-                                        foreach (var root in Read(returned, current))
-                                        {
-                                            result.UnionWith(Map(root, target, current));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if (!roots[current].SetEquals(result))
-                {
-                    roots[current] = result;
-                    if (users.TryGetValue(current, out var readers))
-                    {
-                        foreach (BehaviorValueReference user in readers.Where(queued.Add))
-                        {
-                            pending.Enqueue(user);
-                        }
-                    }
-                }
-            }
-            foreach (var root in roots[Normalize(reference)].SelectMany(root => Map(root, binding)).Distinct())
-            {
-                yield return new(reference, new(reference.ValueId, root.Kind, null, root.Parameter, Array.Empty<int>()));
-            }
-        }
-
         // 普通返回与 out 写回共用已读取的函数事实，不按函数名识别容器。
         private IEnumerable<BehaviorValueReference> ReadCallValues(string method, int? output)
         {
@@ -3234,166 +3182,71 @@ namespace SetterChecker.Core
             }
         }
 
-        // 写入只映射直接返回的字段或实参，不展开调用路径。
-        internal IEnumerable<ValueOrigin> ReadWriteOrigins(BehaviorValueReference reference, string reader)
-        {
-            Query query = new(reader);
-            foreach (ValueOrigin origin in ReadLocalOrigins(reference, reader))
-            {
-                if (origin.Value.Kind != BehaviorValueKind.CallResult
-                    || !this.m_valueCalls.TryGetValue(origin.Reference, out BehaviorCall? call))
-                {
-                    yield return origin;
-                    continue;
-                }
-                RequireCall(origin.Reference.MethodId, call, query);
-                if (!this.m_calls.TryGetValue((origin.Reference.MethodId, call.Point), out ResolvedCall? resolved)
-                    || resolved.Targets.Count == 0)
-                {
-                    yield return origin;
-                    continue;
-                }
-                if (resolved.Failure != null)
-                {
-                    yield return origin;
-                }
-                foreach (ResolvedCallTarget target in resolved.Targets)
-                {
-                    if (!RequireBody(target.MethodId, query) || this.m_bodies[target.MethodId].Failure != null)
-                    {
-                        yield return origin;
-                        continue;
-                    }
-                    if (origin.Value.ParameterIndex.HasValue || !this.m_directReturns.TryGetValue(target.MethodId, out ValueOrigin[]? returned))
-                    {
-                        returned = ReadCallValues(target.MethodId, origin.Value.ParameterIndex)
-                            .SelectMany(item => ReadLocalOrigins(item, reader)).ToArray();
-                        if (!origin.Value.ParameterIndex.HasValue && this.m_bodies[target.MethodId].Calls.Count == 0)
-                        {
-                            this.m_directReturns.Add(target.MethodId, returned);
-                        }
-                    }
-                    if (returned.Length == 0)
-                    {
-                        yield return origin;
-                    }
-                    foreach (ValueOrigin value in returned)
-                    {
-                        if (value.Value.Kind == BehaviorValueKind.CallResult)
-                        {
-                            ValueOrigin[] summaries = ReadReturnedOrigins(value.Reference).ToArray();
-                            bool found = summaries.Any(source => source.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.ShallowCopy);
-                            foreach (ValueOrigin source in summaries)
-                            {
-                                yield return source.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.ShallowCopy
-                                    ? source with { IsAllocationSummary = true }
-                                    : found && source.Value.Kind == BehaviorValueKind.Constant && source.Value.Reference == "null" ? source : origin;
-                            }
-                            foreach (ValueOrigin source in ReadExistingWriteOrigins(value.Reference, reader, target))
-                            {
-                                yield return source;
-                            }
-                            if (!found)
-                            {
-                                yield return origin;
-                            }
-                            continue;
-                        }
-                        if (value.Value.Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance)
-                        {
-                            // 返回别名转成地址转发，复用写入判断原有的接收对象队列。
-                            yield return value with
-                            {
-                                Value = value.Value with { Kind = BehaviorValueKind.Address },
-                                BoundReceiver = value.Value.Kind == BehaviorValueKind.Parameter
-                                    ? target.Arguments[value.Value.ParameterIndex!.Value] : target.Receiver,
-                            };
-                            continue;
-                        }
-                        if (value.Value.Kind == BehaviorValueKind.FieldRead && value.Value.InputValueIds.Count == 0)
-                        {
-                            yield return value;
-                            continue;
-                        }
-                        if (value.Value.Kind != BehaviorValueKind.FieldRead || value.Value.InputValueIds.Count != 1)
-                        {
-                            yield return origin;
-                            continue;
-                        }
-                        foreach (ValueOrigin owner in ReadLocalOrigins(value.Reference with { ValueId = value.Value.InputValueIds[0] }, reader))
-                        {
-                            IReadOnlyList<BehaviorValueReference>? receiver = owner.Value.Kind switch
-                            {
-                                BehaviorValueKind.CurrentInstance => target.Receiver,
-                                BehaviorValueKind.Parameter => target.Arguments[owner.Value.ParameterIndex!.Value],
-                                _ => null,
-                            };
-                            if (receiver == null)
-                            {
-                                foreach (ValueOrigin source in ReadExistingWriteOrigins(value.Reference, reader, target))
-                                {
-                                    yield return source;
-                                }
-                            }
-                            yield return receiver == null ? origin : value with { BoundReceiver = receiver };
-                        }
-                    }
-                }
-            }
-        }
-
         // 写入判断只需要函数内对象身份，不为普通参数枚举所有调用者。
         internal IEnumerable<ValueOrigin> ReadLocalOrigins(BehaviorValueReference reference, string? readerMethod = null, bool observe = true)
         {
-            Queue<(BehaviorValueReference Reference, BehaviorTypeReference? Cast)> pending = new();
-            HashSet<(BehaviorValueReference Reference, BehaviorTypeReference? Cast)> visited = new();
-            pending.Enqueue((Normalize(reference), null));
-            while (pending.TryDequeue(out var item))
+            // 多数值没有输入，队列和去重表在第一次出现输入时才建立。
+            Queue<(BehaviorValueReference Reference, BehaviorTypeReference? Cast)>? pending = null;
+            HashSet<(BehaviorValueReference Reference, BehaviorTypeReference? Cast)>? visited = null;
+            (BehaviorValueReference Reference, BehaviorTypeReference? Cast) item = (Normalize(reference), null);
+            while (true)
             {
-                if (!visited.Add(item))
-                {
-                    continue;
-                }
                 this.OriginReadCount++;
                 if (observe)
                 {
                     Observe(new("body", item.Reference.MethodId), readerMethod ?? reference.MethodId);
                 }
-                IEnumerable<ValueOrigin> origins = this.m_results.TryGetValue(item.Reference, out var result) ? result
-                    : new[] { new ValueOrigin(item.Reference, this.m_bodies[item.Reference.MethodId].Values[item.Reference.ValueId]) };
+                IReadOnlyList<ValueOrigin>? results = this.m_results.GetValueOrDefault(item.Reference);
                 if (observe && this.m_valueCalls.TryGetValue(item.Reference, out BehaviorCall? call))
                 {
                     Observe(CallKey(item.Reference.MethodId, call.Point), readerMethod ?? reference.MethodId);
                 }
-                foreach (ValueOrigin origin in origins)
+                for (int index = 0; index < (results?.Count ?? 1); index++)
                 {
-                    BehaviorValue value = origin.Value;
-                    IEnumerable<int>? inputs = value.Kind == BehaviorValueKind.SlotRead ? ReadReachingValues(origin.Reference, value)
+                    BehaviorValueReference source = results?[index].Reference ?? item.Reference;
+                    BehaviorValue value = results?[index].Value ?? this.m_bodies[source.MethodId].Values[source.ValueId];
+                    IEnumerable<int>? inputs = value.Kind == BehaviorValueKind.SlotRead ? ReadReachingValues(source, value)
                         : value.Kind is BehaviorValueKind.Merge or BehaviorValueKind.Conversion ? value.InputValueIds : null;
+                    List<BehaviorValueReference>? captures = inputs == null && value.Kind == BehaviorValueKind.CapturedVariable
+                        && value.SourceSymbol != null ? this.m_sourceSlots.GetValueOrDefault(value.SourceSymbol) : null;
+                    if (inputs == null && captures == null)
+                    {
+                        ValueOrigin? converted = ConvertOrigin(results?[index] ?? new ValueOrigin(source, value), item.Cast);
+                        if (converted != null)
+                        {
+                            yield return converted;
+                        }
+                        continue;
+                    }
+                    if (pending == null)
+                    {
+                        pending = new();
+                        visited = new() { item };
+                    }
                     if (inputs != null)
                     {
                         foreach (int input in inputs)
                         {
-                            pending.Enqueue((origin.Reference with { ValueId = input },
-                                value.Kind == BehaviorValueKind.Conversion ? value.Type ?? item.Cast : item.Cast));
+                            pending.Enqueue((source with { ValueId = input }, value.Kind == BehaviorValueKind.Conversion ? value.Type ?? item.Cast : item.Cast));
                         }
                         continue;
                     }
-                    if (value.Kind == BehaviorValueKind.CapturedVariable && value.SourceSymbol != null
-                        && this.m_sourceSlots.TryGetValue(value.SourceSymbol, out var captures))
+                    foreach (BehaviorValueReference capture in captures!)
                     {
-                        foreach (BehaviorValueReference capture in captures.Where(capture => capture != origin.Reference))
+                        if (capture != source)
                         {
                             pending.Enqueue((capture, item.Cast));
                         }
-                        continue;
-                    }
-                    ValueOrigin? converted = ConvertOrigin(origin, item.Cast);
-                    if (converted != null)
-                    {
-                        yield return converted;
                     }
                 }
+                do
+                {
+                    if (pending == null || !pending.TryDequeue(out item))
+                    {
+                        yield break;
+                    }
+                }
+                while (!visited!.Add(item));
             }
         }
 
@@ -3716,26 +3569,6 @@ namespace SetterChecker.Core
             throw new AnalysisException("反射实参数组长度尚未确定");
         }
 
-        // 新对象的成员写入只读取该成员的来源。
-        internal IReadOnlyList<BehaviorValueReference> ReadMemberValues(ValueOrigin receiver, BehaviorMemberReference member)
-        {
-            List<BehaviorValueReference> values = new();
-            foreach (BehaviorWrite write in this.m_bodies[receiver.Reference.MethodId].Writes.Where(write => write.Member != null
-                && MemberKey(write.Member) == MemberKey(member) && write.ReceiverValueId.HasValue))
-            {
-                if (ReadLocalOrigins(receiver.Reference with { ValueId = write.ReceiverValueId!.Value })
-                    .Any(origin => origin.Reference == receiver.Reference))
-                {
-                    values.Add(receiver.Reference with { ValueId = write.ValueId });
-                }
-            }
-            if (values.Count == 0)
-            {
-                values.Add(StoreOrigin(Unknown(receiver.Reference, "新对象成员来源尚未确定")));
-            }
-            return values;
-        }
-
         // 只为语义操作生成的具体值保留引用，不创建字段映射代理。
         private BehaviorValueReference StoreOrigin(ValueOrigin origin)
         {
@@ -3832,9 +3665,9 @@ namespace SetterChecker.Core
                 return known;
             }
 
-            MethodBehavior body = this.m_bodies[reference.MethodId];
             int slot = value.InputValueIds.Single();
-            Stack<BehaviorFlowPoint> pending = new(new[] { value.Point!.Value });
+            Stack<BehaviorFlowPoint> pending = new();
+            pending.Push(value.Point!.Value);
             HashSet<BehaviorFlowPoint> visited = new();
             HashSet<int> result = new();
             while (pending.TryPop(out BehaviorFlowPoint point))
@@ -3844,25 +3677,25 @@ namespace SetterChecker.Core
                     continue;
                 }
 
-                BehaviorAssignment? assignment = this.m_slotWrites.GetValueOrDefault((reference.MethodId, slot, point.BlockId))
-                    ?.LastOrDefault(item => item.Point.Order < point.Order);
+                BehaviorAssignment? assignment = null;
+                foreach (BehaviorAssignment write in this.m_slotWrites.GetValueOrDefault((reference.MethodId, slot, point.BlockId)) ?? [])
+                {
+                    assignment = write.Point.Order < point.Order ? write : assignment;
+                }
                 if (assignment != null)
                 {
                     result.Add(assignment.ValueId);
                     continue;
                 }
 
-                int[] predecessors = this.m_predecessors[reference.MethodId][point.BlockId].ToArray();
-                if (predecessors.Length == 0)
+                if (!this.m_predecessors[reference.MethodId].TryGetValue(point.BlockId, out List<int>? predecessors))
                 {
                     result.Add(slot);
+                    continue;
                 }
-                else
+                foreach (int predecessor in predecessors)
                 {
-                    foreach (int predecessor in predecessors)
-                    {
-                        pending.Push(new BehaviorFlowPoint(predecessor, int.MaxValue));
-                    }
+                    pending.Push(new BehaviorFlowPoint(predecessor, int.MaxValue));
                 }
             }
 

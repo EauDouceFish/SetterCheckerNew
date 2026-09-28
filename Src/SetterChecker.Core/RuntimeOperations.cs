@@ -109,6 +109,8 @@ namespace SetterChecker.Core
     /// <summary>按实际类型和完整签名识别基础操作；其余方法交还普通源码或 IL 分析。</summary>
     internal static class RuntimeOperations
     {
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IReadOnlyList<TypeEntry>, ExceptionTypeCache> s_exceptionTypes = new();
+
         // 诊断类型必须同时匹配完整类型名和程序集简单名，避免误伤业务同名类型。
         internal static RuntimeOperationRule? Find(MethodCatalogResult catalog, MethodEntry method)
         {
@@ -301,32 +303,54 @@ namespace SetterChecker.Core
             };
         }
 
-        // 沿继承关系识别所有标准异常类型，不枚举具体异常类名称。
+        // 沿继承关系识别所有标准异常类型，不枚举具体异常类名称；载入新类型会更换类型数组，结果按数组快照缓存。
         private static bool IsExceptionType(MethodCatalogResult catalog, TypeEntry type)
         {
-            HashSet<string> visited = new(StringComparer.Ordinal);
-            TypeEntry? current = type;
-            while (current != null && visited.Add(current.Id))
+            ExceptionTypeCache cache = s_exceptionTypes.GetValue(catalog.Types, types => new(types));
+            return cache.Results.GetOrAdd(type.Id, _ =>
             {
-                if (current.FullName == "System.Exception")
+                HashSet<string> visited = new(StringComparer.Ordinal);
+                TypeEntry? current = type;
+                while (current != null && visited.Add(current.Id))
                 {
-                    return true;
+                    if (current.FullName == "System.Exception")
+                    {
+                        return true;
+                    }
+                    if (current.BaseType == null)
+                    {
+                        current = null;
+                    }
+                    else if (catalog.TypesById.TryGetValue(current.BaseType.DefinitionId, out TypeEntry? baseType))
+                    {
+                        current = baseType;
+                    }
+                    else
+                    {
+                        int position = Math.Min(cache.Positions.Value.ById.GetValueOrDefault(current.BaseType.DefinitionId, int.MaxValue),
+                            cache.Positions.Value.ByFullName.GetValueOrDefault(current.BaseType.FullName, int.MaxValue));
+                        current = position == int.MaxValue ? null : cache.Types[position];
+                    }
                 }
-                if (current.BaseType == null)
+                return false;
+            });
+        }
+
+        /// <summary>同一类型数组快照内的异常判断结果，以及按身份或完整名称首次出现的位置。</summary>
+        private sealed class ExceptionTypeCache(IReadOnlyList<TypeEntry> types)
+        {
+            internal IReadOnlyList<TypeEntry> Types { get; } = types;
+            internal System.Collections.Concurrent.ConcurrentDictionary<string, bool> Results { get; } = new(StringComparer.Ordinal);
+            internal Lazy<(Dictionary<string, int> ById, Dictionary<string, int> ByFullName)> Positions { get; } = new(() =>
+            {
+                (Dictionary<string, int> ById, Dictionary<string, int> ByFullName) positions = (new(StringComparer.Ordinal), new(StringComparer.Ordinal));
+                for (int index = 0; index < types.Count; index++)
                 {
-                    current = null;
+                    positions.ById.TryAdd(types[index].Id, index);
+                    positions.ByFullName.TryAdd(types[index].FullName, index);
                 }
-                else if (catalog.TypesById.TryGetValue(current.BaseType.DefinitionId, out TypeEntry? baseType))
-                {
-                    current = baseType;
-                }
-                else
-                {
-                    current = catalog.Types.FirstOrDefault(item => item.Id == current.BaseType.DefinitionId
-                        || item.FullName == current.BaseType.FullName);
-                }
-            }
-            return false;
+                return positions;
+            });
         }
     }
 }
