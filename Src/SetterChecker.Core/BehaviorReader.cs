@@ -1131,7 +1131,8 @@ namespace SetterChecker.Core
                     this.m_currentOffset = offset;
                     this.m_currentOrder = this.m_incomingStacks[offset].Length;
                     ReadInstruction(instruction);
-                    int[] outgoingStack = this.m_stack.Reverse().ToArray();
+                    int[] outgoingStack = this.m_stack.ToArray();
+                    Array.Reverse(outgoingStack);
                     this.m_outgoingStacks[offset] = outgoingStack;
 
                     foreach (int successor in ReadSuccessors(instruction, instructionsByOffset))
@@ -1236,15 +1237,9 @@ namespace SetterChecker.Core
                     };
                 }
 
-                IEnumerable<int> targets = instruction.OpCode.FlowControl switch
-                {
-                    Cil.FlowControl.Branch => ReadBranchTargets(instruction),
-                    Cil.FlowControl.Cond_Branch => ReadBranchTargets(instruction).Concat(instruction.Next == null
-                        ? Array.Empty<int>() : new[] { instruction.Next.Offset }),
-                    _ => instruction.Next == null ? Array.Empty<int>() : new[] { instruction.Next.Offset },
-                };
-                return targets.Distinct().Order().Select(target => Edge(target,
-                    Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics.Regular, instruction.OpCode.Code == Cil.Code.Leave)).ToArray();
+                bool leave = instruction.OpCode.Code == Cil.Code.Leave;
+                return Array.ConvertAll(ReadTargets(instruction),
+                    target => Edge(target, Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowBranchSemantics.Regular, leave));
             }
 
             // 返回当前指令完成后可能继续执行的全部下一条指令。
@@ -1255,13 +1250,33 @@ namespace SetterChecker.Core
                 // 异常入口由编译器给定的独立栈初始化；普通路径共用已保存的跳转事实。
                 return instruction.OpCode.FlowControl is Cil.FlowControl.Return or Cil.FlowControl.Throw
                     ? Array.Empty<int>()
-                    : ReadManagedFlowEdges(instruction, int.MaxValue, Array.Empty<BehaviorExceptionHandler>())
-                        .Where(edge => edge.TargetBlockId.HasValue && instructions.ContainsKey(edge.TargetBlockId.Value))
-                        .Select(edge => edge.TargetBlockId!.Value).ToArray();
+                    : Array.FindAll(ReadTargets(instruction), instructions.ContainsKey);
+            }
+
+            // 普通跳转、条件跳转和顺序执行的目标位置，去重后升序排列。
+            private static int[] ReadTargets(Cil.Instruction instruction)
+            {
+                int[] targets = instruction.OpCode.FlowControl switch
+                {
+                    Cil.FlowControl.Branch => ReadBranchTargets(instruction),
+                    Cil.FlowControl.Cond_Branch when instruction.Next != null => [.. ReadBranchTargets(instruction), instruction.Next.Offset],
+                    Cil.FlowControl.Cond_Branch => ReadBranchTargets(instruction),
+                    _ => instruction.Next == null ? [] : [instruction.Next.Offset],
+                };
+                Array.Sort(targets);
+                int count = 0;
+                for (int index = 0; index < targets.Length; index++)
+                {
+                    if (count == 0 || targets[index] != targets[count - 1])
+                    {
+                        targets[count++] = targets[index];
+                    }
+                }
+                return count == targets.Length ? targets : targets[..count];
             }
 
             // 读取 Cecil 已经解析完成的单目标或多目标跳转位置。
-            private static IReadOnlyList<int> ReadBranchTargets(Cil.Instruction instruction)
+            private static int[] ReadBranchTargets(Cil.Instruction instruction)
             {
                 return instruction.Operand switch
                 {
