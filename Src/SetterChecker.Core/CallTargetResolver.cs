@@ -1566,21 +1566,7 @@ namespace SetterChecker.Core
         private readonly record struct TemplateList(IReadOnlyList<TypeIdentityTemplate> Items)
         {
             // 个数相同且每项文本相同才视为同一组实参。
-            public bool Equals(TemplateList other)
-            {
-                if (this.Items.Count != other.Items.Count)
-                {
-                    return false;
-                }
-                for (int index = 0; index < this.Items.Count; index++)
-                {
-                    if (!string.Equals(this.Items[index].Text, other.Items[index].Text, StringComparison.Ordinal))
-                    {
-                        return false;
-                    }
-                }
-                return true;
-            }
+            public bool Equals(TemplateList other) => this.Items.SequenceEqual(other.Items);
 
             // 与逐项文本比较一致的哈希。
             public override int GetHashCode()
@@ -1936,9 +1922,13 @@ namespace SetterChecker.Core
                 {
                     return (Array.Empty<MethodCatalogResult.InheritedTypeRelation>(), 0);
                 }
-                arguments = arguments.Select((argument, index) => substitutions.GetValueOrDefault(index) ?? argument).ToArray();
-                hierarchy = catalog.ReadInheritedTypes(type, arguments, owner.IsInterface)
-                    .Prepend(new MethodCatalogResult.InheritedTypeRelation(type, arguments, false, true, 0)).ToArray();
+                TypeIdentityTemplate[] bound = arguments.Select((argument, index) => substitutions.GetValueOrDefault(index) ?? argument).ToArray();
+                if (!new TemplateList(bound).Equals(new TemplateList(arguments)))
+                {
+                    arguments = bound;
+                    hierarchy = catalog.ReadInheritedTypes(type, arguments, owner.IsInterface)
+                        .Prepend(new MethodCatalogResult.InheritedTypeRelation(type, arguments, false, true, 0)).ToArray();
+                }
                 int introductionDepth = !owner.IsInterface ? 0 : hierarchy.Where(relation => !relation.IsInterface
                     && catalog.ReadInheritedTypes(relation.Definition, relation.TypeArguments).Any(parent => parent.CanImplementInterface
                         && parent.Definition.Id == owner.Id && parent.TypeArguments.SequenceEqual(declaration.DeclaringTypeArguments)))
