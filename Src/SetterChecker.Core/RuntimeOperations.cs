@@ -109,6 +109,9 @@ namespace SetterChecker.Core
     /// <summary>按实际类型和完整签名识别基础操作；其余方法交还普通源码或 IL 分析。</summary>
     internal static class RuntimeOperations
     {
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IReadOnlyList<TypeEntry>,
+            System.Collections.Concurrent.ConcurrentDictionary<string, bool>> s_exceptionTypes = new();
+
         // 诊断类型必须同时匹配完整类型名和程序集简单名，避免误伤业务同名类型。
         internal static RuntimeOperationRule? Find(MethodCatalogResult catalog, MethodEntry method)
         {
@@ -301,32 +304,36 @@ namespace SetterChecker.Core
             };
         }
 
-        // 沿继承关系识别所有标准异常类型，不枚举具体异常类名称。
+        // 沿继承关系识别所有标准异常类型，不枚举具体异常类名称；载入新类型会更换类型数组，结果按数组快照缓存。
         private static bool IsExceptionType(MethodCatalogResult catalog, TypeEntry type)
         {
-            HashSet<string> visited = new(StringComparer.Ordinal);
-            TypeEntry? current = type;
-            while (current != null && visited.Add(current.Id))
+            IReadOnlyList<TypeEntry> types = catalog.Types;
+            return s_exceptionTypes.GetOrCreateValue(types).GetOrAdd(type.Id, _ =>
             {
-                if (current.FullName == "System.Exception")
+                HashSet<string> visited = new(StringComparer.Ordinal);
+                TypeEntry? current = type;
+                while (current != null && visited.Add(current.Id))
                 {
-                    return true;
+                    if (current.FullName == "System.Exception")
+                    {
+                        return true;
+                    }
+                    if (current.BaseType == null)
+                    {
+                        current = null;
+                    }
+                    else if (catalog.TypesById.TryGetValue(current.BaseType.DefinitionId, out TypeEntry? baseType))
+                    {
+                        current = baseType;
+                    }
+                    else
+                    {
+                        current = types.FirstOrDefault(item => item.Id == current.BaseType.DefinitionId
+                            || item.FullName == current.BaseType.FullName);
+                    }
                 }
-                if (current.BaseType == null)
-                {
-                    current = null;
-                }
-                else if (catalog.TypesById.TryGetValue(current.BaseType.DefinitionId, out TypeEntry? baseType))
-                {
-                    current = baseType;
-                }
-                else
-                {
-                    current = catalog.Types.FirstOrDefault(item => item.Id == current.BaseType.DefinitionId
-                        || item.FullName == current.BaseType.FullName);
-                }
-            }
-            return false;
+                return false;
+            });
         }
     }
 }

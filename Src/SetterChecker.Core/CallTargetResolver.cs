@@ -2406,8 +2406,6 @@ namespace SetterChecker.Core
     /// <summary>函数说明中的原始值，不保存父调用环境。</summary>
     public sealed record ValueOrigin(BehaviorValueReference Reference, BehaviorValue Value)
     {
-        /// <summary>仅证明返回对象是新分配的，不包含其成员初始化来源。</summary>
-        public bool IsAllocationSummary { get; init; }
         /// <summary>委托绑定的对象，与函数地址分开保存。</summary>
         public IReadOnlyList<BehaviorValueReference>? BoundReceiver { get; init; }
 
@@ -2431,7 +2429,6 @@ namespace SetterChecker.Core
         private readonly Dictionary<(string Method, BehaviorFlowPoint Point, int Index), BehaviorValueReference> m_outResults = new();
         private readonly Dictionary<BehaviorValueReference, IReadOnlyList<ValueOrigin>> m_results = new();
         private readonly Dictionary<(string Method, bool Tracking), ValueOrigin[]> m_returns = new();
-        private readonly Dictionary<string, ValueOrigin[]> m_directReturns = new(StringComparer.Ordinal);
         private readonly Dictionary<string, Dictionary<(string Caller, BehaviorFlowPoint Point), ResolvedCallTarget[]>> m_incoming = new(StringComparer.Ordinal);
         private readonly Dictionary<string, List<(string Method, BehaviorWrite Write)>> m_writes = new(StringComparer.Ordinal);
         private readonly Dictionary<ISymbol, List<BehaviorValueReference>> m_sourceSlots = new(SymbolEqualityComparer.Default);
@@ -2993,125 +2990,6 @@ namespace SetterChecker.Core
             }
         }
 
-        // 仅为实际写入归并已有对象的根，固定参数映射不保存调用路径。
-        private IEnumerable<ValueOrigin> ReadExistingWriteOrigins(BehaviorValueReference reference, string reader, ResolvedCallTarget binding)
-        {
-            Query query = new(reader);
-            Dictionary<BehaviorValueReference, HashSet<(BehaviorValueKind Kind, int? Parameter)>> roots = new();
-            Dictionary<BehaviorValueReference, HashSet<BehaviorValueReference>> users = new();
-            Queue<BehaviorValueReference> pending = new();
-            HashSet<BehaviorValueReference> queued = new();
-
-            // 每个原始值只保存接收对象、参数或静态根，不携带调用路径。
-            HashSet<(BehaviorValueKind Kind, int? Parameter)> Read(BehaviorValueReference value, BehaviorValueReference? user = null)
-            {
-                value = Normalize(value);
-                if (!roots.TryGetValue(value, out var result))
-                {
-                    roots.Add(value, result = new());
-                    pending.Enqueue(value);
-                    queued.Add(value);
-                }
-                if (user.HasValue)
-                {
-                    if (!users.TryGetValue(value, out var readers))
-                    {
-                        users.Add(value, readers = new());
-                    }
-                    readers.Add(user.Value);
-                }
-                return result;
-            }
-
-            // 被调用函数的根只映射到当前固定调用的实参。
-            IEnumerable<(BehaviorValueKind Kind, int? Parameter)> Map(
-                (BehaviorValueKind Kind, int? Parameter) root, ResolvedCallTarget target, BehaviorValueReference? user = null)
-            {
-                if (root.Kind == BehaviorValueKind.FieldRead)
-                {
-                    yield return root;
-                    yield break;
-                }
-                var inputs = root.Kind == BehaviorValueKind.CurrentInstance ? target.Receiver : target.Arguments[root.Parameter!.Value];
-                foreach (BehaviorValueReference input in inputs)
-                {
-                    foreach (var source in Read(input, user))
-                    {
-                        yield return source;
-                    }
-                }
-            }
-
-            Read(reference);
-            foreach (BehaviorValueReference input in binding.Receiver.Concat(binding.Arguments.SelectMany(argument => argument)))
-            {
-                Read(input);
-            }
-            while (pending.TryDequeue(out BehaviorValueReference current))
-            {
-                queued.Remove(current);
-                HashSet<(BehaviorValueKind Kind, int? Parameter)> result = new(roots[current]);
-                foreach (ValueOrigin origin in ReadLocalOrigins(current, reader))
-                {
-                    if (origin.Value.Kind is BehaviorValueKind.CurrentInstance or BehaviorValueKind.Parameter)
-                    {
-                        result.Add((origin.Value.Kind, origin.Value.ParameterIndex));
-                    }
-                    else if (origin.Value.Kind is BehaviorValueKind.FieldRead or BehaviorValueKind.ArrayElementRead or BehaviorValueKind.Address)
-                    {
-                        if (origin.Value.Kind == BehaviorValueKind.FieldRead && origin.Value.Member?.IsReferenceStorage == false)
-                        {
-                            continue;
-                        }
-                        if (origin.Value.InputValueIds.Count == 0 && origin.Value.Member != null)
-                        {
-                            result.Add((BehaviorValueKind.FieldRead, null));
-                        }
-                        else if (origin.Value.InputValueIds.Count != 0)
-                        {
-                            result.UnionWith(Read(origin.Reference with { ValueId = origin.Value.InputValueIds[0] }, current));
-                        }
-                    }
-                    else if (origin.Value.Kind == BehaviorValueKind.CallResult
-                        && this.m_valueCalls.TryGetValue(origin.Reference, out BehaviorCall? call))
-                    {
-                        RequireCall(origin.Reference.MethodId, call, query);
-                        if (this.m_calls.TryGetValue((origin.Reference.MethodId, call.Point), out ResolvedCall? resolved))
-                        {
-                            foreach (ResolvedCallTarget target in resolved.Targets)
-                            {
-                                if (RequireBody(target.MethodId, query) && this.m_bodies[target.MethodId].Failure == null)
-                                {
-                                    foreach (BehaviorValueReference returned in ReadCallValues(target.MethodId, origin.Value.ParameterIndex))
-                                    {
-                                        foreach (var root in Read(returned, current))
-                                        {
-                                            result.UnionWith(Map(root, target, current));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if (!roots[current].SetEquals(result))
-                {
-                    roots[current] = result;
-                    if (users.TryGetValue(current, out var readers))
-                    {
-                        foreach (BehaviorValueReference user in readers.Where(queued.Add))
-                        {
-                            pending.Enqueue(user);
-                        }
-                    }
-                }
-            }
-            foreach (var root in roots[Normalize(reference)].SelectMany(root => Map(root, binding)).Distinct())
-            {
-                yield return new(reference, new(reference.ValueId, root.Kind, null, root.Parameter, Array.Empty<int>()));
-            }
-        }
-
         // 普通返回与 out 写回共用已读取的函数事实，不按函数名识别容器。
         private IEnumerable<BehaviorValueReference> ReadCallValues(string method, int? output)
         {
@@ -3228,114 +3106,6 @@ namespace SetterChecker.Core
                                     Type = this.m_catalog.SubstituteType(value.Value.Type, description.TypeArguments, description.MethodArguments),
                                 } };
                             }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 写入只映射直接返回的字段或实参，不展开调用路径。
-        internal IEnumerable<ValueOrigin> ReadWriteOrigins(BehaviorValueReference reference, string reader)
-        {
-            Query query = new(reader);
-            foreach (ValueOrigin origin in ReadLocalOrigins(reference, reader))
-            {
-                if (origin.Value.Kind != BehaviorValueKind.CallResult
-                    || !this.m_valueCalls.TryGetValue(origin.Reference, out BehaviorCall? call))
-                {
-                    yield return origin;
-                    continue;
-                }
-                RequireCall(origin.Reference.MethodId, call, query);
-                if (!this.m_calls.TryGetValue((origin.Reference.MethodId, call.Point), out ResolvedCall? resolved)
-                    || resolved.Targets.Count == 0)
-                {
-                    yield return origin;
-                    continue;
-                }
-                if (resolved.Failure != null)
-                {
-                    yield return origin;
-                }
-                foreach (ResolvedCallTarget target in resolved.Targets)
-                {
-                    if (!RequireBody(target.MethodId, query) || this.m_bodies[target.MethodId].Failure != null)
-                    {
-                        yield return origin;
-                        continue;
-                    }
-                    if (origin.Value.ParameterIndex.HasValue || !this.m_directReturns.TryGetValue(target.MethodId, out ValueOrigin[]? returned))
-                    {
-                        returned = ReadCallValues(target.MethodId, origin.Value.ParameterIndex)
-                            .SelectMany(item => ReadLocalOrigins(item, reader)).ToArray();
-                        if (!origin.Value.ParameterIndex.HasValue && this.m_bodies[target.MethodId].Calls.Count == 0)
-                        {
-                            this.m_directReturns.Add(target.MethodId, returned);
-                        }
-                    }
-                    if (returned.Length == 0)
-                    {
-                        yield return origin;
-                    }
-                    foreach (ValueOrigin value in returned)
-                    {
-                        if (value.Value.Kind == BehaviorValueKind.CallResult)
-                        {
-                            ValueOrigin[] summaries = ReadReturnedOrigins(value.Reference).ToArray();
-                            bool found = summaries.Any(source => source.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.ShallowCopy);
-                            foreach (ValueOrigin source in summaries)
-                            {
-                                yield return source.Value.Kind is BehaviorValueKind.NewObject or BehaviorValueKind.ShallowCopy
-                                    ? source with { IsAllocationSummary = true }
-                                    : found && source.Value.Kind == BehaviorValueKind.Constant && source.Value.Reference == "null" ? source : origin;
-                            }
-                            foreach (ValueOrigin source in ReadExistingWriteOrigins(value.Reference, reader, target))
-                            {
-                                yield return source;
-                            }
-                            if (!found)
-                            {
-                                yield return origin;
-                            }
-                            continue;
-                        }
-                        if (value.Value.Kind is BehaviorValueKind.Parameter or BehaviorValueKind.CurrentInstance)
-                        {
-                            // 返回别名转成地址转发，复用写入判断原有的接收对象队列。
-                            yield return value with
-                            {
-                                Value = value.Value with { Kind = BehaviorValueKind.Address },
-                                BoundReceiver = value.Value.Kind == BehaviorValueKind.Parameter
-                                    ? target.Arguments[value.Value.ParameterIndex!.Value] : target.Receiver,
-                            };
-                            continue;
-                        }
-                        if (value.Value.Kind == BehaviorValueKind.FieldRead && value.Value.InputValueIds.Count == 0)
-                        {
-                            yield return value;
-                            continue;
-                        }
-                        if (value.Value.Kind != BehaviorValueKind.FieldRead || value.Value.InputValueIds.Count != 1)
-                        {
-                            yield return origin;
-                            continue;
-                        }
-                        foreach (ValueOrigin owner in ReadLocalOrigins(value.Reference with { ValueId = value.Value.InputValueIds[0] }, reader))
-                        {
-                            IReadOnlyList<BehaviorValueReference>? receiver = owner.Value.Kind switch
-                            {
-                                BehaviorValueKind.CurrentInstance => target.Receiver,
-                                BehaviorValueKind.Parameter => target.Arguments[owner.Value.ParameterIndex!.Value],
-                                _ => null,
-                            };
-                            if (receiver == null)
-                            {
-                                foreach (ValueOrigin source in ReadExistingWriteOrigins(value.Reference, reader, target))
-                                {
-                                    yield return source;
-                                }
-                            }
-                            yield return receiver == null ? origin : value with { BoundReceiver = receiver };
                         }
                     }
                 }
@@ -3714,26 +3484,6 @@ namespace SetterChecker.Core
                 }
             }
             throw new AnalysisException("反射实参数组长度尚未确定");
-        }
-
-        // 新对象的成员写入只读取该成员的来源。
-        internal IReadOnlyList<BehaviorValueReference> ReadMemberValues(ValueOrigin receiver, BehaviorMemberReference member)
-        {
-            List<BehaviorValueReference> values = new();
-            foreach (BehaviorWrite write in this.m_bodies[receiver.Reference.MethodId].Writes.Where(write => write.Member != null
-                && MemberKey(write.Member) == MemberKey(member) && write.ReceiverValueId.HasValue))
-            {
-                if (ReadLocalOrigins(receiver.Reference with { ValueId = write.ReceiverValueId!.Value })
-                    .Any(origin => origin.Reference == receiver.Reference))
-                {
-                    values.Add(receiver.Reference with { ValueId = write.ValueId });
-                }
-            }
-            if (values.Count == 0)
-            {
-                values.Add(StoreOrigin(Unknown(receiver.Reference, "新对象成员来源尚未确定")));
-            }
-            return values;
         }
 
         // 只为语义操作生成的具体值保留引用，不创建字段映射代理。

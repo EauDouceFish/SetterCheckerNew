@@ -17,22 +17,6 @@ namespace SetterChecker.Core
     /// </summary>
     public sealed class BehaviorReader
     {
-        // 并行读取指定函数，并按函数身份固定结果顺序。
-        /// <summary>
-        /// 读取一批已经进入函数总表的源码或托管函数。
-        /// </summary>
-        public async Task<BehaviorReadResult> ReadAsync(
-            MaterialSet material,
-            MethodCatalogResult catalog,
-            IReadOnlyList<MethodEntry> methods,
-            int jobs,
-            CancellationToken cancellationToken = default)
-        {
-            BehaviorReadResult result = await ReadAvailableAsync(material, catalog, methods, jobs, cancellationToken).ConfigureAwait(false);
-            string? failure = result.Methods.Select(method => method.Failure).FirstOrDefault(message => message != null);
-            return failure == null ? result : throw new AnalysisException(failure);
-        }
-
         // 逐方法保存读取失败，不丢弃同批成功事实；调用方必须继续保留失败状态。
         internal Task<BehaviorReadResult> ReadAvailableAsync(MaterialSet material, MethodCatalogResult catalog,
             IReadOnlyList<MethodEntry> methods, int jobs, CancellationToken cancellationToken)
