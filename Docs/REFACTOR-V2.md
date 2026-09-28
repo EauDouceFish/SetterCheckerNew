@@ -182,6 +182,12 @@ khengine 本身如果被判为编辑器程序集，直接报错停止。
 - 声明类型属于 `mscorlib`、`netstandard`、`System.Private.CoreLib`、`System`、`System.*`、`Microsoft.*` 程序集的静态字段（区域设置、资源字符串等运行时内部缓存），对它们的读写不算写静态数据，也不触发 TOP。
 - 实例字段、业务程序集的静态字段不受影响。
 
+### R9 带参数的空函数是日志打点（用户 2026-09-28 确认）
+
+- 日志注入器特意不过滤空函数（`LogTrackInjector.CheckFilterMethod` 注释："空函数，不可以直接过滤，有些需要注入打印语句"），`LogTrack_ClockTick(int actorId)` 这类函数就是为了记录参数而存在的。
+- 源码中声明了参数、函数体没有任何语句、且没有 NLT 标签的函数，日志决定为 ShouldTrack，不建议 NoLogTrack。真实行为仍按 Getter 报告。
+- 无参数的空函数（如可重写的空虚函数 `OnLateTick`）不受影响。
+
 ### 2.8 文档同步清单（S0 执行，用户已授权）
 
 1. PROJECT-PLAN 第三章"可信豁免内部的写入不使上层需要追踪，但上层自己的写入仍单独判断"改为：

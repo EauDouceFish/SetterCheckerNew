@@ -27,13 +27,14 @@ namespace SetterChecker.Core
                 bool reason = nlt?.ConstructorArguments.Any(argument => argument.Type?.SpecialType == SpecialType.System_String
                     && argument.Value is string text && !string.IsNullOrWhiteSpace(text)) == true;
                 bool trustedClass = nltClass && !log;
+                bool traceHook = !sourceNlt && IsTraceHook(symbol);
                 MethodEffectKind? actual = trustedClass ? MethodEffectKind.Getter : facts.GetValueOrDefault(method.Id)?.Kind;
                 string? failure = log && sourceNlt ? "NoLogTrack 与 LogTrack 冲突"
                     : trustedClass ? null
                     : actual == null ? effects.Failures.GetValueOrDefault(method.Id)?.Detail ?? "尚未取得真实行为证明"
                     : null;
                 string? decision = log && sourceNlt ? null : nltClass ? "NLTClass" : sourceNlt ? "NoLogTrack"
-                    : log ? "ShouldTrack" : failure != null ? null
+                    : log || traceHook ? "ShouldTrack" : failure != null ? null
                     : actual == MethodEffectKind.Setter ? "ShouldTrack" : "NoLogTrack";
                 bool informational = sourceNlt && !log && actual == null
                     || failure?.StartsWith("接口或重写没有合法实现：", StringComparison.Ordinal) == true
@@ -94,6 +95,14 @@ namespace SetterChecker.Core
         internal static AttributeData? FindAttribute(ISymbol symbol, string name)
         {
             return symbol.GetAttributes().SingleOrDefault(attribute => attribute.AttributeClass?.ToDisplayString() == name);
+        }
+
+        // R9：声明了参数而函数体没有语句的源码函数是日志打点，注入器专门为它记录参数，不建议 NoLogTrack。
+        private static bool IsTraceHook(IMethodSymbol symbol)
+        {
+            return symbol.Parameters.Length != 0 && symbol.DeclaringSyntaxReferences.Length == 1
+                && symbol.DeclaringSyntaxReferences[0].GetSyntax() is Microsoft.CodeAnalysis.CSharp.Syntax.MethodDeclarationSyntax
+                { Body.Statements.Count: 0, ExpressionBody: null };
         }
 
         // 类级可信豁免在行为分析前直接闭合；标签冲突仍需进入分析。

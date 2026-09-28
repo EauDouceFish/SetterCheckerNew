@@ -1782,6 +1782,31 @@ namespace SetterChecker.Core.Tests
             }
         }
 
+        // T27（R9）：带参数的空函数是日志打点，保持记录；无参数的空函数照常建议 NoLogTrack。
+        /// <summary></summary>
+        [TestMethod]
+        public async Task EmptyTraceHookKeepsLogging()
+        {
+            using TestProject project = TestProject.Create("""
+                namespace KH
+                {
+                    public class Calls
+                    {
+                        public void LogPoint(int actorId) { }
+                        public void Hook() { }
+                    }
+                }
+                """);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(new(project.AssemblyDefinitionPath, 4));
+            AnnotationMethod point = run.Annotations.Methods.Single(method => method.Name == "LogPoint");
+            AnnotationMethod hook = run.Annotations.Methods.Single(method => method.Name == "Hook");
+            Assert.AreEqual(MethodEffectKind.Getter, point.Actual);
+            Assert.AreEqual("ShouldTrack", point.Decision);
+            Assert.IsFalse(point.SuggestNoLogTrack);
+            Assert.AreEqual("NoLogTrack", hook.Decision);
+            Assert.IsTrue(hook.SuggestNoLogTrack);
+        }
+
         // V2 摘要规则：Entry 的真实行为必须与预期一致；源码与 DLL 两种来源各跑一次。
         private static async Task AssertEntry(string body, MethodEffectKind expected, bool external = false)
         {
