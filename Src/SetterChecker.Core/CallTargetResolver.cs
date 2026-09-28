@@ -1555,9 +1555,47 @@ namespace SetterChecker.Core
         private sealed class DispatchIndex
         {
             internal Dictionary<string, TargetCandidates> Ranges { get; } = new(StringComparer.Ordinal);
-            internal Dictionary<string, ResolvedMethodDefinition?> Implementations { get; } = new(StringComparer.Ordinal);
-            internal Dictionary<string, (MethodCatalogResult.InheritedTypeRelation[] Types, int IntroductionDepth)> Hierarchies { get; } = new(StringComparer.Ordinal);
+            internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Type, TemplateList Arguments), ResolvedMethodDefinition?> Implementations { get; } = new();
+            internal Dictionary<(string Owner, TemplateList OwnerArguments, string Type, TemplateList Arguments), (MethodCatalogResult.InheritedTypeRelation[] Types, int IntroductionDepth)> Hierarchies { get; } = new();
         }
+
+        /// <summary>按文本逐项比较的泛型实参列表，作字典键时不拼接字符串。</summary>
+        private readonly record struct TemplateList(IReadOnlyList<TypeIdentityTemplate> Items)
+        {
+            // 个数相同且每项文本相同才视为同一组实参。
+            public bool Equals(TemplateList other)
+            {
+                if (this.Items.Count != other.Items.Count)
+                {
+                    return false;
+                }
+                for (int index = 0; index < this.Items.Count; index++)
+                {
+                    if (!string.Equals(this.Items[index].Text, other.Items[index].Text, StringComparison.Ordinal))
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            // 与逐项文本比较一致的哈希。
+            public override int GetHashCode()
+            {
+                HashCode hash = new();
+                for (int index = 0; index < this.Items.Count; index++)
+                {
+                    hash.Add(this.Items[index].Text, StringComparer.Ordinal);
+                }
+                return hash.ToHashCode();
+            }
+        }
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, TypeIdentityTemplate[]> s_placeholders = new();
+
+        // 开放泛型类型的占位实参 !0、!1…… 按个数共用同一数组。
+        private static TypeIdentityTemplate[] Placeholders(int count) => s_placeholders.GetOrAdd(count,
+            static count => Enumerable.Range(0, count).Select(index => new TypeIdentityTemplate("!" + index)).ToArray());
 
         /// <summary>共用已找到的实现；提前停止后保留枚举位置，其他调用可以继续查。</summary>
         private sealed class TargetCandidates
@@ -1648,7 +1686,7 @@ namespace SetterChecker.Core
                     continue;
                 }
                 IReadOnlyList<TypeIdentityTemplate> arguments = type.Id == declared.Id ? declaredArguments
-                    : Enumerable.Range(0, type.GenericParameters.Count).Select(index => new TypeIdentityTemplate("!" + index)).ToArray();
+                    : Placeholders(type.GenericParameters.Count);
                 MethodCatalogResult.InheritedTypeRelation? relation = type.Id == declared.Id ? null
                     : catalog.ReadInheritedTypes(type, arguments).FirstOrDefault(parent => parent.Definition.Id == declared.Id);
                 if (relation != null)
@@ -1697,11 +1735,9 @@ namespace SetterChecker.Core
             IReadOnlyList<ValueOrigin> receivers, AnalysisTiming timing, DispatchIndex dispatch)
         {
             TypeEntry owner = catalog.TypesById[declaration.Method.TypeId];
-            string ownerKey = owner.Id + "|" + string.Join(',', declaration.DeclaringTypeArguments.Select(argument => argument.Text));
+            TemplateList ownerArguments = new(declaration.DeclaringTypeArguments);
             MethodIdentityTemplate targetSignature = catalog.ReadMethodSignature(declaration.Method)
                 .Instantiate(new(owner.Id), declaration.DeclaringTypeArguments);
-            string declarationKey = declaration.Method.Id + "|" + string.Join(',', declaration.DeclaringTypeArguments.Select(argument => argument.Text))
-                + "|" + string.Join(',', declaration.MethodTypeArguments.Select(argument => argument.Text));
             List<(TypeEntry Type, IReadOnlyList<TypeIdentityTemplate> Arguments, bool Expand)> bounds = new();
             bool allKnown = receivers.Count != 0;
             foreach (ValueOrigin origin in receivers)
@@ -1718,8 +1754,8 @@ namespace SetterChecker.Core
             Queue<(TypeEntry Type, IReadOnlyList<TypeIdentityTemplate> Arguments, bool Expand, ResolvedMethodDefinition? Inherited)> pending = new(
                 (allKnown ? bounds.AsEnumerable() : new[] { (owner, declaration.DeclaringTypeArguments, true) })
                     .Select(bound => (bound.Item1, bound.Item2, bound.Item3, (ResolvedMethodDefinition?)null)));
-            HashSet<string> visited = new(StringComparer.Ordinal);
-            HashSet<string> result = new(StringComparer.Ordinal);
+            HashSet<(string Type, TemplateList Arguments, bool Expand)> visited = new();
+            HashSet<(string Method, TemplateList Arguments)> result = new();
             bool expandAny = pending.Any(candidate => candidate.Expand);
             IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> children;
             IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> implementations;
@@ -1732,7 +1768,7 @@ namespace SetterChecker.Core
             {
                 timing.Count("接口候选类型访问");
                 TypeEntry type = candidate.Type;
-                if (!visited.Add(type.Id + "|" + string.Join(',', candidate.Arguments.Select(argument => argument.Text)) + "|" + candidate.Expand))
+                if (!visited.Add((type.Id, new(candidate.Arguments), candidate.Expand)))
                 {
                     continue;
                 }
@@ -1760,14 +1796,14 @@ namespace SetterChecker.Core
                     foreach (TypeEntry child in (children.GetValueOrDefault(type.Id) ?? Array.Empty<TypeEntry>())
                         .Concat(implementations.GetValueOrDefault(type.Id) ?? Array.Empty<TypeEntry>()))
                     {
-                        pending.Enqueue((child, Enumerable.Range(0, child.GenericParameters.Count).Select(index => new TypeIdentityTemplate("!" + index)).ToArray(), true, selected));
+                        pending.Enqueue((child, Placeholders(child.GenericParameters.Count), true, selected));
                     }
                 }
                 if (type.IsInterface || type.IsAbstract)
                 {
                     continue;
                 }
-                if (selected != null && result.Add(selected.Method.Id + "|" + string.Join(',', selected.DeclaringTypeArguments.Select(argument => argument.Text))))
+                if (selected != null && result.Add((selected.Method.Id, new(selected.DeclaringTypeArguments))))
                 {
                     yield return selected;
                 }
@@ -1776,7 +1812,7 @@ namespace SetterChecker.Core
             // 子类与基类共用匹配结果，不按每个具体子类重复扫描继承链。
             ResolvedMethodDefinition? ResolveImplementation(TypeEntry type, IReadOnlyList<TypeIdentityTemplate> arguments)
             {
-                string implementationKey = declarationKey + "|" + type.Id + "|" + string.Join(',', arguments.Select(argument => argument.Text));
+                var implementationKey = (declaration.Method.Id, ownerArguments, new TemplateList(declaration.MethodTypeArguments), type.Id, new TemplateList(arguments));
                 if (!dispatch.Implementations.TryGetValue(implementationKey, out ResolvedMethodDefinition? selected))
                 {
                     timing.Count("接口具体类型实际匹配");
@@ -1798,7 +1834,7 @@ namespace SetterChecker.Core
                         return ResolveImplementation(parent.Definition, parent.TypeArguments);
                     }
                 }
-                string hierarchyKey = ownerKey + "|" + type.Id + "|" + string.Join(',', arguments.Select(argument => argument.Text));
+                var hierarchyKey = (owner.Id, ownerArguments, type.Id, new TemplateList(arguments));
                 if (!dispatch.Hierarchies.TryGetValue(hierarchyKey, out var binding))
                 {
                     binding = BindHierarchy(type, arguments);
