@@ -2505,7 +2505,7 @@ namespace SetterChecker.Core
         private readonly HashSet<string> m_requestedMethods = new(StringComparer.Ordinal);
         private readonly HashSet<string> m_completedRegistrations = new(StringComparer.Ordinal);
         private readonly Dictionary<(string Method, int Slot, int Block), BehaviorAssignment[]> m_slotWrites = new();
-        private readonly Dictionary<string, ILookup<int, int>> m_predecessors = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, Dictionary<int, List<int>>> m_predecessors = new(StringComparer.Ordinal);
         private readonly Dictionary<BehaviorValueReference, int[]> m_reaching = new();
         private readonly Dictionary<OriginKey, BehaviorValueReference> m_stored = new();
         private readonly Dictionary<(BehaviorTypeReference Source, BehaviorTypeReference Target), BehaviorTypeReference> m_convertedTypes = new();
@@ -2572,9 +2572,22 @@ namespace SetterChecker.Core
         internal void ReadBody(MethodBehavior body)
         {
             this.m_pendingCalls.Add(body.MethodId, body.Calls.Select(call => call.Point).ToHashSet());
-            this.m_predecessors.Add(body.MethodId, body.Blocks.SelectMany(block => block.Successors
-                .Where(edge => edge.TargetBlockId.HasValue).Select(edge => (Target: edge.TargetBlockId!.Value, block.Id)))
-                .ToLookup(pair => pair.Target, pair => pair.Id));
+            Dictionary<int, List<int>> predecessors = new();
+            foreach (BehaviorFlowBlock block in body.Blocks)
+            {
+                for (int index = 0; index < block.Successors.Count; index++)
+                {
+                    if (block.Successors[index].TargetBlockId is int target)
+                    {
+                        if (!predecessors.TryGetValue(target, out List<int>? sources))
+                        {
+                            predecessors.Add(target, sources = new());
+                        }
+                        sources.Add(block.Id);
+                    }
+                }
+            }
+            this.m_predecessors.Add(body.MethodId, predecessors);
             List<BehaviorAssignment> assignments = new(body.Assignments);
             foreach (BehaviorCall call in body.Calls)
             {
@@ -2597,9 +2610,14 @@ namespace SetterChecker.Core
                     assignments.Add(new(address.InputValueIds[0], output.ValueId, call.Point));
                 }
             }
-            foreach (var group in assignments.GroupBy(assignment => (assignment.TargetValueId, assignment.Point.BlockId)))
+            BehaviorAssignment[] sorted = assignments.OrderBy(item => item.TargetValueId).ThenBy(item => item.Point.BlockId).ThenBy(item => item.Point.Order).ToArray();
+            for (int start = 0, end = 0; start < sorted.Length; start = end)
             {
-                this.m_slotWrites.Add((body.MethodId, group.Key.TargetValueId, group.Key.BlockId), group.OrderBy(item => item.Point.Order).ToArray());
+                while (end < sorted.Length && sorted[end].TargetValueId == sorted[start].TargetValueId && sorted[end].Point.BlockId == sorted[start].Point.BlockId)
+                {
+                    end++;
+                }
+                this.m_slotWrites.Add((body.MethodId, sorted[start].TargetValueId, sorted[start].Point.BlockId), sorted[start..end]);
             }
             foreach (BehaviorValue value in body.Values)
             {
@@ -3677,15 +3695,14 @@ namespace SetterChecker.Core
                     continue;
                 }
 
-                bool reached = false;
-                foreach (int predecessor in this.m_predecessors[reference.MethodId][point.BlockId])
-                {
-                    reached = true;
-                    pending.Push(new BehaviorFlowPoint(predecessor, int.MaxValue));
-                }
-                if (!reached)
+                if (!this.m_predecessors[reference.MethodId].TryGetValue(point.BlockId, out List<int>? predecessors))
                 {
                     result.Add(slot);
+                    continue;
+                }
+                foreach (int predecessor in predecessors)
+                {
+                    pending.Push(new BehaviorFlowPoint(predecessor, int.MaxValue));
                 }
             }
 
