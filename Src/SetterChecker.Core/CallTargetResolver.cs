@@ -3151,55 +3151,68 @@ namespace SetterChecker.Core
         // 写入判断只需要函数内对象身份，不为普通参数枚举所有调用者。
         internal IEnumerable<ValueOrigin> ReadLocalOrigins(BehaviorValueReference reference, string? readerMethod = null, bool observe = true)
         {
-            Queue<(BehaviorValueReference Reference, BehaviorTypeReference? Cast)> pending = new();
-            HashSet<(BehaviorValueReference Reference, BehaviorTypeReference? Cast)> visited = new();
-            pending.Enqueue((Normalize(reference), null));
-            while (pending.TryDequeue(out var item))
+            // 多数值没有输入，队列和去重表在第一次出现输入时才建立。
+            Queue<(BehaviorValueReference Reference, BehaviorTypeReference? Cast)>? pending = null;
+            HashSet<(BehaviorValueReference Reference, BehaviorTypeReference? Cast)>? visited = null;
+            (BehaviorValueReference Reference, BehaviorTypeReference? Cast) item = (Normalize(reference), null);
+            while (true)
             {
-                if (!visited.Add(item))
-                {
-                    continue;
-                }
                 this.OriginReadCount++;
                 if (observe)
                 {
                     Observe(new("body", item.Reference.MethodId), readerMethod ?? reference.MethodId);
                 }
-                IEnumerable<ValueOrigin> origins = this.m_results.TryGetValue(item.Reference, out var result) ? result
-                    : new[] { new ValueOrigin(item.Reference, this.m_bodies[item.Reference.MethodId].Values[item.Reference.ValueId]) };
+                IReadOnlyList<ValueOrigin>? results = this.m_results.GetValueOrDefault(item.Reference);
                 if (observe && this.m_valueCalls.TryGetValue(item.Reference, out BehaviorCall? call))
                 {
                     Observe(CallKey(item.Reference.MethodId, call.Point), readerMethod ?? reference.MethodId);
                 }
-                foreach (ValueOrigin origin in origins)
+                for (int index = 0; index < (results?.Count ?? 1); index++)
                 {
-                    BehaviorValue value = origin.Value;
-                    IEnumerable<int>? inputs = value.Kind == BehaviorValueKind.SlotRead ? ReadReachingValues(origin.Reference, value)
+                    BehaviorValueReference source = results?[index].Reference ?? item.Reference;
+                    BehaviorValue value = results?[index].Value ?? this.m_bodies[source.MethodId].Values[source.ValueId];
+                    IEnumerable<int>? inputs = value.Kind == BehaviorValueKind.SlotRead ? ReadReachingValues(source, value)
                         : value.Kind is BehaviorValueKind.Merge or BehaviorValueKind.Conversion ? value.InputValueIds : null;
+                    List<BehaviorValueReference>? captures = inputs == null && value.Kind == BehaviorValueKind.CapturedVariable
+                        && value.SourceSymbol != null ? this.m_sourceSlots.GetValueOrDefault(value.SourceSymbol) : null;
+                    if (inputs == null && captures == null)
+                    {
+                        ValueOrigin? converted = ConvertOrigin(results?[index] ?? new ValueOrigin(source, value), item.Cast);
+                        if (converted != null)
+                        {
+                            yield return converted;
+                        }
+                        continue;
+                    }
+                    if (pending == null)
+                    {
+                        pending = new();
+                        visited = new() { item };
+                    }
                     if (inputs != null)
                     {
                         foreach (int input in inputs)
                         {
-                            pending.Enqueue((origin.Reference with { ValueId = input },
-                                value.Kind == BehaviorValueKind.Conversion ? value.Type ?? item.Cast : item.Cast));
+                            pending.Enqueue((source with { ValueId = input }, value.Kind == BehaviorValueKind.Conversion ? value.Type ?? item.Cast : item.Cast));
                         }
                         continue;
                     }
-                    if (value.Kind == BehaviorValueKind.CapturedVariable && value.SourceSymbol != null
-                        && this.m_sourceSlots.TryGetValue(value.SourceSymbol, out var captures))
+                    foreach (BehaviorValueReference capture in captures!)
                     {
-                        foreach (BehaviorValueReference capture in captures.Where(capture => capture != origin.Reference))
+                        if (capture != source)
                         {
                             pending.Enqueue((capture, item.Cast));
                         }
-                        continue;
-                    }
-                    ValueOrigin? converted = ConvertOrigin(origin, item.Cast);
-                    if (converted != null)
-                    {
-                        yield return converted;
                     }
                 }
+                do
+                {
+                    if (pending == null || !pending.TryDequeue(out item))
+                    {
+                        yield break;
+                    }
+                }
+                while (!visited!.Add(item));
             }
         }
 
@@ -3618,9 +3631,9 @@ namespace SetterChecker.Core
                 return known;
             }
 
-            MethodBehavior body = this.m_bodies[reference.MethodId];
             int slot = value.InputValueIds.Single();
-            Stack<BehaviorFlowPoint> pending = new(new[] { value.Point!.Value });
+            Stack<BehaviorFlowPoint> pending = new();
+            pending.Push(value.Point!.Value);
             HashSet<BehaviorFlowPoint> visited = new();
             HashSet<int> result = new();
             while (pending.TryPop(out BehaviorFlowPoint point))
@@ -3630,25 +3643,26 @@ namespace SetterChecker.Core
                     continue;
                 }
 
-                BehaviorAssignment? assignment = this.m_slotWrites.GetValueOrDefault((reference.MethodId, slot, point.BlockId))
-                    ?.LastOrDefault(item => item.Point.Order < point.Order);
+                BehaviorAssignment? assignment = null;
+                foreach (BehaviorAssignment write in this.m_slotWrites.GetValueOrDefault((reference.MethodId, slot, point.BlockId)) ?? [])
+                {
+                    assignment = write.Point.Order < point.Order ? write : assignment;
+                }
                 if (assignment != null)
                 {
                     result.Add(assignment.ValueId);
                     continue;
                 }
 
-                int[] predecessors = this.m_predecessors[reference.MethodId][point.BlockId].ToArray();
-                if (predecessors.Length == 0)
+                bool reached = false;
+                foreach (int predecessor in this.m_predecessors[reference.MethodId][point.BlockId])
+                {
+                    reached = true;
+                    pending.Push(new BehaviorFlowPoint(predecessor, int.MaxValue));
+                }
+                if (!reached)
                 {
                     result.Add(slot);
-                }
-                else
-                {
-                    foreach (int predecessor in predecessors)
-                    {
-                        pending.Push(new BehaviorFlowPoint(predecessor, int.MaxValue));
-                    }
                 }
             }
 
