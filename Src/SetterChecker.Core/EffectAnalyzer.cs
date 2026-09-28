@@ -276,16 +276,16 @@ namespace SetterChecker.Core
             {
                 return false;
             }
+            // 只认 List/Dictionary 本身；嵌套的 Enumerator、KeyCollection 等构造会保存原集合，必须照常分析。
             string id = target.Reference.DeclaringTypeDefinitionId;
-            if (id.Contains("System.Collections.Generic.List`1", StringComparison.Ordinal)
-                || id.Contains("System.Collections.Generic.Dictionary`2", StringComparison.Ordinal))
+            if (catalog.TypesById.TryGetValue(id, out TypeEntry? type))
             {
-                return true;
+                return !type.FullName.Contains('+')
+                    && (type.FullName is "System.Collections.Generic.List`1" or "System.Collections.Generic.Dictionary`2"
+                        || type.FullName.StartsWith("System.Collections.Generic.List<", StringComparison.Ordinal)
+                        || type.FullName.StartsWith("System.Collections.Generic.Dictionary<", StringComparison.Ordinal));
             }
-            return catalog.TypesById.TryGetValue(id, out TypeEntry? type)
-                && (type.FullName is "System.Collections.Generic.List`1" or "System.Collections.Generic.Dictionary`2"
-                    || type.FullName.StartsWith("System.Collections.Generic.List<", StringComparison.Ordinal)
-                    || type.FullName.StartsWith("System.Collections.Generic.Dictionary<", StringComparison.Ordinal));
+            return System.Text.RegularExpressions.Regex.IsMatch(id, @":System\.Collections\.Generic\.(List`1|Dictionary`2)(\||$)");
         }
         private const int StaticBit = 128;
         private const int UnknownBit = 129;
@@ -616,6 +616,10 @@ namespace SetterChecker.Core
                 {
                     if (IsStandardCollectionConstructor(target))
                     {
+                        // 标准集合构造不修改已有对象，但复制构造会把实参中的对象引用存进新集合。
+                        Store(state, ReadActualRoots(state, target, 0, false),
+                            call.Arguments.Where(argument => !IsValueTypeValue(state.Method, argument.ValueId))
+                                .SelectMany(argument => ReadRoots(state, argument.ValueId, false)).ToArray());
                         continue;
                     }
                     MethodSummary callee = ReadSummary(target.MethodId);
@@ -1000,6 +1004,14 @@ namespace SetterChecker.Core
                                 else if (value.InputValueIds.Count != 0)
                                 {
                                     pending.Enqueue((Input(0), d));
+                                    // 经局部变量地址做深写时，要追到赋给该变量的值（例如结构体枚举器中保存的原集合）。
+                                    if (d && value.Member == null && this.m_bodies.TryGetValue(origin.Reference.MethodId, out MethodBehavior? owner))
+                                    {
+                                        foreach (BehaviorAssignment assignment in owner.Assignments.Where(item => item.TargetValueId == value.InputValueIds[0]))
+                                        {
+                                            pending.Enqueue((origin.Reference with { ValueId = assignment.ValueId }, true));
+                                        }
+                                    }
                                 }
                                 else if (d)
                                 {

@@ -1826,6 +1826,23 @@ namespace SetterChecker.Core.Tests
             }
             """, MethodEffectKind.Getter, external);
 
+        // T6b：foreach 取出字段集合中的元素并修改它（对应 SwitchCaseArg.ClearData、TSDamageDetectVirgation.OnUpdate），必须为 Setter。
+        /// <summary>T6b：经 foreach 元素修改已有对象为 Setter。</summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public Task ForeachElementMutationIsSetter(bool external, bool dictionary) => AssertEntry($$"""
+            public class Task2 { public int Frames; public System.Collections.Generic.List<int> Items = new System.Collections.Generic.List<int>(); }
+            public class Calls
+            {
+                private readonly System.Collections.Generic.List<Task2> m_list = new System.Collections.Generic.List<Task2>();
+                private readonly System.Collections.Generic.Dictionary<int, Task2> m_dict = new System.Collections.Generic.Dictionary<int, Task2>();
+                public void Entry() { {{(dictionary ? "foreach (var task in m_dict.Values) { task.Frames--; }" : "foreach (var item in m_list) { item.Items.Clear(); }")}} }
+            }
+            """, MethodEffectKind.Setter, external);
+
         // T7/T8：修改局部新建列表不算修改，修改字段列表为 Setter。
         /// <summary></summary>
         [TestMethod]
