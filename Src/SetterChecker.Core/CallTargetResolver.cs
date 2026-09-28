@@ -27,7 +27,7 @@ namespace SetterChecker.Core
             Dictionary<string, MethodEntry> methods = new(StringComparer.Ordinal);
             Dictionary<string, MethodBehavior> bodies = new(StringComparer.Ordinal);
             ValueSourceIndex sources = new(catalog, methods, bodies, cancellationToken) { UseReflectionBaseline = useReflectionBaseline };
-            EffectAnalyzer.FunctionEffects effects = new(catalog, roots, methods, sources);
+            EffectAnalyzer.TopTracker effects = new(catalog, sources);
             Dictionary<(string Method, BehaviorFlowPoint Point), ResolvedCall> calls = new();
             Dictionary<(string Method, BehaviorFlowPoint Point), PendingCall> failures = new();
             DispatchIndex dispatch = new();
@@ -37,6 +37,8 @@ namespace SetterChecker.Core
             HashSet<string> unread = new(StringComparer.Ordinal);
             HashSet<string> deferred = new(StringComparer.Ordinal);
             Queue<string> deferredReady = new();
+            Queue<string> revisit = new();
+            HashSet<string> revisitSet = new(StringComparer.Ordinal);
             HashSet<string> behaviorNeeded = new(StringComparer.Ordinal);
             HashSet<string> rootIds = roots.Select(method => method.Id).ToHashSet(StringComparer.Ordinal);
             HashSet<string> liveBehavior = new(StringComparer.Ordinal);
@@ -64,8 +66,9 @@ namespace SetterChecker.Core
             // 查询只查登记状态和结果，不搜索任何上下游关系。
             bool NeedsBehavior(string method) => behaviorNeeded.Contains(method) && IsLive(method);
 
-            // 入口自身或仍被入口需要的函数保持活跃。
-            bool IsLive(string method) => !effects.IsSettled(method) && (rootIds.Contains(method) || liveBehavior.Contains(method));
+            // 尚未确定的入口，或被仍在展开的函数需要完整摘要的函数保持活跃；TOP 函数的其余调用不影响任何结论。
+            bool IsLive(string method) => !effects.IsTop(method)
+                && (rootIds.Contains(method) && !effects.IsDecided(method) || liveBehavior.Contains(method));
 
             // 首次激活时只记一个有效的直接调用者，不复制函数或分析环境。
             void ActivateBehavior(string caller, string method)
@@ -74,7 +77,7 @@ namespace SetterChecker.Core
                 while (pending.TryDequeue(out var next))
                 {
                     demandVisits++;
-                    if (rootIds.Contains(next.Method) || effects.IsSettled(next.Method) || !liveBehavior.Add(next.Method))
+                    if (effects.IsTop(next.Method) || !liveBehavior.Add(next.Method))
                     {
                         continue;
                     }
@@ -125,7 +128,7 @@ namespace SetterChecker.Core
                 }
                 foreach (string method in affected)
                 {
-                    if (IsLive(method) || effects.IsSettled(method) || !behaviorCallers.TryGetValue(method, out var callers))
+                    if (IsLive(method) || effects.IsTop(method) || !behaviorCallers.TryGetValue(method, out var callers))
                     {
                         continue;
                     }
@@ -229,11 +232,12 @@ namespace SetterChecker.Core
 
             try
             {
-                while (unread.Count != 0 || ready.Count != 0 || registrationRequests.Count != 0 || deferred.Count != 0 || pausedRegistrations.Count != 0)
+                while (unread.Count != 0 || ready.Count != 0 || registrationRequests.Count != 0 || deferred.Count != 0
+                    || pausedRegistrations.Count != 0 || revisit.Count != 0)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     // 需求可能被后续调用重新激活；暂停不等于候选已经找全。
-                    if (unread.Count == 0 && ready.Count == 0 && deferred.Count == 0 && registrationRequests.Count == 0)
+                    if (unread.Count == 0 && ready.Count == 0 && deferred.Count == 0 && registrationRequests.Count == 0 && revisit.Count == 0)
                     {
                         int retained = 0;
                         for (int index = 0; index < pausedRegistrations.Count; index++)
@@ -273,7 +277,7 @@ namespace SetterChecker.Core
                         {
                             bodies.Add(body.MethodId, body);
                             sources.ReadBody(body);
-                            effects.ReadDirect(body, includeReturns: false);
+                            effects.ReadDirect(body);
                             Schedule(body.MethodId);
                         }
                     }
@@ -286,6 +290,16 @@ namespace SetterChecker.Core
                             deferred.Remove(method);
                             Schedule(method);
                             resumedMethods++;
+                            continue;
+                        }
+                        if (registrationRequests.Count == 0)
+                        {
+                            // 依赖变化引起的重算放到新函数与注册候选之后，一批变化只重算一次。
+                            while (revisit.TryDequeue(out string? again))
+                            {
+                                revisitSet.Remove(again);
+                                Schedule(again);
+                            }
                             continue;
                         }
                         var request = registrationRequests.Peek();
@@ -379,7 +393,7 @@ namespace SetterChecker.Core
                                     stopAfterTarget: valueNeeded || registration ? null : target =>
                                     {
                                         effects.Bind(new(current, call, new[] { target }));
-                                        return ValueTask.FromResult(effects.IsSettled(current));
+                                        return ValueTask.FromResult(effects.IsTop(current));
                                     }, registrationBinding: registration && !NeedsBehavior(current) && !valueNeeded,
                                     registrationTargets: registration ? targets : null).ConfigureAwait(false);
                                 resolvedCalls++;
@@ -416,8 +430,12 @@ namespace SetterChecker.Core
                         if (methods.ContainsKey(reader) && !bodies.ContainsKey(reader))
                         {
                             unread.Add(reader);
+                            Schedule(reader);
                         }
-                        Schedule(reader);
+                        else if (!queued.Contains(reader) && revisitSet.Add(reader))
+                        {
+                            revisit.Enqueue(reader);
+                        }
                     }
                     foreach (BehaviorMemberReference member in sources.TakeRegistrationMembers())
                     {
@@ -446,7 +464,7 @@ namespace SetterChecker.Core
             }
 
             sources.CompleteReturns();
-            foreach (MethodBehavior body in bodies.Values.Where(body => !effects.IsSettled(body.MethodId)))
+            foreach (MethodBehavior body in bodies.Values.Where(body => !effects.IsTop(body.MethodId)))
             {
                 effects.ReadDirect(body, sources.ReadReflectionWrites(body.MethodId));
             }
@@ -456,7 +474,7 @@ namespace SetterChecker.Core
                 calls.Values.OrderBy(call => call.CallerMethodId, StringComparer.Ordinal)
                     .ThenBy(call => call.Call.Point.BlockId).ThenBy(call => call.Call.Point.Order).ToArray(), sources, watch.Elapsed)
             {
-                Effects = effects,
+                Top = effects,
                 Failure = interrupted,
                 PendingCalls = failures.Values.Where(call => NeedsBehavior(call.CallerMethodId) || sources.NeedsValues(call.CallerMethodId))
                     .OrderBy(call => call.CallerMethodId, StringComparer.Ordinal).ThenBy(call => call.Call.Point.BlockId).ToArray(),
@@ -474,7 +492,7 @@ namespace SetterChecker.Core
             sources.Timing.Count("调用关系实际更新次数", changedCalls);
             sources.Timing.Count("等待结束后函数入队次数", resumedMethods);
             progress?.Invoke($"函数体读取 {bodies.Count} 次；固定调用 {calls.Count} 个；未确定目标 {result.PendingCalls.Count} 个。");
-            if (requireCompleteCalls && result.PendingCalls.FirstOrDefault(call => !effects.IsSettled(call.CallerMethodId)) is PendingCall failure)
+            if (requireCompleteCalls && result.PendingCalls.FirstOrDefault(call => !effects.IsTop(call.CallerMethodId)) is PendingCall failure)
             {
                 throw new AnalysisException(failure.Failure!);
             }
@@ -554,7 +572,8 @@ namespace SetterChecker.Core
                     sources.SetResult(call, caller.Id, new[] { Result(BehaviorValueKind.Computation, runtimeRule.Operation.ToString()) });
                 }
                 else if (runtimeRule.Operation == RuntimeOperation.ReadCollection
-                    && method.Name is "get_Item" or "get_Keys" or "get_Values" or "get_Default")
+                    && method.Name is "get_Item" or "get_Keys" or "get_Values" or "get_Default"
+                    || runtimeRule.Operation == RuntimeOperation.WriteCollection && call.ResultValueId is int)
                 {
                     ValueOrigin result = Result(BehaviorValueKind.FieldRead, runtimeRule.Operation.ToString(),
                         catalog.ReadMethodReturnType(method));
@@ -567,6 +586,11 @@ namespace SetterChecker.Core
                 else if (call.ResultValueId is int)
                 {
                     sources.SetResult(call, caller.Id, new[] { Result(BehaviorValueKind.Computation, runtimeRule.Operation.ToString()) });
+                }
+                if (runtimeRule.Operation == RuntimeOperation.ConvertValue && method.Name is "Format" or "Concat" or "Join"
+                    && catalog.TypesById[method.TypeId].FullName == "System.String")
+                {
+                    await ReadFormattedArguments().ConfigureAwait(false);
                 }
             }
             else if (await ReadIterator().ConfigureAwait(false) || await ReadReflection().ConfigureAwait(false))
@@ -642,7 +666,24 @@ namespace SetterChecker.Core
             }
             else if (call.Kind == BehaviorCallKind.Virtual && (method.IsVirtual || method.IsAbstract))
             {
-                foreach (ResolvedMethodDefinition target in VirtualTargets(declaration, receiver))
+                IEnumerable<ResolvedMethodDefinition> candidates = VirtualTargets(declaration, receiver);
+                // constrained. 前缀已给出实际值类型：只取声明在该类型上的实现，找不到时保留全部候选。
+                if (call.ConstrainedReceiverType is BehaviorTypeReference constrainedType && !constrainedType.Id.StartsWith('!'))
+                {
+                    TypeEntry? exact = null;
+                    try
+                    {
+                        exact = catalog.ResolveTypeDefinition(constrainedType);
+                    }
+                    catch (AnalysisException)
+                    {
+                    }
+                    ResolvedMethodDefinition[] all = candidates.ToArray();
+                    ResolvedMethodDefinition[] own = exact == null ? Array.Empty<ResolvedMethodDefinition>()
+                        : all.Where(candidate => candidate.Method.TypeId == exact.Id).ToArray();
+                    candidates = own.Length != 0 ? own : all;
+                }
+                foreach (ResolvedMethodDefinition target in candidates)
                 {
                     if (await AddTarget(Bind(target, receiver, arguments)).ConfigureAwait(false))
                     {
@@ -670,6 +711,69 @@ namespace SetterChecker.Core
                 ValuesOnly = valuesOnly,
                 RuntimeRule = runtimeRule,
             };
+
+            // string 格式化会调用对象实参的 ToString 或 IFormattable.ToString；只连接业务代码中的实现，标准库实现按纯转换处理。
+            async ValueTask ReadFormattedArguments()
+            {
+                TypeEntry objectType = catalog.ReadPrimitiveType("System.Object");
+                List<ResolvedMethodDefinition> declarations = new();
+                foreach (TypeEntry? type in new TypeEntry?[] { objectType, catalog.ReadNamedRuntimeType("System.IFormattable", caller) })
+                {
+                    MethodEntry? entry = type == null ? null : catalog.GetMethods(type).FirstOrDefault(candidate => candidate.Name == "ToString" && !candidate.IsStatic
+                        && (type == objectType ? candidate.Parameters.Count == 0 : candidate.Parameters.Count == 2));
+                    if (entry != null)
+                    {
+                        declarations.Add(catalog.ResolveMethodDefinition(catalog.ReadMethodReference(entry), true));
+                    }
+                }
+                for (int index = 0; index < method.Parameters.Count && index < arguments.Count; index++)
+                {
+                    string parameterType = method.Parameters[index].TypeId;
+                    IReadOnlyList<IReadOnlyList<BehaviorValueReference>> values;
+                    if (parameterType == "System.Object")
+                    {
+                        values = new[] { arguments[index] };
+                    }
+                    else if (parameterType == "System.Object[]" && arguments[index].Count == 1)
+                    {
+                        try
+                        {
+                            values = sources.ReadArrayArguments(arguments[index][0], sources.ReadArrayLength(arguments[index][0]));
+                        }
+                        catch (AnalysisException)
+                        {
+                            failure = "格式化参数数组来源尚未确定";
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        continue;
+                    }
+                    foreach (IReadOnlyList<BehaviorValueReference> value in values)
+                    {
+                        foreach (ResolvedMethodDefinition declaration2 in declarations)
+                        {
+                            foreach (ResolvedMethodDefinition implementation in VirtualTargets(declaration2, value))
+                            {
+                                if (implementation.Method.AssemblyPath == objectType.AssemblyPath || RuntimeOperations.Find(catalog, implementation.Method) != null)
+                                {
+                                    continue;
+                                }
+                                IReadOnlyList<IReadOnlyList<BehaviorValueReference>> parameters = implementation.Method.Parameters
+                                    .Select(_ => (IReadOnlyList<BehaviorValueReference>)Array.Empty<BehaviorValueReference>()).ToArray();
+                                sources.Include(implementation.Method);
+                                if (await AddTarget(new ResolvedCallTarget(implementation.Method.Id,
+                                    catalog.ReadMethodReference(implementation.Method, implementation.DeclaringTypeArguments, implementation.MethodTypeArguments),
+                                    value, parameters, implementation.DeclaringTypeArguments.Select(type => type.Text).ToArray())).ConfigureAwait(false))
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // 枚举对象保存延迟函数及原实参；只有 MoveNext 执行该函数体。
             async ValueTask<bool> ReadIterator()
@@ -758,25 +862,6 @@ namespace SetterChecker.Core
                     return false;
                 }
                 string typeName = owner.FullName;
-                if (typeName.StartsWith("System.Collections.Generic.List<", StringComparison.Ordinal) && method.Name == "Add"
-                    && method.Parameters.Count == 1 && !method.Parameters.Any(parameter => parameter.RefKind != RefKind.None))
-                {
-                    ValueOrigin[] receiverOrigins = receiver.Count == 0
-                        ? Array.Empty<ValueOrigin>()
-                        : sources.ReadLocalOrigins(receiver[0]).ToArray();
-                    if (receiverOrigins.Length == 0)
-                    {
-                        return false;
-                    }
-                    if (receiverOrigins.All(origin => origin.Value.Kind is BehaviorValueKind.NewObject
-                        or BehaviorValueKind.NewArray or BehaviorValueKind.Constant or BehaviorValueKind.Local))
-                    {
-                        return true;
-                    }
-                    writes.Add(new(BehaviorWriteKind.Indirect, call.ReceiverValueId, null,
-                        Array.Empty<int>(), call.Arguments[0].ValueId, call.Point));
-                    return true;
-                }
                 if (sources.UseReflectionBaseline && (typeName == "System.Type"
                     && method.Name is "GetField" or "GetFields" or "GetProperty" or "GetProperties" or "GetMethod" or "GetMethods"
                         or "GetConstructor" or "GetConstructors" or "GetMember" or "GetMembers" or "MakeGenericType" or "get_BaseType"
@@ -1199,7 +1284,12 @@ namespace SetterChecker.Core
                 if (typeName is "System.Reflection.MethodBase" or "System.Reflection.MethodInfo" or "System.Reflection.ConstructorInfo"
                     && method.Name == "Invoke")
                 {
-                    foreach (ValueOrigin origin in sources.GetOrigins(receiver.Single()))
+                    IReadOnlyList<ValueOrigin> invoked = sources.GetOrigins(receiver.Single());
+                    if (invoked.Count == 0)
+                    {
+                        failure = "反射调用目标尚未确定";
+                    }
+                    foreach (ValueOrigin origin in invoked)
                     {
                         if (IsNull(origin))
                         {
@@ -1231,7 +1321,12 @@ namespace SetterChecker.Core
                 if (typeName == "System.Reflection.FieldInfo" && method.Name is "SetValue" or "GetValue")
                 {
                     List<ValueOrigin> read = new();
-                    foreach (ValueOrigin origin in sources.GetOrigins(receiver.Single()))
+                    IReadOnlyList<ValueOrigin> fields = sources.GetOrigins(receiver.Single());
+                    if (fields.Count == 0)
+                    {
+                        failure = "反射字段尚未确定";
+                    }
+                    foreach (ValueOrigin origin in fields)
                     {
                         if (IsNull(origin))
                         {
@@ -1269,7 +1364,12 @@ namespace SetterChecker.Core
                 }
                 if (typeName == "System.Reflection.PropertyInfo" && method.Name is "GetValue" or "SetValue")
                 {
-                    foreach (ValueOrigin origin in sources.GetOrigins(receiver.Single()))
+                    IReadOnlyList<ValueOrigin> properties = sources.GetOrigins(receiver.Single());
+                    if (properties.Count == 0)
+                    {
+                        failure = "反射属性尚未确定";
+                    }
+                    foreach (ValueOrigin origin in properties)
                     {
                         if (IsNull(origin))
                         {
@@ -2101,7 +2201,7 @@ namespace SetterChecker.Core
                 }
             }
             IPropertySymbol? property = method.SourceSymbol?.AssociatedSymbol as IPropertySymbol;
-            string name = property?.Name ?? (method.Kind == MethodKind.Constructor ? ".ctor:" + method.SourceSymbol!.ContainingType.Name : method.Name);
+            string name = property?.Name ?? (method.Kind == MethodKind.Constructor ? ".ctor:" + ReadConstructorTypeName(method) : method.Name);
             string identity = property == null ? method.Id : MethodCatalog.SourceNamedTypeId(property.ContainingType);
             foreach (var location in ReadLocations(name, property == null).Read(identity))
             {
@@ -2116,6 +2216,19 @@ namespace SetterChecker.Core
                     yield return (owner, method);
                 }
             }
+        }
+
+        // 构造位置按语法类型名初筛；DLL 构造函数没有源码符号时取目录中的简单类型名。
+        private string ReadConstructorTypeName(MethodEntry method)
+        {
+            if (method.SourceSymbol != null)
+            {
+                return method.SourceSymbol.ContainingType.Name;
+            }
+            string name = catalog.TypesById[method.TypeId].FullName;
+            int generic = name.IndexOfAny(new[] { '<', '`' });
+            name = generic < 0 ? name : name[..generic];
+            return name[(Math.Max(name.LastIndexOf('.'), name.LastIndexOf('+')) + 1)..];
         }
 
         // 同名位置只绑定并分类一次，查询仍按需推进，不预先读取外围函数体。
@@ -2769,6 +2882,10 @@ namespace SetterChecker.Core
         // 字段以所属程序集类型及成员身份区分，泛型实参另在绑定处核对。
         internal static string MemberKey(BehaviorMemberReference member) => member.DeclaringTypeDefinitionId + "::" + member.Name;
 
+        // 找到产生某个调用结果（含 out 结果）的调用位置。
+        internal bool TryReadValueCall(BehaviorValueReference value, out BehaviorCall? call)
+            => this.m_valueCalls.TryGetValue(Normalize(value), out call);
+
         // 反射写入沿用普通写入判断。
         internal IEnumerable<BehaviorWrite> ReadReflectionWrites(string method) => this.m_callsByMethod.TryGetValue(method, out var calls)
             ? calls.Values.SelectMany(call => call.Writes) : Enumerable.Empty<BehaviorWrite>();
@@ -3220,7 +3337,7 @@ namespace SetterChecker.Core
         }
 
         // 写入判断只需要函数内对象身份，不为普通参数枚举所有调用者。
-        internal IEnumerable<ValueOrigin> ReadLocalOrigins(BehaviorValueReference reference, string? readerMethod = null)
+        internal IEnumerable<ValueOrigin> ReadLocalOrigins(BehaviorValueReference reference, string? readerMethod = null, bool observe = true)
         {
             Queue<(BehaviorValueReference Reference, BehaviorTypeReference? Cast)> pending = new();
             HashSet<(BehaviorValueReference Reference, BehaviorTypeReference? Cast)> visited = new();
@@ -3232,10 +3349,13 @@ namespace SetterChecker.Core
                     continue;
                 }
                 this.OriginReadCount++;
-                Observe(new("body", item.Reference.MethodId), readerMethod ?? reference.MethodId);
+                if (observe)
+                {
+                    Observe(new("body", item.Reference.MethodId), readerMethod ?? reference.MethodId);
+                }
                 IEnumerable<ValueOrigin> origins = this.m_results.TryGetValue(item.Reference, out var result) ? result
                     : new[] { new ValueOrigin(item.Reference, this.m_bodies[item.Reference.MethodId].Values[item.Reference.ValueId]) };
-                if (this.m_valueCalls.TryGetValue(item.Reference, out BehaviorCall? call))
+                if (observe && this.m_valueCalls.TryGetValue(item.Reference, out BehaviorCall? call))
                 {
                     Observe(CallKey(item.Reference.MethodId, call.Point), readerMethod ?? reference.MethodId);
                 }
@@ -3274,6 +3394,10 @@ namespace SetterChecker.Core
         // 类型已明确的形参可直接用于接口范围查询。
         internal ValueOrigin? ReadFixedReceiver(BehaviorValueReference reference)
         {
+            if (reference.ValueId < 0)
+            {
+                return null;
+            }
             BehaviorValue value = this.m_bodies[reference.MethodId].Values[reference.ValueId];
             return value.Kind is BehaviorValueKind.CurrentInstance or BehaviorValueKind.Parameter && value.Type != null
                 && !value.Type.Id.Contains('!') ? new(Normalize(reference), value) : null;
@@ -3785,7 +3909,7 @@ namespace SetterChecker.Core
     public sealed record CallTargetResolutionResult(IReadOnlyList<MethodEntry> Methods, BehaviorReadResult Behaviors,
         IReadOnlyList<ResolvedCall> Calls, ValueSourceIndex ValueSources, TimeSpan Elapsed)
     {
-        internal EffectAnalyzer.FunctionEffects Effects { get; init; } = null!;
+        internal EffectAnalyzer.TopTracker Top { get; init; } = null!;
         /// <summary>整轮连接中断的原因；已有 Setter 证据保留，其余行为不能据此下结论。</summary>
         public string? Failure { get; init; }
         /// <summary>尚未闭合的固定调用位置。</summary>

@@ -264,7 +264,6 @@ namespace SetterChecker.Core
                         new[] { block.FallThroughSuccessor, block.ConditionalSuccessor }.OfType<ControlFlowBranch>()
                             .Select(edge => new BehaviorFlowEdge(edge.Destination?.Ordinal, edge.Semantics,
                                 edge.FinallyRegions.Select(region => region.FirstBlockOrdinal).ToArray())).ToArray())).ToArray();
-                MarkLazyWrites(syntax);
                 return new MethodBehavior(this.m_method.Id, MethodBodyKind.Executable, this.m_values, this.m_assignments,
                     this.m_writes, this.m_calls, this.m_returns, blocks)
                 {
@@ -274,104 +273,122 @@ namespace SetterChecker.Core
                 };
             }
 
-            // 仅记录编辑器宏中可能隐藏真机分支的行号，不改变本轮行为判断。
+            // 只记录因 UNITY_EDITOR 条件编译而未启用的分支行号，不改变本轮行为判断。
             private static IReadOnlyList<int> ReadHiddenPlayerCodeLines(SyntaxNode? syntax)
             {
                 if (syntax == null)
                 {
                     return Array.Empty<int>();
                 }
-                return syntax.DescendantTrivia(descendIntoTrivia: true)
-                    .Where(trivia => trivia.HasStructure && trivia.GetStructure() is DirectiveTriviaSyntax directive
-                        && directive.ToString().Contains("UNITY_EDITOR", StringComparison.Ordinal))
-                    .Select(trivia => trivia.GetLocation().GetLineSpan().StartLinePosition.Line + 1)
-                    .Distinct().Order().ToArray();
-            }
-
-            // 只标记用户确认的字段懒初始化写入，不把普通字段赋值误当成缓存初始化。
-            private void MarkLazyWrites(SyntaxNode? syntax)
-            {
-                if (syntax == null || this.m_writes.Count == 0)
+                List<int> lines = new();
+                foreach (SyntaxTrivia trivia in syntax.DescendantTrivia(descendIntoTrivia: true))
                 {
-                    return;
-                }
-                HashSet<string> fields = new(StringComparer.Ordinal);
-                foreach (AssignmentExpressionSyntax assignment in syntax.DescendantNodes().OfType<AssignmentExpressionSyntax>())
-                {
-                    ExpressionSyntax? value = assignment.Right;
-                    bool directCreation = value is ObjectCreationExpressionSyntax or ArrayCreationExpressionSyntax
-                        || value is ParenthesizedExpressionSyntax { Expression: AssignmentExpressionSyntax nested }
-                            && nested.Right is ObjectCreationExpressionSyntax or ArrayCreationExpressionSyntax;
-                    if (assignment.IsKind(SyntaxKind.CoalesceAssignmentExpression) && directCreation
-                        || assignment.IsKind(SyntaxKind.SimpleAssignmentExpression) && directCreation
-                            && assignment.Parent?.Parent is IfStatementSyntax)
-                    {
-                        string? name = GetFieldName(assignment.Left);
-                        if (name != null)
-                        {
-                            fields.Add(name);
-                        }
-                    }
-                }
-                foreach (IfStatementSyntax branch in syntax.DescendantNodes().OfType<IfStatementSyntax>())
-                {
-                    if (branch.Else != null || !IsNullCheck(branch.Condition))
+                    if (!trivia.HasStructure || trivia.GetStructure() is not BranchingDirectiveTriviaSyntax directive || directive.BranchTaken)
                     {
                         continue;
                     }
-                    IEnumerable<StatementSyntax> statements = branch.Statement is BlockSyntax block
-                        ? block.Statements
-                        : new[] { branch.Statement };
-                    AssignmentExpressionSyntax[] assignments = statements.SelectMany(statement => statement.DescendantNodesAndSelf())
-                        .OfType<AssignmentExpressionSyntax>().Where(item => item.IsKind(SyntaxKind.SimpleAssignmentExpression)
-                            && item.Right is ObjectCreationExpressionSyntax or ArrayCreationExpressionSyntax).ToArray();
-                    AssignmentExpressionSyntax? assignment = assignments.Length == 1 ? assignments[0] : null;
-                    string? name = assignment == null ? null : GetFieldName(assignment.Left);
-                    if (name != null && statements.Count() == 1)
+                    IfDirectiveTriviaSyntax? head = directive as IfDirectiveTriviaSyntax
+                        ?? directive.GetRelatedDirectives().OfType<IfDirectiveTriviaSyntax>().FirstOrDefault();
+                    bool editorChain = head != null && directive.GetRelatedDirectives().Prepend(head)
+                        .OfType<ConditionalDirectiveTriviaSyntax>()
+                        .Any(item => item.Condition.ToString().Contains("UNITY_EDITOR", StringComparison.Ordinal));
+                    if (editorChain)
                     {
-                        fields.Add(name);
+                        lines.Add(trivia.GetLocation().GetLineSpan().StartLinePosition.Line + 1);
                     }
                 }
-                if (fields.Count == 0)
-                {
-                    return;
-                }
-                for (int index = 0; index < this.m_writes.Count; index++)
-                {
-                    BehaviorWrite write = this.m_writes[index];
-                    if (write.Member?.Name is string name && fields.Contains(name))
-                    {
-                        this.m_writes[index] = write with { IsLazyInitialization = true };
-                    }
-                }
+                return lines.Distinct().Order().ToArray();
             }
 
-            // 读取简单字段名，other.F 不属于允许的 this/静态字段懒初始化。
-            private static string? GetFieldName(ExpressionSyntax expression)
+            // R2：只认 F ??= new、F ?? (F = new)、if (F == null) F = new 三种写法中的这一次写入，F 为静态或 this 字段。
+            private bool IsLazyInitialization(IFieldReferenceOperation field)
             {
-                return expression switch
+                if (field.Syntax is not ExpressionSyntax left || !IsOwnField(left)
+                    || left.Parent is not AssignmentExpressionSyntax assignment || assignment.Left != left
+                    || assignment.Right is not (ObjectCreationExpressionSyntax or ImplicitObjectCreationExpressionSyntax
+                        or ArrayCreationExpressionSyntax or ImplicitArrayCreationExpressionSyntax))
                 {
-                    IdentifierNameSyntax identifier => identifier.Identifier.ValueText,
-                    MemberAccessExpressionSyntax member when member.Expression is ThisExpressionSyntax => member.Name.Identifier.ValueText,
-                    _ => null,
-                };
-            }
-
-            // 判断 F == null、null == F 和 F is null 三种空值条件。
-            private static bool IsNullCheck(ExpressionSyntax condition)
-            {
-                if (condition is IsPatternExpressionSyntax { Pattern: ConstantPatternSyntax { Expression: LiteralExpressionSyntax literal } }
-                    && literal.IsKind(SyntaxKind.NullLiteralExpression))
+                    return false;
+                }
+                if (assignment.IsKind(SyntaxKind.CoalesceAssignmentExpression))
                 {
                     return true;
                 }
+                if (!assignment.IsKind(SyntaxKind.SimpleAssignmentExpression))
+                {
+                    return false;
+                }
+                if (assignment.Parent is ParenthesizedExpressionSyntax parenthesized
+                    && parenthesized.Parent is BinaryExpressionSyntax coalesce && coalesce.IsKind(SyntaxKind.CoalesceExpression)
+                    && coalesce.Right == parenthesized)
+                {
+                    return IsSameField(coalesce.Left, field.Field);
+                }
+                if (assignment.Parent is not ExpressionStatementSyntax statement)
+                {
+                    return false;
+                }
+                SyntaxNode? holder = statement.Parent;
+                StatementSyntax body = statement;
+                if (holder is BlockSyntax block)
+                {
+                    if (block.Statements.Count(item => item is not EmptyStatementSyntax) != 1)
+                    {
+                        return false;
+                    }
+                    body = block;
+                    holder = block.Parent;
+                }
+                return holder is IfStatementSyntax branch && branch.Else == null && branch.Statement == body
+                    && IsNullCheckOf(branch.Condition, field.Field);
+            }
+
+            // 只接受裸字段名或 this.F，other.F 或 Type.F 不适用。
+            private static bool IsOwnField(ExpressionSyntax expression) => expression is IdentifierNameSyntax
+                || expression is MemberAccessExpressionSyntax { Expression: ThisExpressionSyntax };
+
+            // 判断表达式是否正是同一个静态或 this 字段。
+            private bool IsSameField(ExpressionSyntax expression, IFieldSymbol field)
+            {
+                while (expression is ParenthesizedExpressionSyntax parenthesized)
+                {
+                    expression = parenthesized.Expression;
+                }
+                if (!IsOwnField(expression))
+                {
+                    return false;
+                }
+                ISymbol? symbol = this.m_catalog.ReadSourceModel(this.m_compilation, expression.SyntaxTree).GetSymbolInfo(expression).Symbol;
+                return SymbolEqualityComparer.Default.Equals(symbol?.OriginalDefinition, field.OriginalDefinition);
+            }
+
+            // 判断条件是否为对同一字段的 == null、null ==、is null 或 ReferenceEquals(F, null)。
+            private bool IsNullCheckOf(ExpressionSyntax condition, IFieldSymbol field)
+            {
+                while (condition is ParenthesizedExpressionSyntax parenthesized)
+                {
+                    condition = parenthesized.Expression;
+                }
+                if (condition is IsPatternExpressionSyntax { Pattern: ConstantPatternSyntax { Expression: LiteralExpressionSyntax literal } } pattern
+                    && literal.IsKind(SyntaxKind.NullLiteralExpression))
+                {
+                    return IsSameField(pattern.Expression, field);
+                }
                 if (condition is BinaryExpressionSyntax binary && binary.IsKind(SyntaxKind.EqualsExpression))
                 {
-                    return binary.Left.IsKind(SyntaxKind.NullLiteralExpression) || binary.Right.IsKind(SyntaxKind.NullLiteralExpression);
+                    return binary.Right.IsKind(SyntaxKind.NullLiteralExpression) && IsSameField(binary.Left, field)
+                        || binary.Left.IsKind(SyntaxKind.NullLiteralExpression) && IsSameField(binary.Right, field);
                 }
-                return condition is InvocationExpressionSyntax invocation
-                    && invocation.Expression.ToString().EndsWith("ReferenceEquals", StringComparison.Ordinal)
-                    && invocation.ArgumentList.Arguments.Any(argument => argument.Expression.IsKind(SyntaxKind.NullLiteralExpression));
+                if (condition is InvocationExpressionSyntax invocation && invocation.ArgumentList.Arguments.Count == 2
+                    && invocation.Expression is IdentifierNameSyntax { Identifier.ValueText: "ReferenceEquals" }
+                        or MemberAccessExpressionSyntax { Name.Identifier.ValueText: "ReferenceEquals" })
+                {
+                    ExpressionSyntax first = invocation.ArgumentList.Arguments[0].Expression;
+                    ExpressionSyntax second = invocation.ArgumentList.Arguments[1].Expression;
+                    return second.IsKind(SyntaxKind.NullLiteralExpression) && IsSameField(first, field)
+                        || first.IsKind(SyntaxKind.NullLiteralExpression) && IsSameField(second, field);
+                }
+                return false;
             }
 
             // 普通直线语句直接读取已绑定操作；有分支、闭包或隐式执行关系时仍使用原控制流。
@@ -913,7 +930,10 @@ namespace SetterChecker.Core
                         break;
                     case IFieldReferenceOperation field:
                         this.m_writes.Add(new BehaviorWrite(BehaviorWriteKind.Field, field.Instance == null ? null : ReadOperation(field.Instance),
-                            this.m_catalog.ReadSourceMemberReference(field.Field, this.m_method.AssemblyPath!), Array.Empty<int>(), value, Point()));
+                            this.m_catalog.ReadSourceMemberReference(field.Field, this.m_method.AssemblyPath!), Array.Empty<int>(), value, Point())
+                        {
+                            IsLazyInitialization = IsLazyInitialization(field),
+                        });
                         break;
                     case IPropertyReferenceOperation property:
                         ReadAccessorCall(property.Property.SetMethod ?? throw new AnalysisException($"属性没有写入函数：{property.Property}"),
@@ -924,6 +944,10 @@ namespace SetterChecker.Core
                             array.Indices.Select(ReadOperation).ToArray(), value, Point()));
                         break;
                     case IDiscardOperation:
+                        break;
+                    case IInstanceReferenceOperation:
+                        // 结构体方法中的 this = ... 整体改写当前对象。
+                        this.m_writes.Add(new BehaviorWrite(BehaviorWriteKind.Indirect, CurrentInstance(), null, Array.Empty<int>(), value, Point()));
                         break;
                     default:
                         throw new AnalysisException($"源码写入目标尚未支持：{target.Kind}；{target.Syntax}");

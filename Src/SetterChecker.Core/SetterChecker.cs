@@ -224,8 +224,8 @@ namespace SetterChecker.Core
         /// <summary>真实分析与日志分析累计加入的不同修改说明数。</summary>
         public int SummaryUpdates { get; init; }
 
-        /// <summary>所有根函数及其标签审计均已完成。</summary>
-        public bool Complete => this.Failure == null && this.Annotations.Complete && this.Calls?.Behaviors.Methods.All(body => body.Failure == null) == true;
+        /// <summary>所有根函数的真实行为均已证明；影响结论的读取失败和待定调用都会体现为根函数的失败。</summary>
+        public bool Complete => this.Failure == null && this.Calls != null && this.Annotations.Complete;
 
         /// <summary>日志决定可交付不等于真实行为已证明，人工基线单独计数。</summary>
         public bool LogDecisionsComplete => this.Failure == null && this.Annotations.Methods.Where(method => method.IsReportable)

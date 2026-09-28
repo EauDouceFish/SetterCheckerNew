@@ -262,7 +262,8 @@ namespace SetterChecker.Core
             }
             if (owner.StartsWith("System.Collections.Generic.List<", StringComparison.Ordinal))
             {
-                return name is "Add" or "AddRange" or "Insert" or "InsertRange" or "Remove" or "RemoveAt" or "RemoveRange" or "Clear" or "Reverse" or "set_Item"
+                // AddRange/InsertRange 会枚举传入序列，序列可能是业务迭代器，必须读取真实实现。
+                return name is "Add" or "Insert" or "Remove" or "RemoveAt" or "RemoveRange" or "Clear" or "Reverse" or "set_Item"
                     && (name is "Clear" or "Reverse" ? parameters.Length == 0 : parameters.Length <= 2);
             }
             if (owner.StartsWith("System.Collections.Generic.Dictionary<", StringComparison.Ordinal))

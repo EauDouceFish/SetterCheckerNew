@@ -543,7 +543,9 @@ namespace SetterChecker.Core.Tests
             AnalysisRun run = await new SetterChecker().AnalyzeAsync(new(project.AssemblyDefinitionPath, 4), deadline.Token);
             Assert.IsFalse(run.Complete);
             Assert.IsNull(run.Annotations.Methods.Single().Actual);
-            Assert.IsNull(run.Annotations.Methods.Single().Decision);
+            // 规则 R5：返回值来源本身不再使函数未证明；未知来自调用原生函数，按原生边界采用当前人工标签。
+            Assert.IsTrue(run.Annotations.Methods.Single().UsesManualBaseline);
+            Assert.AreEqual("ShouldTrack", run.Annotations.Methods.Single().Decision);
         }
 
         // 对应 Framework/WorldModule/Manager/Data/ConfigItem.cs 的加载、释放和字符串读取。
@@ -1405,7 +1407,8 @@ namespace SetterChecker.Core.Tests
                 }
                 """, external);
             var result = await project.AnalyzeAsync("KH.Calls", "Entry");
-            Assert.AreEqual(MethodEffectKind.Getter, result.Effects.Methods.Single().Kind);
+            // 规则 R1：Read 带可信 NLT 但确实写了静态数据，真实行为使 Entry 成为 Setter；类型比较本身仍不要求读取对象内容。
+            Assert.AreEqual(MethodEffectKind.Setter, result.Effects.Methods.Single().Kind);
             Assert.AreEqual(0, result.Effects.Failures.Count);
         }
 
@@ -1458,8 +1461,8 @@ namespace SetterChecker.Core.Tests
                 }
                 """, external);
             var result = await project.AnalyzeAsync("KH.Calls", "Entry");
-            Assert.AreEqual(MethodEffectKind.Setter, result.Effects.Methods.Single().Kind);
-            Assert.AreEqual(MethodEffectKind.Setter, result.Effects.Methods.Single().Kind);
+            // 规则 R5：创建对象并返回本身不算修改。
+            Assert.AreEqual(MethodEffectKind.Getter, result.Effects.Methods.Single().Kind);
         }
 
         // 对应代理返回类型再查找配置回调；可信缓存的修改不能遮住另一个合法返回目标。
@@ -1754,6 +1757,212 @@ namespace SetterChecker.Core.Tests
             }
         }
 
+        // V2 摘要规则：Entry 的真实行为必须与预期一致；源码与 DLL 两种来源各跑一次。
+        private static async Task AssertEntry(string body, MethodEffectKind expected, bool external = false)
+        {
+            using TestProject project = TestProject.Create("namespace KH\n{\n" + body + "\n}\n", external);
+            var result = await project.AnalyzeAsync("KH.Calls", "Entry");
+            Assert.AreEqual(expected, result.Effects.Methods.Single().Kind,
+                JsonSerializer.Serialize(result.Effects.Methods.Single().Evidence) + JsonSerializer.Serialize(result.Effects.Failures));
+        }
+
+        // T1：类构造函数只写新对象自身字段，调用方不修改已有状态。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public Task ClassConstructorOfNewObjectIsGetter(bool external) => AssertEntry("""
+            public class Item { private int m_id; private object m_owner; public Item(int id, object owner) { m_id = id; m_owner = owner; } }
+            public static class Calls { public static object Entry(object owner) { return new Item(3, owner); } }
+            """, MethodEffectKind.Getter, external);
+
+        // T2：构造函数写静态计数器（对应 Poolable），调用方为 Setter。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public Task ConstructorWritingStaticIsSetter(bool external) => AssertEntry("""
+            public class Item { private static int s_next; public readonly int Id; public Item() { Id = ++s_next; } }
+            public static class Calls { public static object Entry() { return new Item(); } }
+            """, MethodEffectKind.Setter, external);
+
+        // T3：结构体构造返回新值。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public Task StructConstructorReturnIsGetter(bool external) => AssertEntry("""
+            public struct Vec { public int X; public int Y; public Vec(int x, int y) { X = x; Y = y; } }
+            public static class Calls { public static Vec Entry(int a) { return new Vec(a, a + 1); } }
+            """, MethodEffectKind.Getter, external);
+
+        // T4/T5：out 实参是局部变量时不修改已有状态；是字段时为 Setter（对应 toCoordKey 与 TryGetValue(k, out m_state)）。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public Task OutParameterTargetDecidesEffect(bool external, bool field) => AssertEntry($$"""
+            public static class Calls
+            {
+                private static int s_a;
+                private static void Split(int value, out int a, out int b) { a = value / 2; b = value - a; }
+                public static int Entry(int value) { {{(field ? "Split(value, out s_a, out int b); return b;" : "Split(value, out int a, out int b); return a + b;")}} }
+            }
+            """, field ? MethodEffectKind.Setter : MethodEffectKind.Getter, external);
+
+        // T6：foreach 遍历字段列表只读取。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public Task ForeachOverFieldListIsGetter(bool external) => AssertEntry("""
+            public class Calls
+            {
+                private readonly System.Collections.Generic.List<Calls> m_list = new System.Collections.Generic.List<Calls>();
+                private int m_id;
+                public bool Entry(int id) { foreach (Calls item in m_list) { if (item.m_id == id) { return true; } } return false; }
+            }
+            """, MethodEffectKind.Getter, external);
+
+        // T7/T8：修改局部新建列表不算修改，修改字段列表为 Setter。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public Task CollectionReceiverDecidesEffect(bool field) => AssertEntry($$"""
+            public class Calls
+            {
+                private readonly System.Collections.Generic.List<int> m_list = new System.Collections.Generic.List<int>();
+                public int Entry()
+                {
+                    System.Collections.Generic.List<int> list = {{(field ? "m_list" : "new System.Collections.Generic.List<int>()")}};
+                    list.Add(1);
+                    list.RemoveAt(0);
+                    return list.Count;
+                }
+            }
+            """, field ? MethodEffectKind.Setter : MethodEffectKind.Getter);
+
+        // T9：经返回值取得的已有列表被修改。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public Task ReturnedFieldMutationIsSetter(bool external) => AssertEntry("""
+            public class Calls
+            {
+                private readonly System.Collections.Generic.List<int> m_list = new System.Collections.Generic.List<int>();
+                private System.Collections.Generic.List<int> GetList() { return m_list; }
+                public void Entry() { GetList().Clear(); }
+            }
+            """, MethodEffectKind.Setter, external);
+
+        // T10：新对象保存了已有列表的引用，经新对象修改必须追回原对象。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public Task AliasThroughNewObjectIsSetter(bool external) => AssertEntry("""
+            public class Wrapper { public readonly System.Collections.Generic.List<int> Items; public Wrapper(System.Collections.Generic.List<int> items) { Items = items; } }
+            public class Calls
+            {
+                private readonly System.Collections.Generic.List<int> m_list = new System.Collections.Generic.List<int>();
+                public void Entry() { new Wrapper(m_list).Items.Add(1); }
+            }
+            """, MethodEffectKind.Setter, external);
+
+        // T11：参数之间的链接关系必须保留：Link(fresh, m_b) 后经 fresh 修改 m_b。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public Task AliasThroughParameterLinkIsSetter(bool external) => AssertEntry("""
+            public class Node { public Node Next; public int X; }
+            public class Calls
+            {
+                private readonly Node m_b = new Node();
+                private static void Link(Node a, Node b) { a.Next = b; }
+                public void Entry() { Node fresh = new Node(); Link(fresh, m_b); fresh.Next.X = 1; }
+            }
+            """, MethodEffectKind.Setter, external);
+
+        // T12：R2 三种懒加载写法都不算修改。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow("if (s_instance == null) s_instance = new Calls(); return s_instance;")]
+        [DataRow("if (null == s_instance) { s_instance = new Calls(); } return s_instance;")]
+        [DataRow("return s_instance ??= new Calls();")]
+        [DataRow("return s_instance ?? (s_instance = new Calls());")]
+        public Task LazySingletonIsGetter(string body) => AssertEntry($$"""
+            public class Calls { private static Calls s_instance; public static Calls Entry() { {{body}} } }
+            """, MethodEffectKind.Getter);
+
+        // T13/T14：懒加载分支里还有其他写入，或写的是其他对象的字段，仍为 Setter。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow("if (s_list == null) { s_list = new System.Collections.Generic.List<int>(); s_count++; } return s_list;")]
+        [DataRow("if (s_list == null) s_list = new System.Collections.Generic.List<int>(); else s_count++; return s_list;")]
+        [DataRow("if (s_count > 0) s_list = new System.Collections.Generic.List<int>(); return s_list;")]
+        [DataRow("if (s_other.s_list2 == null) s_other.s_list2 = new System.Collections.Generic.List<int>(); return s_list;")]
+        public Task LazyInitBoundaryIsSetter(string body) => AssertEntry($$"""
+            public class Calls
+            {
+                private static System.Collections.Generic.List<int> s_list;
+                private static int s_count;
+                private static Calls s_other = new Calls();
+                private System.Collections.Generic.List<int> s_list2;
+                public static System.Collections.Generic.List<int> Entry() { {{body}} }
+            }
+            """, MethodEffectKind.Setter);
+
+        // T15：与诊断类型同名但程序集不同的类型仍按普通代码分析。
+        /// <summary></summary>
+        [TestMethod]
+        public Task DiagnosticsRequiresExactAssembly() => AssertEntry("""
+            public static class Debuger { private static int s_count; public static void Log(string text) { s_count++; } }
+            public static class Calls { public static void Entry() { Debuger.Log("x"); } }
+            """, MethodEffectKind.Setter);
+
+        // T23/T24：新建对象后注册到已有列表或写入参对象，均为 Setter（对应 DoCreatePlayerActor、CreatAI）。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public Task CreateWithSideEffectIsSetter(bool external, bool parameter) => AssertEntry($$"""
+            public class Actor { public int BtId; }
+            public class Calls
+            {
+                private readonly System.Collections.Generic.List<Actor> m_items = new System.Collections.Generic.List<Actor>();
+                public Actor Entry(Actor owner) { Actor created = new Actor(); {{(parameter ? "owner.BtId = 1;" : "m_items.Add(created);")}} return created; }
+            }
+            """, MethodEffectKind.Setter, external);
+
+        // T25：从对象池取出不是新对象，取出动作修改了池。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public Task PoolTakeIsSetter(bool external) => AssertEntry("""
+            public class Calls
+            {
+                private readonly System.Collections.Generic.List<object> m_pool = new System.Collections.Generic.List<object>();
+                public object Entry() { int last = m_pool.Count - 1; object item = m_pool[last]; m_pool.RemoveAt(last); return item; }
+            }
+            """, MethodEffectKind.Setter, external);
+
+        // T26：编号递增（对应 GetSid）为 Setter。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public Task IdAllocationIsSetter(bool external) => AssertEntry("""
+            public static class Calls { private static long s_next = 100000; public static long Entry() { return s_next++; } }
+            """, MethodEffectKind.Setter, external);
+
         // 对应可信 NLT 缓存函数；用同一写法核对裸标签、原因标签和类标签。
         /// <summary>豁免只隔断日志影响，不能抹掉真实 Setter。</summary>
         [TestMethod]
@@ -1786,7 +1995,8 @@ namespace SetterChecker.Core.Tests
             AnnotationMethod entry = run.Annotations.Methods.Single(method => method.Name == "Entry");
             AnnotationMethod cache = run.Annotations.Methods.Single(method => method.Name == "Read");
             Assert.AreEqual(MethodEffectKind.Setter, entry.Actual);
-            Assert.AreEqual("NoLogTrack", entry.Decision);
+            // 规则 R1：日志决定只看真实行为，可信 NLT 内部的写入照常使上层需要追踪。
+            Assert.AreEqual("ShouldTrack", entry.Decision);
             Assert.AreEqual(label == "class" ? "NLTClass" : "NoLogTrack", cache.Decision);
             Assert.AreEqual(label == "method", cache.MissingReason);
         }

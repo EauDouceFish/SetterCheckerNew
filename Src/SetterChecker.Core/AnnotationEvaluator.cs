@@ -133,8 +133,8 @@ namespace SetterChecker.Core
         /// <summary>说明本轮基线是否有效，不把失效配置静默当作已采用。</summary>
         public string? ManualBaselineStatus { get; init; }
 
-        /// <summary>行为、冲突与告警调用关系均已检查完毕。</summary>
-        public bool Complete => this.PendingCalls == 0 && this.Methods.All(method => method.Failure == null
+        /// <summary>每个函数的行为与冲突均已检查完毕；只影响已证明 Setter 的待定调用不阻塞。</summary>
+        public bool Complete => this.Methods.All(method => method.Failure == null
             || method.InformationalOnly && !method.SourceNoLogTrack);
     }
 
