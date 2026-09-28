@@ -1555,6 +1555,7 @@ namespace SetterChecker.Core
         private sealed class DispatchIndex
         {
             internal Dictionary<string, TargetCandidates> Ranges { get; } = new(StringComparer.Ordinal);
+            internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Starts), TargetCandidates> Traversals { get; } = new();
             internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Type, TemplateList Arguments), ResolvedMethodDefinition?> Implementations { get; } = new();
             internal Dictionary<(string Owner, TemplateList OwnerArguments, string Type, TemplateList Arguments), (MethodCatalogResult.InheritedTypeRelation[] Types, int IntroductionDepth)> Hierarchies { get; } = new();
         }
@@ -1735,7 +1736,6 @@ namespace SetterChecker.Core
             IReadOnlyList<ValueOrigin> receivers, AnalysisTiming timing, DispatchIndex dispatch)
         {
             TypeEntry owner = catalog.TypesById[declaration.Method.TypeId];
-            TemplateList ownerArguments = new(declaration.DeclaringTypeArguments);
             MethodIdentityTemplate targetSignature = catalog.ReadMethodSignature(declaration.Method)
                 .Instantiate(new(owner.Id), declaration.DeclaringTypeArguments);
             List<(TypeEntry Type, IReadOnlyList<TypeIdentityTemplate> Arguments, bool Expand)> bounds = new();
@@ -1751,9 +1751,33 @@ namespace SetterChecker.Core
                 bool expand = origin.Value.Kind != BehaviorValueKind.NewObject && !type.IsSealed && !type.IsValueType;
                 bounds.Add((type, catalog.ReadResolvedTypeArguments(origin.Value.Type), expand));
             }
+            if (!allKnown)
+            {
+                bounds = [(owner, declaration.DeclaringTypeArguments, true)];
+            }
+            // 不同接收范围解析出相同起点时（如 Object 与未知类型）共用同一遍历，结果序列不变。
+            var key = (declaration.Method.Id, new TemplateList(declaration.DeclaringTypeArguments), new TemplateList(declaration.MethodTypeArguments),
+                string.Concat(bounds.Select(bound => $"{bound.Type.Id.Length}:{bound.Type.Id}{bound.Arguments.Count}:"
+                    + string.Concat(bound.Arguments.Select(argument => $"{argument.Text.Length}:{argument.Text}")) + (bound.Expand ? '+' : '-'))));
+            if (!dispatch.Traversals.TryGetValue(key, out TargetCandidates? traversal))
+            {
+                traversal = new TargetCandidates(Traverse(catalog, declaration, owner, targetSignature, bounds, timing, dispatch));
+                dispatch.Traversals.Add(key, traversal);
+            }
+            foreach (ResolvedMethodDefinition implementation in traversal.Read())
+            {
+                yield return implementation;
+            }
+        }
+
+        // 从起点类型沿子类型展开，逐个匹配实现；同一构造声明与具体类型只匹配一次。
+        private static IEnumerable<ResolvedMethodDefinition> Traverse(MethodCatalogResult catalog, ResolvedMethodDefinition declaration, TypeEntry owner,
+            MethodIdentityTemplate targetSignature, List<(TypeEntry Type, IReadOnlyList<TypeIdentityTemplate> Arguments, bool Expand)> starts,
+            AnalysisTiming timing, DispatchIndex dispatch)
+        {
+            TemplateList ownerArguments = new(declaration.DeclaringTypeArguments);
             Queue<(TypeEntry Type, IReadOnlyList<TypeIdentityTemplate> Arguments, bool Expand, ResolvedMethodDefinition? Inherited)> pending = new(
-                (allKnown ? bounds.AsEnumerable() : new[] { (owner, declaration.DeclaringTypeArguments, true) })
-                    .Select(bound => (bound.Item1, bound.Item2, bound.Item3, (ResolvedMethodDefinition?)null)));
+                starts.Select(bound => (bound.Type, bound.Arguments, bound.Expand, (ResolvedMethodDefinition?)null)));
             HashSet<(string Type, TemplateList Arguments, bool Expand)> visited = new();
             HashSet<(string Method, TemplateList Arguments)> result = new();
             bool expandAny = pending.Any(candidate => candidate.Expand);
@@ -1772,7 +1796,6 @@ namespace SetterChecker.Core
                 {
                     continue;
                 }
-
                 ResolvedMethodDefinition? selected = null;
                 if (!owner.IsInterface && declaration.DeclaringTypeArguments.Count == 0
                     && candidate.Inherited is { DeclaringTypeArguments.Count: 0 } inherited
