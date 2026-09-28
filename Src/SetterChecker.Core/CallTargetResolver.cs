@@ -11,6 +11,7 @@ namespace SetterChecker.Core
     public sealed class CallTargetResolver
     {
         private static readonly ConditionalWeakTable<ResolvedCallTarget, TargetDescription> s_targetDescriptions = new();
+        private static readonly ConditionalWeakTable<ResolvedCallTarget, string> s_targetIdentities = new();
 
         // 每份函数体只读一次，固定关系只在新增事实时通知使用方。
         /// <summary>连接共享调用关系；Setter 立即向上通知，Getter 在关系闭合后确认。</summary>
@@ -699,7 +700,8 @@ namespace SetterChecker.Core
                 targets.Add(Bind(declaration, receiver, arguments));
             }
 
-            return new ResolvedCall(caller.Id, call, targets.DistinctBy(TargetIdentity).OrderBy(TargetIdentity, StringComparer.Ordinal).ToArray())
+            return new ResolvedCall(caller.Id, call, targets.Count <= 1 ? targets.ToArray()
+                : targets.DistinctBy(TargetIdentity).OrderBy(TargetIdentity, StringComparer.Ordinal).ToArray())
             {
                 IsMetadataBinding = !dynamicBinding && call.Kind is BehaviorCallKind.Direct or BehaviorCallKind.ObjectCreation,
                 CompletesWithoutTarget = completesWithoutTarget,
@@ -1714,19 +1716,18 @@ namespace SetterChecker.Core
         }
 
         // 同一函数绑定不同对象仍是不同合法候选，但不复制函数体或分析环境。
-        internal static string TargetIdentity(ResolvedCallTarget target) => ReadTargetDescription(target).Identity;
+        internal static string TargetIdentity(ResolvedCallTarget target) => s_targetIdentities.GetValue(target, static target => target.MethodId + "|"
+            + string.Join(',', target.DeclaringTypeArguments) + "|" + string.Join(',', target.MethodTypeArguments) + "|"
+            + string.Join(',', target.Receiver.Select(value => value.MethodOrdinal + ":" + value.ValueId)) + "|"
+            + string.Join(';', target.Arguments.Select(argument => string.Join(',', argument.Select(value => value.MethodOrdinal + ":" + value.ValueId))))
+            + "|" + target.DelegateDeclarationId);
 
-        internal sealed record TargetDescription(string Identity, IReadOnlyList<TypeIdentityTemplate> TypeArguments,
-            IReadOnlyList<TypeIdentityTemplate> MethodArguments);
+        internal sealed record TargetDescription(IReadOnlyList<TypeIdentityTemplate> TypeArguments, IReadOnlyList<TypeIdentityTemplate> MethodArguments);
 
-        // 一个固定目标的身份和泛型模板只整理一次，来源换算直接复用。
+        // 一个固定目标的泛型模板只整理一次，来源换算直接复用。
         internal static TargetDescription ReadTargetDescription(ResolvedCallTarget target)
         {
-            return s_targetDescriptions.GetValue(target, static target => new(target.MethodId + "|" + string.Join(',', target.DeclaringTypeArguments) + "|"
-                + string.Join(',', target.MethodTypeArguments) + "|"
-                + string.Join(',', target.Receiver.Select(value => value.MethodOrdinal + ":" + value.ValueId)) + "|"
-                + string.Join(';', target.Arguments.Select(argument => string.Join(',', argument.Select(value => value.MethodOrdinal + ":" + value.ValueId))))
-                + "|" + target.DelegateDeclarationId,
+            return s_targetDescriptions.GetValue(target, static target => new(
                 target.DeclaringTypeArguments.Select(argument => new TypeIdentityTemplate(argument)).ToArray(),
                 target.MethodTypeArguments.Select(argument => new TypeIdentityTemplate(argument)).ToArray()));
         }
@@ -1795,8 +1796,7 @@ namespace SetterChecker.Core
                 if (!visited.Add((type.Id, new(candidate.Arguments), candidate.Expand)))
                 {
                     continue;
-                }
-                ResolvedMethodDefinition? selected = null;
+                }                ResolvedMethodDefinition? selected = null;
                 if (!owner.IsInterface && declaration.DeclaringTypeArguments.Count == 0
                     && candidate.Inherited is { DeclaringTypeArguments.Count: 0 } inherited
                     && !catalog.HasDeclaredOverride(type, declaration.Method.Name))
