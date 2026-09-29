@@ -600,7 +600,7 @@ namespace SetterChecker.Core
                     }
                     // 值类型字段保存的是拷贝，不会成为被写对象的别名。
                     IReadOnlyList<EffectRoot> values = write.Member?.IsReferenceStorage == false
-                        ? Array.Empty<EffectRoot>() : ReadRoots(state, write.ValueId, false);
+                        ? Array.Empty<EffectRoot>() : ReadRoots(state, write.ValueId, false, Owner.Keep);
                     Store(state, targets, values);
                     if (write.Kind == BehaviorWriteKind.Indirect)
                     {
@@ -620,7 +620,7 @@ namespace SetterChecker.Core
                 }
                 foreach (BehaviorReturn returned in body.Returns.Where(item => item.ValueId.HasValue))
                 {
-                    state.Returns.AddRange(ReadRoots(state, returned.ValueId!.Value, false));
+                    state.Returns.AddRange(ReadRoots(state, returned.ValueId!.Value, false, Owner.Keep));
                 }
 
                 foreach (var (root, deep, cause) in state.Effects)
@@ -760,7 +760,7 @@ namespace SetterChecker.Core
                                 values.Add(EffectRoot.Static(Owner.Combat));
                                 continue;
                             }
-                            values.AddRange(ReadActualRoots(state, target, source, target.IsCallback && source > 0, Owner.Open));
+                            values.AddRange(ReadActualRoots(state, target, source, target.IsCallback && source > 0, Owner.Keep));
                         }
                         if (destination == ReturnSlot)
                         {
@@ -1118,7 +1118,7 @@ namespace SetterChecker.Core
                                     {
                                         copied.AddRange(source.MethodId != state.Method ? new[] { EffectRoot.ForeignOf(Owner.Open) }
                                             : source.ValueId < 0 ? new[] { EffectRoot.UnknownOf("浅复制来源尚未确定") }
-                                            : ReadRoots(state, source.ValueId, true));
+                                            : ReadRoots(state, source.ValueId, true, Owner.Keep));
                                     }
                                     state.AddFreshSources(origin.Reference.ValueId, copied);
                                 }
@@ -1133,6 +1133,10 @@ namespace SetterChecker.Core
                                     if (value.Member == null)
                                     {
                                         Add(EffectRoot.UnknownOf(value.Reference ?? "写入对象来源尚未确定"));
+                                    }
+                                    else if (walk.Owner == Owner.Keep)
+                                    {
+                                        Add(EffectRoot.Static(ClassifyField(this.m_catalog, value.Member) == Owner.Combat ? Owner.Combat : Owner.Open));
                                     }
                                     else if (ReadStaticOwner(this.m_catalog, walk.Owner, value.Member) == Owner.Combat)
                                     {
@@ -1161,7 +1165,11 @@ namespace SetterChecker.Core
                             case BehaviorValueKind.Address:
                                 if (value.Member != null && value.InputValueIds.Count == 0)
                                 {
-                                    if (Settle(ref walk) && ReadStaticOwner(this.m_catalog, walk.Owner, value.Member) == Owner.Combat)
+                                    if (walk.Owner == Owner.Keep)
+                                    {
+                                        Add(EffectRoot.Static(ClassifyField(this.m_catalog, value.Member) == Owner.Combat ? Owner.Combat : Owner.Open));
+                                    }
+                                    else if (Settle(ref walk) && ReadStaticOwner(this.m_catalog, walk.Owner, value.Member) == Owner.Combat)
                                     {
                                         Add(EffectRoot.Static(Owner.Combat));
                                     }
@@ -1299,7 +1307,7 @@ namespace SetterChecker.Core
                     }
                     if (value.StaticCombat && live)
                     {
-                        yield return (null, EffectRoot.Static(settled.Owner == Owner.Open ? Owner.Combat : settled.Owner));
+                        yield return (null, EffectRoot.Static(settled.Owner is Owner.Open or Owner.Keep ? Owner.Combat : settled.Owner));
                     }
                     if (value.Fresh)
                     {
@@ -1339,7 +1347,7 @@ namespace SetterChecker.Core
                                     {
                                         Reference = input,
                                         Deep = true,
-                                        Owner = kind == 2 && settled.Owner == Owner.Open ? Owner.Combat : settled.Owner,
+                                        Owner = kind == 2 && settled.Owner is Owner.Open or Owner.Keep ? Owner.Combat : settled.Owner,
                                     }, null);
                                 }
                             }
@@ -1414,7 +1422,8 @@ namespace SetterChecker.Core
         internal sealed record TopCause(string? Callee, int Position, string Detail);
 
         /// <summary>被写存储的归属：未定（交给调用方）、战斗状态、非战斗状态（V3 设计 2.2 节）。</summary>
-        private enum Owner : byte { Open, Combat, Other }
+        // Keep：读取存入值、返回值的来源时只记录来源、不判定归属，归属由之后对该对象的写入决定。
+        private enum Owner : byte { Open, Combat, Other, Keep }
 
         /// <summary>回溯中的一个值：是否已经过引用成员、当前归属，以及归属字段的容器是否仍待确认不是本函数新对象。</summary>
         private readonly record struct Walk(BehaviorValueReference Reference, bool Deep, Owner Owner, bool Pending);

@@ -2016,6 +2016,51 @@ namespace SetterChecker.Core.Tests
             }
             """, MethodEffectKind.Setter);
 
+        // T30：客户端实现经自己的字典取出 khengine 已有对象再修改其战斗字段，调用方为 Setter（对应 LTCTempProxy.TriggerProxyHelperExt_RemovePoolItemUseChannels）。
+        /// <summary></summary>
+        [TestMethod]
+        public async Task CombatWriteThroughClientLookupIsSetter()
+        {
+            using TestProject project = TestProject.Create("""
+                namespace KH
+                {
+                    public class Item
+                    {
+                        public System.Collections.Generic.List<int> channels = new System.Collections.Generic.List<int>();
+                        public long sid;
+                        public void Clear() { channels.Clear(); }
+                    }
+                    public class Pool
+                    {
+                        private System.Collections.Generic.List<Item> m_items = new System.Collections.Generic.List<Item>();
+                        public Item Get(long sid) { for (int i = 0; i < m_items.Count; i++) { if (m_items[i].sid == sid) { return m_items[i]; } } return null; }
+                    }
+                    public interface IProxy { void Remove(long pool, long item); }
+                    public static class Calls
+                    {
+                        private static IProxy ms_impl;
+                        public static void SetImpl(IProxy impl) { ms_impl = impl; }
+                        public static void Entry() { if (ms_impl != null) { ms_impl.Remove(1, 2); } }
+                    }
+                }
+                """, registrations: """
+                public class Helper : KH.IProxy
+                {
+                    private System.Collections.Generic.Dictionary<long, KH.Pool> m_pools = new System.Collections.Generic.Dictionary<long, KH.Pool>();
+                    private KH.Pool GetPool(long id) { KH.Pool pool; if (m_pools.TryGetValue(id, out pool)) { return pool; } return null; }
+                    public void Remove(long pool, long item)
+                    {
+                        KH.Pool found = GetPool(pool);
+                        if (found != null) { KH.Item target = found.Get(item); if (target != null) { target.Clear(); } }
+                    }
+                    public static void Init() { KH.Calls.SetImpl(new Helper()); }
+                }
+                """);
+            var result = await project.AnalyzeAsync("KH.Calls", "Entry");
+            Assert.AreEqual(MethodEffectKind.Setter, result.Effects.Methods.Single().Kind,
+                JsonSerializer.Serialize(result.Effects.Methods.Single().Evidence) + JsonSerializer.Serialize(result.Effects.Failures));
+        }
+
         // T29（R2 放宽）：懒加载分支中新建后只填充这个新对象不算修改；分支内把 F 改指向已有对象再修改，仍为 Setter。
         /// <summary></summary>
         [TestMethod]
