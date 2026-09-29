@@ -1709,7 +1709,8 @@ namespace SetterChecker.Core
                 HashSet<string> seen = new(StringComparer.Ordinal);
                 foreach (var (candidate, candidateArguments, symbol, contracts) in overrides)
                 {
-                    if (!contracts.Overlaps(visible) || assignable?.Contains(SourceTypeKey(candidate.SourceSymbol!)) == false)
+                    if (!contracts.Overlaps(visible)
+                        || assignable?.Contains(dispatch.SourceTypeKeys.GetOrAdd(candidate.Id, _ => SourceTypeKey(candidate.SourceSymbol!))) == false)
                     {
                         continue;
                     }
@@ -1873,6 +1874,7 @@ namespace SetterChecker.Core
             internal ConcurrentDictionary<string, IReadOnlyList<(IMethodSymbol, IReadOnlySet<string>)>> FrameworkOverrides { get; } = new(StringComparer.Ordinal);
             internal object MatchLock { get; } = new();
             internal IReadOnlyDictionary<string, HashSet<string>>? AssignableSources;
+            internal ConcurrentDictionary<string, string> SourceTypeKeys { get; } = new(StringComparer.Ordinal);
             internal Dictionary<string, TargetCandidates> Ranges { get; } = new(StringComparer.Ordinal);
             internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Starts), TargetCandidates> Traversals { get; } = new();
             internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Type, TemplateList Arguments), ResolvedMethodDefinition?> Implementations { get; } = new();
