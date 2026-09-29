@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Microsoft.CodeAnalysis;
@@ -31,7 +32,8 @@ namespace SetterChecker.Core
             EffectAnalyzer.TopTracker effects = new(catalog, sources);
             Dictionary<(string Method, BehaviorFlowPoint Point), ResolvedCall> calls = new();
             Dictionary<(string Method, BehaviorFlowPoint Point), PendingCall> failures = new();
-            DispatchIndex dispatch = new();
+            DispatchIndex dispatch = new() { Jobs = jobs };
+            Task prepareIndexes = Task.Run(catalog.PrepareDispatchIndexes, cancellationToken);
             RegistrationIndex registrations = new(material, catalog, sources.Timing, jobs, cancellationToken);
             Queue<string> ready = new();
             HashSet<string> queued = new(StringComparer.Ordinal);
@@ -344,6 +346,10 @@ namespace SetterChecker.Core
                     }
                     else
                     {
+                        if (!prepareIndexes.IsCompleted)
+                        {
+                            prepareIndexes.GetAwaiter().GetResult();
+                        }
                         processedMethods++;
                         queued.Remove(current);
                         if (!bodies.ContainsKey(current))
@@ -360,7 +366,6 @@ namespace SetterChecker.Core
                                 && targets.Contains(catalog.ResolveMethodDefinition(call.Target, true).Method.Id);
                             if (!NeedsBehavior(current) && !valueNeeded && !registration)
                             {
-                                // 暂停需求不等于删除调用；后续重新激活时仍需处理。
                                 sources.DeferCall(current, call.Point);
                                 skippedCalls++;
                                 continue;
@@ -454,6 +459,10 @@ namespace SetterChecker.Core
             }
             finally
             {
+                if (!prepareIndexes.IsCompleted)
+                {
+                    prepareIndexes.GetAwaiter().GetResult();
+                }
                 foreach (var request in registrationRequests)
                 {
                     request.Items.Dispose();
@@ -1455,10 +1464,14 @@ namespace SetterChecker.Core
                     string key = declared.Method.Id + "|" + string.Join(',', declared.DeclaringTypeArguments.Select(argument => argument.Text)) + "|"
                         + string.Join(',', declared.MethodTypeArguments.Select(argument => argument.Text)) + "|"
                         + receiverRange;
-                    if (!dispatch.Ranges.TryGetValue(key, out TargetCandidates? implementations))
+                    TargetCandidates implementations;
+                    lock (dispatch.MatchLock)
                     {
-                        implementations = new TargetCandidates(ReadImplementations(catalog, declared, receivers, sources.Timing, dispatch));
-                        dispatch.Ranges.Add(key, implementations);
+                        if (!dispatch.Ranges.TryGetValue(key, out implementations!))
+                        {
+                            implementations = new TargetCandidates(ReadImplementations(catalog, declared, receivers, sources.Timing, dispatch));
+                            dispatch.Ranges.Add(key, implementations);
+                        }
                     }
                     return sources.Timing.MeasureEnumeration(implementations.Read(), AnalysisTiming.Part.Dispatch);
                 }
@@ -1670,7 +1683,7 @@ namespace SetterChecker.Core
             }
         }
 
-        // 值的实际类型范围（新对象只取自身，其余含全部派生类型，以及它们的源码祖先）中，重写或实现外部库虚成员的源码函数。
+        // 值的实际类型范围中，重写或实现了库函数可见的外部库虚成员的源码函数。
         private static IReadOnlyList<ResolvedMethodDefinition> ReadFrameworkCallbacks(MethodCatalogResult catalog, ValueOrigin origin, IReadOnlySet<string> visible,
             DispatchIndex dispatch)
         {
@@ -1679,37 +1692,15 @@ namespace SetterChecker.Core
             TypeEntry definition = known ? catalog.ResolveTypeDefinition(type!) : catalog.ReadPrimitiveType("System.Object");
             IReadOnlyList<TypeIdentityTemplate> arguments = known ? catalog.ReadResolvedTypeArguments(type!) : Array.Empty<TypeIdentityTemplate>();
             bool exact = known && origin.Value.Kind == BehaviorValueKind.NewObject;
-            string key = (exact ? "exact:" : "derived:") + definition.Id + "|" + string.Join(',', arguments.Select(argument => argument.Text))
-                + "|" + string.Join(',', visible.Order(StringComparer.Ordinal));
-            if (dispatch.Callbacks.TryGetValue(key, out IReadOnlyList<ResolvedMethodDefinition>? cached))
+            string rangeKey = (exact ? "exact:" : "derived:") + definition.Id + "|" + string.Join(',', arguments.Select(argument => argument.Text));
+            string key = rangeKey + "|" + string.Join(',', visible.Order(StringComparer.Ordinal));
+            return dispatch.Callbacks.GetOrAdd(key, _ =>
             {
-                return cached;
-            }
-            List<(TypeEntry Type, IReadOnlyList<TypeIdentityTemplate> Arguments)> range = new() { (definition, arguments) };
-            range.AddRange(catalog.ReadInheritedTypes(definition, arguments, includeInterfaces: false)
-                .Select(relation => (relation.Definition, (IReadOnlyList<TypeIdentityTemplate>)relation.TypeArguments)));
-            if (!exact)
-            {
-                HashSet<string> visited = new(StringComparer.Ordinal) { definition.Id };
-                Queue<TypeEntry> pending = new(new[] { definition });
-                while (pending.TryDequeue(out TypeEntry? current))
-                {
-                    foreach (TypeEntry child in catalog.DerivedTypesByBaseId.GetValueOrDefault(current.Id, Array.Empty<TypeEntry>())
-                        .Concat(catalog.ImplementingTypesByInterfaceId.GetValueOrDefault(current.Id, Array.Empty<TypeEntry>())))
-                    {
-                        if (visited.Add(child.Id))
-                        {
-                            range.Add((child, Placeholders(child.GenericParameters.Count)));
-                            pending.Enqueue(child);
-                        }
-                    }
-                }
-            }
-            List<ResolvedMethodDefinition> callbacks = new();
-            HashSet<string> seen = new(StringComparer.Ordinal);
-            foreach (var (candidate, candidateArguments) in range.Where(item => item.Type.SourceSymbol != null && item.Type.IsCandidate))
-            {
-                foreach (var (symbol, contracts) in ReadFrameworkOverrides(catalog, candidate, dispatch))
+                IReadOnlyList<(TypeEntry, IReadOnlyList<TypeIdentityTemplate>, IMethodSymbol, IReadOnlySet<string>)> overrides =
+                    dispatch.CallbackRanges.GetOrAdd(rangeKey, _ => ReadRangeOverrides(catalog, definition, arguments, exact, dispatch));
+                List<ResolvedMethodDefinition> callbacks = new();
+                HashSet<string> seen = new(StringComparer.Ordinal);
+                foreach (var (candidate, candidateArguments, symbol, contracts) in overrides)
                 {
                     if (!contracts.Overlaps(visible))
                     {
@@ -1721,18 +1712,38 @@ namespace SetterChecker.Core
                         callbacks.Add(new ResolvedMethodDefinition(method, candidateArguments) { MethodTypeArguments = Placeholders(method.GenericArity) });
                     }
                 }
-            }
-            dispatch.Callbacks.Add(key, callbacks);
-            return callbacks;
+                return callbacks;
+            });
         }
 
-        // 源码类型中重写外部库虚函数或实现外部库接口成员的函数，每个类型只计算一次。
-        private static IReadOnlyList<(IMethodSymbol Member, IReadOnlySet<string> Contracts)> ReadFrameworkOverrides(MethodCatalogResult catalog, TypeEntry type, DispatchIndex dispatch)
+        // 实际类型范围（新对象只取自身，其余含全部派生类型，以及它们的源码祖先）内按原顺序列出的框架重写；与可见类型无关，同一范围只计算一次，各类型的重写并行读取。
+        private static IReadOnlyList<(TypeEntry Type, IReadOnlyList<TypeIdentityTemplate> Arguments, IMethodSymbol Member, IReadOnlySet<string> Contracts)> ReadRangeOverrides(
+            MethodCatalogResult catalog, TypeEntry definition, IReadOnlyList<TypeIdentityTemplate> arguments, bool exact, DispatchIndex dispatch)
         {
-            if (dispatch.FrameworkOverrides.TryGetValue(type.Id, out IReadOnlyList<(IMethodSymbol, IReadOnlySet<string>)>? known))
+            List<(TypeEntry Type, IReadOnlyList<TypeIdentityTemplate> Arguments)> range = new() { (definition, arguments) };
+            range.AddRange(catalog.ReadInheritedTypes(definition, arguments, includeInterfaces: false)
+                .Select(relation => (relation.Definition, (IReadOnlyList<TypeIdentityTemplate>)relation.TypeArguments)));
+            if (!exact)
             {
-                return known;
+                range.AddRange(catalog.ReadDescendants(definition, true)
+                    .Select(child => (child, (IReadOnlyList<TypeIdentityTemplate>)Placeholders(child.GenericParameters.Count))));
             }
+            var candidates = range.Where(item => item.Type.SourceSymbol != null && item.Type.IsCandidate).ToArray();
+            TypeEntry[] missing = candidates.Select(item => item.Type).Where(type => !dispatch.FrameworkOverrides.ContainsKey(type.Id))
+                .DistinctBy(type => type.Id).ToArray();
+            var read = new IReadOnlyList<(IMethodSymbol, IReadOnlySet<string>)>[missing.Length];
+            Parallel.For(0, missing.Length, new ParallelOptions { MaxDegreeOfParallelism = dispatch.Jobs }, index => read[index] = ReadFrameworkOverrides(catalog, missing[index]));
+            for (int index = 0; index < missing.Length; index++)
+            {
+                dispatch.FrameworkOverrides.TryAdd(missing[index].Id, read[index]);
+            }
+            return candidates.SelectMany(item => dispatch.FrameworkOverrides[item.Type.Id]
+                .Select(member => (item.Type, item.Arguments, member.Item1, member.Item2))).ToArray();
+        }
+
+        // 源码类型中重写外部库虚函数或实现外部库接口成员的函数；只读符号，可并行调用，结果由调用方按类型缓存。
+        private static IReadOnlyList<(IMethodSymbol Member, IReadOnlySet<string> Contracts)> ReadFrameworkOverrides(MethodCatalogResult catalog, TypeEntry type)
+        {
             INamedTypeSymbol symbol = type.SourceSymbol!;
             Dictionary<IMethodSymbol, HashSet<string>> result = new(SymbolEqualityComparer.Default);
             void Add(IMethodSymbol member, string contract)
@@ -1766,10 +1777,8 @@ namespace SetterChecker.Core
                     }
                 }
             }
-            (IMethodSymbol, IReadOnlySet<string>)[] ordered = result.OrderBy(pair => pair.Key.ToDisplayString(), StringComparer.Ordinal)
+            return result.OrderBy(pair => pair.Key.ToDisplayString(), StringComparer.Ordinal)
                 .Select(pair => (pair.Key, (IReadOnlySet<string>)pair.Value)).ToArray();
-            dispatch.FrameworkOverrides.Add(type.Id, ordered);
-            return ordered;
         }
 
         // 外部库类型的元数据全名（命名空间加元数据名，嵌套类型用 + 连接），与类型身份中的名称一致。
@@ -1806,8 +1815,11 @@ namespace SetterChecker.Core
         /// <summary>候选范围和单个类型的匹配结果分开复用，不保存调用路径。</summary>
         private sealed class DispatchIndex
         {
-            internal Dictionary<string, IReadOnlyList<ResolvedMethodDefinition>> Callbacks { get; } = new(StringComparer.Ordinal);
-            internal Dictionary<string, IReadOnlyList<(IMethodSymbol, IReadOnlySet<string>)>> FrameworkOverrides { get; } = new(StringComparer.Ordinal);
+            internal int Jobs { get; init; } = 1;
+            internal ConcurrentDictionary<string, IReadOnlyList<ResolvedMethodDefinition>> Callbacks { get; } = new(StringComparer.Ordinal);
+            internal ConcurrentDictionary<string, IReadOnlyList<(TypeEntry, IReadOnlyList<TypeIdentityTemplate>, IMethodSymbol, IReadOnlySet<string>)>> CallbackRanges { get; } = new(StringComparer.Ordinal);
+            internal ConcurrentDictionary<string, IReadOnlyList<(IMethodSymbol, IReadOnlySet<string>)>> FrameworkOverrides { get; } = new(StringComparer.Ordinal);
+            internal object MatchLock { get; } = new();
             internal Dictionary<string, TargetCandidates> Ranges { get; } = new(StringComparer.Ordinal);
             internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Starts), TargetCandidates> Traversals { get; } = new();
             internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Type, TemplateList Arguments), ResolvedMethodDefinition?> Implementations { get; } = new();
@@ -1856,42 +1868,44 @@ namespace SetterChecker.Core
             {
                 for (int index = 0; ; index++)
                 {
-                    if (index == this.m_found.Count)
+                    ResolvedMethodDefinition? current;
+                    lock (this)
                     {
-                        if (this.m_failure != null)
+                        if (index == this.m_found.Count)
                         {
-                            throw this.m_failure;
-                        }
-                        if (this.m_remaining == null)
-                        {
-                            yield break;
-                        }
-                        IEnumerator<ResolvedMethodDefinition> remaining = this.m_remaining;
-                        try
-                        {
-                            if (remaining.MoveNext())
+                            if (this.m_failure != null)
                             {
-                                this.m_found.Add(remaining.Current);
+                                throw this.m_failure;
                             }
-                            else
+                            if (this.m_remaining == null)
                             {
+                                yield break;
+                            }
+                            IEnumerator<ResolvedMethodDefinition> remaining = this.m_remaining;
+                            try
+                            {
+                                if (remaining.MoveNext())
+                                {
+                                    this.m_found.Add(remaining.Current);
+                                }
+                                else
+                                {
+                                    remaining.Dispose();
+                                    this.m_remaining = null;
+                                    yield break;
+                                }
+                            }
+                            catch (AnalysisException exception)
+                            {
+                                this.m_failure = exception;
                                 remaining.Dispose();
                                 this.m_remaining = null;
+                                throw;
                             }
                         }
-                        catch (AnalysisException exception)
-                        {
-                            this.m_failure = exception;
-                            remaining.Dispose();
-                            this.m_remaining = null;
-                            throw;
-                        }
-                        if (this.m_remaining == null)
-                        {
-                            yield break;
-                        }
+                        current = this.m_found[index];
                     }
-                    yield return this.m_found[index];
+                    yield return current;
                 }
             }
         }
@@ -1906,22 +1920,9 @@ namespace SetterChecker.Core
         internal static IReadOnlyList<BehaviorTypeReference> ReadRuntimeTypes(MethodCatalogResult catalog, TypeEntry declared,
             IReadOnlyList<TypeIdentityTemplate> declaredArguments)
         {
-            Queue<TypeEntry> pending = new(new[] { declared });
-            HashSet<string> visited = new(StringComparer.Ordinal);
             List<BehaviorTypeReference> result = new();
-            IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> derived = catalog.DerivedTypesByBaseId;
-            IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> implementations = catalog.ImplementingTypesByInterfaceId;
-            while (pending.TryDequeue(out TypeEntry? type))
+            foreach (TypeEntry type in new[] { declared }.Concat(catalog.ReadDescendants(declared, true)))
             {
-                if (!visited.Add(type.Id))
-                {
-                    continue;
-                }
-                foreach (TypeEntry child in (derived.GetValueOrDefault(type.Id) ?? Array.Empty<TypeEntry>())
-                    .Concat(implementations.GetValueOrDefault(type.Id) ?? Array.Empty<TypeEntry>()))
-                {
-                    pending.Enqueue(child);
-                }
                 if (type.IsAbstract || type.IsInterface)
                 {
                     continue;
@@ -1998,10 +1999,14 @@ namespace SetterChecker.Core
             var key = (declaration.Method.Id, new TemplateList(declaration.DeclaringTypeArguments), new TemplateList(declaration.MethodTypeArguments),
                 string.Concat(bounds.Select(bound => $"{bound.Type.Id.Length}:{bound.Type.Id}{bound.Arguments.Count}:"
                     + string.Concat(bound.Arguments.Select(argument => $"{argument.Text.Length}:{argument.Text}")) + (bound.Expand ? '+' : '-'))));
-            if (!dispatch.Traversals.TryGetValue(key, out TargetCandidates? traversal))
+            TargetCandidates? traversal;
+            lock (dispatch.MatchLock)
             {
-                traversal = new TargetCandidates(Traverse(catalog, declaration, owner, targetSignature, bounds, timing, dispatch));
-                dispatch.Traversals.Add(key, traversal);
+                if (!dispatch.Traversals.TryGetValue(key, out traversal))
+                {
+                    traversal = new TargetCandidates(Traverse(catalog, declaration, owner, targetSignature, bounds, timing, dispatch));
+                    dispatch.Traversals.Add(key, traversal);
+                }
             }
             foreach (ResolvedMethodDefinition implementation in traversal.Read())
             {
@@ -2076,11 +2081,15 @@ namespace SetterChecker.Core
             ResolvedMethodDefinition? ResolveImplementation(TypeEntry type, IReadOnlyList<TypeIdentityTemplate> arguments)
             {
                 var implementationKey = (declaration.Method.Id, ownerArguments, new TemplateList(declaration.MethodTypeArguments), type.Id, new TemplateList(arguments));
-                if (!dispatch.Implementations.TryGetValue(implementationKey, out ResolvedMethodDefinition? selected))
+                ResolvedMethodDefinition? selected;
+                lock (dispatch.MatchLock)
                 {
-                    timing.Count("接口具体类型实际匹配");
-                    selected = MatchImplementation(type, arguments);
-                    dispatch.Implementations.Add(implementationKey, selected);
+                    if (!dispatch.Implementations.TryGetValue(implementationKey, out selected))
+                    {
+                        timing.Count("接口具体类型实际匹配");
+                        selected = MatchImplementation(type, arguments);
+                        dispatch.Implementations.Add(implementationKey, selected);
+                    }
                 }
                 return selected;
             }
@@ -2098,11 +2107,15 @@ namespace SetterChecker.Core
                     }
                 }
                 var hierarchyKey = (owner.Id, ownerArguments, type.Id, new TemplateList(arguments));
-                if (!dispatch.Hierarchies.TryGetValue(hierarchyKey, out var binding))
+                (MethodCatalogResult.InheritedTypeRelation[] Types, int IntroductionDepth) binding;
+                lock (dispatch.MatchLock)
                 {
-                    binding = BindHierarchy(type, arguments);
-                    dispatch.Hierarchies.Add(hierarchyKey, binding);
-                    timing.Count("接口类型关系实际匹配");
+                    if (!dispatch.Hierarchies.TryGetValue(hierarchyKey, out binding))
+                    {
+                        binding = BindHierarchy(type, arguments);
+                        dispatch.Hierarchies.Add(hierarchyKey, binding);
+                        timing.Count("接口类型关系实际匹配");
+                    }
                 }
                 if (binding.Types.Length == 0)
                 {
@@ -2298,6 +2311,8 @@ namespace SetterChecker.Core
         private readonly Dictionary<(SemanticModel Model, SyntaxNode Node), ISymbol?> m_symbols = new();
         private readonly Dictionary<(string Name, bool Calls), RegistrationLocations> m_boundLocations = new();
         private (SourceAssemblyMaterial Assembly, SyntaxTree Tree)[] m_files = Array.Empty<(SourceAssemblyMaterial, SyntaxTree)>();
+        private readonly Task<((SourceAssemblyMaterial Assembly, SyntaxTree Tree)[] Files, List<RegistrationEntry>[] Entries)> m_scan =
+            Task.Run(() => Scan(material, jobs, cancellation), cancellation);
 
         private enum RegistrationKind : byte { Write, Call, Receiver }
         private readonly record struct RegistrationLocation(int File, TextSpan Span, int Kind);
@@ -2421,6 +2436,22 @@ namespace SetterChecker.Core
             return symbol;
         }
 
+        // 语法扫描只依赖源码，在索引创建时即后台并行执行，与主分析重叠；各文件结果按文件顺序保存。
+        private static ((SourceAssemblyMaterial Assembly, SyntaxTree Tree)[] Files, List<RegistrationEntry>[] Entries) Scan(
+            MaterialSet material, int jobs, CancellationToken cancellation)
+        {
+            var files = material.SourceAssemblies.Where(assembly => assembly.IsCandidateSource).SelectMany(assembly => assembly.Compilation.SyntaxTrees
+                .Select(tree => (Assembly: assembly, Tree: tree))).ToArray();
+            var entries = new List<RegistrationEntry>[files.Length];
+            Parallel.For(0, files.Length, new ParallelOptions { MaxDegreeOfParallelism = jobs, CancellationToken = cancellation }, fileIndex =>
+            {
+                RegistrationScanner scanner = new();
+                scanner.Visit(files[fileIndex].Tree.GetRoot(cancellation));
+                entries[fileIndex] = scanner.Entries;
+            });
+            return (files, entries);
+        }
+
         // 名称只用于筛选语法位置，随后必须核对编译器给出的真实声明。
         private void Build()
         {
@@ -2430,15 +2461,8 @@ namespace SetterChecker.Core
             }
             using var registrationTiming = timing.Measure(AnalysisTiming.Part.RegistrationSyntax);
             this.m_writes = new(StringComparer.Ordinal);
-            var files = this.m_files = material.SourceAssemblies.Where(assembly => assembly.IsCandidateSource).SelectMany(assembly => assembly.Compilation.SyntaxTrees
-                .Select(tree => (Assembly: assembly, Tree: tree))).ToArray();
-            var entries = new List<RegistrationEntry>[files.Length];
-            Parallel.For(0, files.Length, new ParallelOptions { MaxDegreeOfParallelism = jobs, CancellationToken = cancellation }, fileIndex =>
-            {
-                RegistrationScanner scanner = new();
-                scanner.Visit(files[fileIndex].Tree.GetRoot(cancellation));
-                entries[fileIndex] = scanner.Entries;
-            });
+            var (files, entries) = this.m_scan.GetAwaiter().GetResult();
+            this.m_files = files;
             for (int fileIndex = 0; fileIndex < files.Length; fileIndex++)
             {
                 foreach (var entry in entries[fileIndex])

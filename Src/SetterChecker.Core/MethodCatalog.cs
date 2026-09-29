@@ -69,7 +69,7 @@ namespace SetterChecker.Core
                 },
                 (workItem, _) =>
                 {
-                    managedParts.Add(ReadManagedTypes(workItem.Path, workItem.SourceContext));
+                    managedParts.Add(ReadManagedTypes(workItem.Path, workItem.SourceContext, jobs));
 
                     return ValueTask.CompletedTask;
                 }).ConfigureAwait(false);
@@ -136,16 +136,17 @@ namespace SetterChecker.Core
             return aliases;
         }
 
-        // 直接读取源码声明与标签，不等待生成元数据或为不同调用者复制声明。
-        private static ManagedAssemblyPart ReadSourceTypes(SourceCatalogContext context)
+        // 直接读取源码声明与标签，不等待生成元数据或为不同调用者复制声明；各类型互不依赖，按类型并行读取。
+        private static ManagedAssemblyPart ReadSourceTypes(SourceCatalogContext context, int jobs)
         {
             INamedTypeSymbol[] declarations = context.Material.Compilation.GetSymbolsWithName(_ => true, SymbolFilter.Type)
                 .OfType<INamedTypeSymbol>().Where(type => type.Locations.Any(location => location.IsInSource
                     && location.SourceTree != null && context.DeclaredPaths.Contains(location.SourceTree.FilePath)))
                 .Select(type => type.OriginalDefinition).Distinct<INamedTypeSymbol>(SymbolEqualityComparer.Default).ToArray();
-            List<MethodEntry> methods = new();
-            TypeEntry[] types = declarations.Select(symbol =>
+            var read = new (TypeEntry Type, MethodEntry[] Methods)[declarations.Length];
+            Parallel.For(0, declarations.Length, new ParallelOptions { MaxDegreeOfParallelism = jobs }, index =>
             {
+                INamedTypeSymbol symbol = declarations[index];
                 string id = SourceNamedTypeId(symbol);
                 TypeEntry type = new(id, id, context.Material.Name, symbol.ContainingAssembly.Identity.GetDisplayName(),
                     symbol.Name, symbol.ToDisplayString(s_typeDisplayFormat),
@@ -164,18 +165,16 @@ namespace SetterChecker.Core
                     GenericParameters = ReadSourceGenericParameters(SourceTypeArguments(symbol).Cast<ITypeParameterSymbol>()),
                     IsCandidate = context.Material.IsCandidateSource,
                 };
-                if (context.Material.IsReportAssembly)
-                {
-                    methods.AddRange(ReadSourceMethodSymbols(symbol)
+                read[index] = (type, context.Material.IsReportAssembly
+                    ? ReadSourceMethodSymbols(symbol)
                         .Select(method => (method.PartialImplementationPart ?? method).OriginalDefinition)
                         .Distinct<IMethodSymbol>(SymbolEqualityComparer.Default)
-                        .Select(method => CreateSourceMethod(method, type, context)));
-                }
-                return type;
-            }).ToArray();
-            return new ManagedAssemblyPart(Path.GetFullPath(context.Material.AssemblyPath), types, Array.Empty<ForwardedTypeEntry>(),
+                        .Select(method => CreateSourceMethod(method, type, context)).ToArray()
+                    : Array.Empty<MethodEntry>());
+            });
+            return new ManagedAssemblyPart(Path.GetFullPath(context.Material.AssemblyPath), read.Select(item => item.Type).ToArray(), Array.Empty<ForwardedTypeEntry>(),
                 context.Material.Compilation.ReferencedAssemblyNames.Select(identity => identity.GetDisplayName()).Order(StringComparer.Ordinal).ToArray())
-            { SourceMethods = methods.OrderBy(method => method.Id, StringComparer.Ordinal).ToArray() };
+            { SourceMethods = read.SelectMany(item => item.Methods).OrderBy(method => method.Id, StringComparer.Ordinal).ToArray() };
         }
 
         // 比较程序集名称、版本、区域和公钥标记。
@@ -411,11 +410,11 @@ namespace SetterChecker.Core
 
         // 启动和按需载入共用完整模块读取、源码回贴与资源释放。
         internal static ManagedAssemblyPart ReadManagedTypes(
-            string path, SourceCatalogContext? source)
+            string path, SourceCatalogContext? source, int jobs)
         {
             if (source != null)
             {
-                return ReadSourceTypes(source);
+                return ReadSourceTypes(source, jobs);
             }
             string fullPath = Path.GetFullPath(path);
             using Cecil.ModuleDefinition module = OpenModule(fullPath);
@@ -1259,6 +1258,8 @@ namespace SetterChecker.Core
         private Dictionary<MethodCatalog.ForwardedTypeKey, MethodCatalog.ForwardedTypeEntry[]> m_forwardersByAlias;
         private IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>>? m_derivedTypesByBaseId;
         private IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>>? m_implementingTypesByInterfaceId;
+        private readonly ConcurrentDictionary<string, IReadOnlyList<TypeEntry>> m_descendants = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, IReadOnlyList<TypeEntry>> m_descendantsWithInterfaces = new(StringComparer.Ordinal);
         private readonly IReadOnlyDictionary<string, MethodCatalog.SourceCatalogContext>
             m_sourceContextsByAssembly;
         private readonly IReadOnlyDictionary<string, MethodCatalog.SourceCatalogContext> m_sourceContextsByPath;
@@ -2005,38 +2006,55 @@ namespace SetterChecker.Core
                 {
                     throw new AnalysisException($"派发预扫描后出现新程序集，必须先闭合动态加载来源：{path}");
                 }
-                part = MethodCatalog.ReadManagedTypes(path, this.m_sourceContextsByPath.GetValueOrDefault(path));
-                foreach (var group in part.SourceMethods.GroupBy(method => method.TypeId, StringComparer.Ordinal))
-                {
-                    this.m_methodsByTypeId[group.Key] = group.ToArray();
-                }
-
-                foreach (TypeEntry type in part.Types)
-                {
-                    this.m_typesById.TryAdd(type.Id, type);
-                    if (type.MetadataToken > 0)
-                    {
-                        this.m_typesByManagedLocation.TryAdd(ManagedTypeLocation(path, type.MetadataToken), type);
-                    }
-                }
-                foreach (var group in part.Types.GroupBy(type => type.LogicalId, StringComparer.Ordinal))
-                {
-                    this.m_typesByLogicalId[group.Key] = (this.m_typesByLogicalId.GetValueOrDefault(group.Key) ?? Array.Empty<TypeEntry>())
-                        .Concat(group).DistinctBy(type => type.Id).OrderBy(type => type.Id, StringComparer.Ordinal).ToArray();
-                }
-                foreach (var group in MethodCatalog.IndexForwarders(part.Forwarders))
-                {
-                    this.m_forwardersByAlias[group.Key] = (this.m_forwardersByAlias.GetValueOrDefault(group.Key)
-                        ?? Array.Empty<MethodCatalog.ForwardedTypeEntry>()).Concat(group.Value).ToArray();
-                }
-                this.m_types = this.m_types.Concat(part.Types).ToArray();
-                this.m_derivedTypesByBaseId = null;
-                this.m_implementingTypesByInterfaceId = null;
-                this.m_typeGeneration++;
-
-                this.m_loadedPartsByPath.Add(path, part);
-                return part.Types.Select(type => this.m_typesById[type.Id]).ToArray();
             }
+            MethodCatalog.ManagedAssemblyPart loaded = MethodCatalog.ReadManagedTypes(path, this.m_sourceContextsByPath.GetValueOrDefault(path), this.m_jobs);
+            lock (this.m_loadedTypeLock)
+            {
+                if (this.m_loadedPartsByPath.TryGetValue(path, out MethodCatalog.ManagedAssemblyPart? part))
+                {
+                    return part.Types.Select(type => this.m_typesById[type.Id]).ToArray();
+                }
+                if (this.m_dispatchAssembliesClosed)
+                {
+                    throw new AnalysisException($"派发预扫描后出现新程序集，必须先闭合动态加载来源：{path}");
+                }
+                MergeLoadedPart(loaded);
+                return loaded.Types.Select(type => this.m_typesById[type.Id]).ToArray();
+            }
+        }
+
+        // 调用方已持有类型锁；新类型使继承索引和派生闭包失效。
+        private void MergeLoadedPart(MethodCatalog.ManagedAssemblyPart part)
+        {
+            foreach (var group in part.SourceMethods.GroupBy(method => method.TypeId, StringComparer.Ordinal))
+            {
+                this.m_methodsByTypeId[group.Key] = group.ToArray();
+            }
+            foreach (TypeEntry type in part.Types)
+            {
+                this.m_typesById.TryAdd(type.Id, type);
+                if (type.MetadataToken > 0)
+                {
+                    this.m_typesByManagedLocation.TryAdd(ManagedTypeLocation(part.Path, type.MetadataToken), type);
+                }
+            }
+            foreach (var group in part.Types.GroupBy(type => type.LogicalId, StringComparer.Ordinal))
+            {
+                this.m_typesByLogicalId[group.Key] = (this.m_typesByLogicalId.GetValueOrDefault(group.Key) ?? Array.Empty<TypeEntry>())
+                    .Concat(group).DistinctBy(type => type.Id).OrderBy(type => type.Id, StringComparer.Ordinal).ToArray();
+            }
+            foreach (var group in MethodCatalog.IndexForwarders(part.Forwarders))
+            {
+                this.m_forwardersByAlias[group.Key] = (this.m_forwardersByAlias.GetValueOrDefault(group.Key)
+                    ?? Array.Empty<MethodCatalog.ForwardedTypeEntry>()).Concat(group.Value).ToArray();
+            }
+            this.m_types = this.m_types.Concat(part.Types).ToArray();
+            this.m_derivedTypesByBaseId = null;
+            this.m_implementingTypesByInterfaceId = null;
+            this.m_descendants.Clear();
+            this.m_descendantsWithInterfaces.Clear();
+            this.m_typeGeneration++;
+            this.m_loadedPartsByPath.Add(part.Path, part);
         }
 
         // 合并真实定义与已经证明的转交别名，不再给每个类型复制别名列表。
@@ -2114,43 +2132,49 @@ namespace SetterChecker.Core
             });
         }
 
+        // 先闭合再建索引，供调用解析与函数体读取重叠。
+        internal void PrepareDispatchIndexes()
+        {
+            RequireClosedDispatchIndex(true);
+            _ = this.DerivedTypesByBaseId;
+            _ = this.ImplementingTypesByInterfaceId;
+        }
+
+        // 从该类型沿子类和实现类型按广度优先展开，不含自身；同一起点只计算一次。
+        internal IReadOnlyList<TypeEntry> ReadDescendants(TypeEntry type, bool includeInterfaceImplementations)
+        {
+            ConcurrentDictionary<string, IReadOnlyList<TypeEntry>> cache = includeInterfaceImplementations
+                ? this.m_descendantsWithInterfaces : this.m_descendants;
+            return cache.GetOrAdd(type.Id, _ =>
+            {
+                IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> derived = this.DerivedTypesByBaseId;
+                IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> implementations = includeInterfaceImplementations
+                    ? this.ImplementingTypesByInterfaceId : new Dictionary<string, IReadOnlyList<TypeEntry>>(StringComparer.Ordinal);
+                List<TypeEntry> result = new();
+                Queue<TypeEntry> pending = new(new[] { type });
+                HashSet<string> visited = new(StringComparer.Ordinal) { type.Id };
+                while (pending.TryDequeue(out TypeEntry? current))
+                {
+                    foreach (TypeEntry child in (derived.GetValueOrDefault(current.Id) ?? Array.Empty<TypeEntry>())
+                        .Concat(implementations.GetValueOrDefault(current.Id) ?? Array.Empty<TypeEntry>()))
+                    {
+                        if (visited.Add(child.Id))
+                        {
+                            result.Add(child);
+                            pending.Enqueue(child);
+                        }
+                    }
+                }
+                return result;
+            });
+        }
+
         // 补齐候选关系；同世代的完整接口检查也证明基类完整，实际调用仍要求唯一载体。
         internal void RequireClosedDispatchIndex(bool includeInterfaces)
         {
+            CloseDispatchAssemblies();
             lock (this.m_loadedTypeLock)
             {
-                if (!this.m_dispatchAssembliesClosed)
-                {
-                    string[] sourcePaths = this.m_sourceContextsByPath.Keys.Where(path => !this.m_loadedPartsByPath.ContainsKey(path)).ToArray();
-                    foreach (string path in sourcePaths)
-                    {
-                        LoadAssemblyTypes(path);
-                    }
-                    Queue<MethodCatalog.ManagedAssemblyPart> pending = new(this.m_loadedPartsByPath.Values.OrderBy(part => part.Path, StringComparer.OrdinalIgnoreCase));
-                    HashSet<string> visited = new(StringComparer.OrdinalIgnoreCase);
-                    while (pending.TryDequeue(out MethodCatalog.ManagedAssemblyPart? part))
-                    {
-                        if (!visited.Add(part.Path))
-                        {
-                            continue;
-                        }
-                        foreach (string reference in part.AssemblyReferences)
-                        {
-                            foreach (string candidate in ReadAssemblyCandidates(new System.Reflection.AssemblyName(reference)))
-                            {
-                                if (!this.m_loadedPartsByPath.ContainsKey(candidate))
-                                {
-                                    LoadAssemblyTypes(candidate);
-                                }
-                                if (!visited.Contains(candidate))
-                                {
-                                    pending.Enqueue(this.m_loadedPartsByPath[candidate]);
-                                }
-                            }
-                        }
-                    }
-                    this.m_dispatchAssembliesClosed = true;
-                }
                 while (this.m_dispatchGenerations.GetValueOrDefault(includeInterfaces, -1) != this.m_typeGeneration
                     && (includeInterfaces || this.m_dispatchGenerations.GetValueOrDefault(true, -1) != this.m_typeGeneration))
                 {
@@ -2168,6 +2192,77 @@ namespace SetterChecker.Core
                     if (generation == this.m_typeGeneration)
                     {
                         this.m_dispatchGenerations[includeInterfaces] = generation;
+                    }
+                }
+            }
+        }
+
+        // 按引用层次并行读取尚未载入的程序集，合并仍按路径顺序。
+        private void CloseDispatchAssemblies()
+        {
+            if (Volatile.Read(ref this.m_dispatchAssembliesClosed))
+            {
+                return;
+            }
+            string[] sourcePaths;
+            lock (this.m_loadedTypeLock)
+            {
+                if (this.m_dispatchAssembliesClosed)
+                {
+                    return;
+                }
+                sourcePaths = this.m_sourceContextsByPath.Keys.Where(path => !this.m_loadedPartsByPath.ContainsKey(path)).ToArray();
+            }
+            foreach (string path in sourcePaths)
+            {
+                LoadAssemblyTypes(path);
+            }
+            HashSet<string> visited = new(StringComparer.OrdinalIgnoreCase);
+            while (true)
+            {
+                string[] next;
+                lock (this.m_loadedTypeLock)
+                {
+                    HashSet<string> pending = new(StringComparer.OrdinalIgnoreCase);
+                    foreach (MethodCatalog.ManagedAssemblyPart part in this.m_loadedPartsByPath.Values
+                        .OrderBy(item => item.Path, StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (!visited.Add(part.Path))
+                        {
+                            continue;
+                        }
+                        foreach (string reference in part.AssemblyReferences)
+                        {
+                            foreach (string candidate in ReadAssemblyCandidates(new System.Reflection.AssemblyName(reference)))
+                            {
+                                if (!this.m_loadedPartsByPath.ContainsKey(candidate))
+                                {
+                                    pending.Add(candidate);
+                                }
+                            }
+                        }
+                    }
+                    if (pending.Count == 0)
+                    {
+                        this.m_dispatchAssembliesClosed = true;
+                        return;
+                    }
+                    next = pending.Order(StringComparer.OrdinalIgnoreCase).ToArray();
+                }
+                MethodCatalog.ManagedAssemblyPart[] loaded = new MethodCatalog.ManagedAssemblyPart[next.Length];
+                Parallel.For(0, next.Length, new ParallelOptions { MaxDegreeOfParallelism = this.m_jobs }, index =>
+                {
+                    loaded[index] = MethodCatalog.ReadManagedTypes(next[index],
+                        this.m_sourceContextsByPath.GetValueOrDefault(next[index]), 1);
+                });
+                lock (this.m_loadedTypeLock)
+                {
+                    foreach (MethodCatalog.ManagedAssemblyPart part in loaded)
+                    {
+                        if (!this.m_loadedPartsByPath.ContainsKey(part.Path))
+                        {
+                            MergeLoadedPart(part);
+                        }
                     }
                 }
             }

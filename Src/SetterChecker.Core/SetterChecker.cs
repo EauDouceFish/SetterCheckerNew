@@ -41,10 +41,11 @@ namespace SetterChecker.Core
                 // 类级豁免只改变该函数自己的日志决定，真实写入仍必须向调用者传播；报告函数的源码重写只参与分析，供 R11 使用。
                 HashSet<string> rootIds = roots.Select(method => method.Id).ToHashSet(StringComparer.Ordinal);
                 HashSet<string> rootKeys = roots.Select(method => AnnotationEvaluator.ReadOverrideKey(method.SourceSymbol!)).ToHashSet(StringComparer.Ordinal);
-                MethodEntry[] overrides = catalog.Types.Where(type => type.IsCandidate && type.SourceSymbol != null)
+                MethodEntry[] overrides = catalog.Types.Where(type => type.IsCandidate && type.SourceSymbol != null).AsParallel().AsOrdered()
+                    .WithDegreeOfParallelism(request.Jobs)
                     .SelectMany(type => type.SourceSymbol!.GetMembers().OfType<Microsoft.CodeAnalysis.IMethodSymbol>())
                     .Where(symbol => symbol is { IsOverride: true, IsAbstract: false } && symbol.DeclaringSyntaxReferences.Length != 0
-                        && AnnotationEvaluator.ReadOverriddenKeys(symbol).Any(rootKeys.Contains))
+                        && AnnotationEvaluator.ReadOverriddenKeys(symbol).Any(rootKeys.Contains)).ToArray()
                     .Select(symbol => catalog.ReadSourceDeclaration(symbol, symbol.DeclaringSyntaxReferences[0].SyntaxTree.FilePath))
                     .Where(method => !rootIds.Contains(method.Id)).DistinctBy(method => method.Id).ToArray();
                 MethodEntry[] analysisRoots = roots.Concat(overrides).ToArray();                CallTargetResolutionResult? calls = null;
