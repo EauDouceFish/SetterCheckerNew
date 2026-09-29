@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 
 namespace SetterChecker.Core.Tests
@@ -619,6 +620,69 @@ namespace SetterChecker.Core.Tests
             Assert.AreEqual(3, report.RootElement.GetProperty("Total").GetInt32());
             Assert.AreEqual(2, report.RootElement.GetProperty("DetectedShouldTrack").GetInt32());
             StringAssert.Contains(File.ReadAllText(Path.Combine(output, "report.md")), "生成源码程序集：0");
+        }
+
+        // 补标写在函数正上方并沿用文件的 BOM、换行和缩进；提醒只列出相比上次新增的函数。
+        /// <summary>补标后再次分析不再有补标项；短名称在该位置不可用时写限定名称。</summary>
+        [TestMethod]
+        public async Task NoLogTrackSuggestionsAreAppliedAndNotified()
+        {
+            static string Source(string read, string readOld, string one, string two, string twice) => (Attributes + $$"""
+                namespace KH
+                {
+                    public class Counter
+                    {
+                        private int m_value;
+                        /// <summary>读取当前值。</summary>
+                        {{read}}public int Read() { return m_value; }
+                        {{readOld}}[System.Obsolete]
+                        public int ReadOld() { return m_value; }
+                        public void Write() { m_value++; }
+                        [NoLogTrack] public int Labeled() { return m_value; }
+                        {{one}}public int One() { return 1; } {{two}}public int Two() { return 2; }
+                    }
+                }
+                namespace Other
+                {
+                    public static class Reader
+                    {
+                        {{twice}}public static int Twice(int value) { return value * 2; }
+                    }
+                }
+                """).ReplaceLineEndings("\r\n");
+            using TestProject project = TestProject.Create("namespace KH { }");
+            string path = Path.Combine(Path.GetDirectoryName(project.AssemblyDefinitionPath)!, "Root.cs");
+            File.WriteAllText(path, Source("", "", "", "", ""), new UTF8Encoding(true));
+            using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(30));
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(project.Request(4), deadline.Token);
+            string first = Path.Combine(project.RootPath, "first");
+            new ReportWriter().Write(run, first);
+            using (JsonDocument functions = JsonDocument.Parse(File.ReadAllText(Path.Combine(first, "functions.json"))))
+            {
+                var rows = functions.RootElement.GetProperty("Functions").EnumerateArray().Select(row => (Name: row.GetProperty("Name").GetString()!,
+                    Action: row.GetProperty("Action").GetString()!, Id: row.GetProperty("Id").GetString()!)).ToArray();
+                CollectionAssert.AreEquivalent(new[] { "One", "Read", "ReadOld", "Twice", "Two" },
+                    rows.Where(row => row.Action == "补 NoLogTrack").Select(row => row.Name).ToArray());
+                Assert.AreEqual(string.Empty, rows.Single(row => row.Name == "Write").Action);
+                Assert.AreEqual(string.Empty, rows.Single(row => row.Name == "Labeled").Action);
+                string previous = Path.Combine(project.RootPath, "previous.json");
+                File.WriteAllText(previous, JsonSerializer.Serialize(new { Functions = new[] { new { rows.Single(row => row.Name == "Read").Id, Action = "补 NoLogTrack" } } }));
+                string second = Path.Combine(project.RootPath, "second");
+                new ReportWriter().Write(run, second, previous);
+                using JsonDocument notify = JsonDocument.Parse(File.ReadAllText(Path.Combine(second, "notify.json")));
+                CollectionAssert.AreEquivalent(new[] { "One", "ReadOld", "Twice", "Two" }, notify.RootElement.GetProperty("Functions").EnumerateArray()
+                    .Select(row => row.GetProperty("Name").GetString()).ToArray());
+            }
+
+            Assert.AreEqual((5, 1), new ReportWriter().ApplyNoLogTrack(run));
+            byte[] bytes = File.ReadAllBytes(path);
+            CollectionAssert.AreEqual(Encoding.UTF8.Preamble.ToArray(), bytes[..3]);
+            string line = "[NoLogTrack]\n        ";
+            Assert.AreEqual(Source(line, line, line, "[NoLogTrack] ", "[KH.NoLogTrack]\n        "), Encoding.UTF8.GetString(bytes[3..]));
+            AnalysisRun again = await new SetterChecker().AnalyzeAsync(project.Request(4), deadline.Token);
+            Assert.IsFalse(again.Annotations.Methods.Any(method => method.SuggestNoLogTrack));
+            CollectionAssert.AreEquivalent(new[] { "Labeled", "One", "Read", "ReadOld", "Twice", "Two" },
+                again.Annotations.Methods.Where(method => method.SourceNoLogTrack).Select(method => method.Name).ToArray());
         }
 
         // 对应 Data/Script/Base/KHScriptData.cs:354，保留反射字段数组、循环和参数读取。

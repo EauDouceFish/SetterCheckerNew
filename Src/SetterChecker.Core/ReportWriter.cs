@@ -1,17 +1,27 @@
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Text;
 
 namespace SetterChecker.Core
 {
-    /// <summary>从同一份结论生成报告与只读补丁预览。</summary>
+    /// <summary>从同一份结论生成报告、逐函数结果、补标提醒与补丁，并可按同一批修改为源码补 NoLogTrack。</summary>
     public sealed class ReportWriter
     {
+        private const string AddNoLogTrack = "补 NoLogTrack";
+
         // 固定排序输出数量、差异、告警、失败和耗时，不改写被分析项目。
-        /// <summary>在指定输出目录生成 report.md、report.json 和 preview.patch。</summary>
-        public void Write(AnalysisRun run, string directory)
+        /// <summary>在指定输出目录生成 report.md、report.json、functions.json、functions.csv、notify.json、notify.md 和 preview.patch。</summary>
+        /// <param name="run">本次分析结果。</param>
+        /// <param name="directory">报告目录。</param>
+        /// <param name="previousFunctions">上一次的 functions.json；给出时提醒只列出其中尚未要求补标的函数，否则列出全部。</param>
+        public void Write(AnalysisRun run, string directory, string? previousFunctions = null)
         {
+            IReadOnlySet<string> previous = previousFunctions == null ? new HashSet<string>() : ReadPreviousSuggestions(previousFunctions);
             Directory.CreateDirectory(directory);
             IReadOnlyList<AnnotationMethod> methods = run.Annotations.Methods.Where(method => method.IsReportable).ToArray();
             Dictionary<string, MethodEntry> names = (run.Calls?.Methods ?? run.Catalog.Methods).ToDictionary(method => method.Id);
@@ -102,6 +112,8 @@ namespace SetterChecker.Core
             }
             WriteGroups(text, "源码有 NoLogTrack、真实行为为 Setter（保留人工豁免）", methods.Where(method => method.SourceNoLogTrack && method.Actual == MethodEffectKind.Setter));
             WriteGroups(text, "源码无 NoLogTrack、可补标", methods.Where(method => method.SuggestNoLogTrack));
+            NoLogTrackEdits edits = ReadNoLogTrackEdits(run);
+            WriteGroups(text, "可补标但声明上不能直接加特性（需手工处理）", edits.Skipped);
             WriteGroups(text, "采用人工基线（非行为证明）", methods.Where(method => method.UsesManualBaseline));
             WriteGroups(text, "可信豁免复查（含不参与统计的类级审计项）", run.Annotations.Methods.Where(method => method.ReviewExemption));
             WriteGroups(text, "缺少 Reason", methods.Where(method => method.MissingReason));
@@ -204,7 +216,137 @@ namespace SetterChecker.Core
             }, options);
             File.WriteAllText(Path.Combine(directory, "report.md"), text.ToString(), new UTF8Encoding(false));
             File.WriteAllText(Path.Combine(directory, "report.json"), json, new UTF8Encoding(false));
-            File.WriteAllText(Path.Combine(directory, "preview.patch"), ReadPreview(methods, run.Material.ProjectRoot), new UTF8Encoding(false));
+            File.WriteAllText(Path.Combine(directory, "preview.patch"), ReadPreview(edits, run.Material.ProjectRoot), new UTF8Encoding(false));
+            IReadOnlyList<FunctionRow> rows = ReadFunctionRows(methods, names, run.Material.ProjectRoot);
+            JsonSerializerOptions readable = new() { WriteIndented = true, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+            File.WriteAllText(Path.Combine(directory, "functions.json"), JsonSerializer.Serialize(new { Functions = rows }, readable), new UTF8Encoding(false));
+            File.WriteAllText(Path.Combine(directory, "functions.csv"), ReadCsv(rows), new UTF8Encoding(true));
+            FunctionRow[] notify = rows.Where(row => row.Action == AddNoLogTrack && !previous.Contains(row.Id)).ToArray();
+            File.WriteAllText(Path.Combine(directory, "notify.json"), JsonSerializer.Serialize(new
+            {
+                Previous = previousFunctions == null ? null : Path.GetFullPath(previousFunctions),
+                Count = notify.Length,
+                Functions = notify,
+            }, readable), new UTF8Encoding(false));
+            StringBuilder message = new();
+            message.AppendLine("# NoLogTrack 补标提醒\n");
+            message.AppendLine(previousFunctions == null ? "对比基准：无，列出全部。" : $"对比基准：{Path.GetFullPath(previousFunctions)}");
+            message.AppendLine($"判定为 NoLogTrack、源码却没有标签的函数{(previousFunctions == null ? string.Empty : "（相比上次新增）")}：{notify.Length} 个。\n");
+            foreach (FunctionRow row in notify)
+            {
+                message.AppendLine($"- {row.Class}.{row.Name}（{row.File}:{row.Line}）");
+            }
+            File.WriteAllText(Path.Combine(directory, "notify.md"), message.ToString(), new UTF8Encoding(false));
+        }
+
+        // 把判定为 NoLogTrack 而源码缺少标签的函数写入标签，全部文件核对无误后才开始写。
+        /// <summary>按与 preview.patch 相同的修改为源码补 NoLogTrack，保留原文件 BOM 与换行。</summary>
+        /// <returns>补标函数数和改动文件数。</returns>
+        public (int Methods, int Files) ApplyNoLogTrack(AnalysisRun run)
+        {
+            NoLogTrackEdits edits = ReadNoLogTrackEdits(run);
+            UTF8Encoding strict = new(false, true);
+            var files = edits.Files.Select(file =>
+            {
+                byte[] bytes = File.ReadAllBytes(file.Path);
+                bool bom = bytes.AsSpan().StartsWith(Encoding.UTF8.Preamble);
+                string current;
+                try
+                {
+                    current = strict.GetString(bytes, bom ? 3 : 0, bytes.Length - (bom ? 3 : 0));
+                }
+                catch (DecoderFallbackException)
+                {
+                    throw new AnalysisException($"源码不是有效 UTF-8，未补标：{file.Path}");
+                }
+                return current == file.Original ? (file, bom) : throw new AnalysisException($"源码在分析后已改变，未补标：{file.Path}");
+            }).ToArray();
+            foreach (var (file, bom) in files)
+            {
+                File.WriteAllText(file.Path, file.Updated, new UTF8Encoding(bom));
+            }
+            return (edits.Files.Sum(file => file.Count), edits.Files.Count);
+        }
+
+        // 在声明的首个特性或修饰符前另起一行，缩进和换行沿用该声明所在行；短名称在该位置不指向 KH.NoLogTrackAttribute 时写限定名称。
+        private static NoLogTrackEdits ReadNoLogTrackEdits(AnalysisRun run)
+        {
+            List<NoLogTrackFile> files = new();
+            List<AnnotationMethod> skipped = new();
+            foreach (var file in run.Annotations.Methods.Where(method => method.IsReportable && method.SuggestNoLogTrack)
+                .GroupBy(method => method.File).OrderBy(group => group.Key, StringComparer.Ordinal))
+            {
+                List<TextChange> changes = new();
+                SourceText? original = null;
+                SemanticModel? model = null;
+                foreach (AnnotationMethod method in file)
+                {
+                    SyntaxNode node = method.SourceMethod.SourceSymbol!.DeclaringSyntaxReferences.Single().GetSyntax();
+                    if (node is not (BaseMethodDeclarationSyntax or AccessorDeclarationSyntax))
+                    {
+                        skipped.Add(method);
+                        continue;
+                    }
+                    original ??= node.SyntaxTree.GetText();
+                    model ??= run.Material.SourceAssemblies.Single(source => source.Compilation.ContainsSyntaxTree(node.SyntaxTree))
+                        .Compilation.GetSemanticModel(node.SyntaxTree);
+                    string name = new[] { "NoLogTrack", "KH.NoLogTrack" }.FirstOrDefault(candidate => model.GetSpeculativeSymbolInfo(node.SpanStart,
+                            SyntaxFactory.Attribute(SyntaxFactory.ParseName(candidate))).Symbol?.ContainingType.ToDisplayString() == "KH.NoLogTrackAttribute")
+                        ?? "global::KH.NoLogTrack";
+                    TextLine line = original.Lines.GetLineFromPosition(node.SpanStart);
+                    string indent = original.ToString(TextSpan.FromBounds(line.Start, node.SpanStart));
+                    string newline = original.ToString(TextSpan.FromBounds(line.End, line.EndIncludingLineBreak));
+                    changes.Add(new TextChange(new TextSpan(node.SpanStart, 0), string.IsNullOrWhiteSpace(indent) && newline.Length != 0
+                        ? $"[{name}]{newline}{indent}" : $"[{name}] "));
+                }
+                if (original != null)
+                {
+                    files.Add(new NoLogTrackFile(file.Key, original.ToString(), original.WithChanges(changes).ToString(), changes.Count));
+                }
+            }
+            return new NoLogTrackEdits(files, skipped);
+        }
+
+        // 每个可报告函数一行、列固定，按文件和行号排序；表格查看、流水线对比和提醒共用这一份。
+        private static IReadOnlyList<FunctionRow> ReadFunctionRows(IReadOnlyList<AnnotationMethod> methods,
+            IReadOnlyDictionary<string, MethodEntry> names, string projectRoot)
+        {
+            return methods.Select(method => new FunctionRow(method.Id, Path.GetRelativePath(projectRoot, method.File).Replace('\\', '/'),
+                    method.Line, method.Class, method.Name, method.SourceLabel, method.Actual?.ToString() ?? "未证明", method.Decision ?? "未确定",
+                    method.SuggestNoLogTrack ? AddNoLogTrack : method.MissingReason ? "去掉 NoLogTrack 或补 Reason"
+                    : method.ReviewExemption ? "复查豁免"
+                    : method.Failure != null && !method.InformationalOnly && !method.UsesManualBaseline ? "人工判断" : string.Empty,
+                    method.Failure ?? (method.Actual == MethodEffectKind.Setter && method.Evidence is EffectEvidence evidence
+                        ? evidence.Detail + (evidence.MethodPath.Count > 1 ? "；调用过程：" + string.Join(" → ", evidence.MethodPath
+                            .Select(id => names.TryGetValue(id, out MethodEntry? entry) ? entry.TypeName + "." + entry.Name : id)) : string.Empty)
+                        : string.Empty)))
+                .OrderBy(row => row.File, StringComparer.Ordinal).ThenBy(row => row.Line).ThenBy(row => row.Id, StringComparer.Ordinal).ToArray();
+        }
+
+        // 表头用中文；含逗号、引号或换行的字段按 CSV 规则加引号。
+        private static string ReadCsv(IReadOnlyList<FunctionRow> rows)
+        {
+            static string Field(string value) => value.IndexOfAny([',', '"', '\n', '\r']) < 0 ? value : "\"" + value.Replace("\"", "\"\"") + "\"";
+            StringBuilder csv = new("文件,行,类,函数,源码标签,真实行为,最终决定,需要处理,依据,函数标识\n");
+            foreach (FunctionRow row in rows)
+            {
+                csv.Append(string.Join(",", new[] { row.File, row.Line.ToString(), row.Class, row.Name, row.SourceLabel, row.Actual,
+                    row.Decision, row.Action, row.Detail, row.Id }.Select(Field))).Append('\n');
+            }
+            return csv.ToString();
+        }
+
+        // 读取上一次 functions.json 中已要求补标的函数标识。
+        private static IReadOnlySet<string> ReadPreviousSuggestions(string path)
+        {
+            if (!File.Exists(path))
+            {
+                throw new AnalysisException($"上一次的结果不存在：{path}");
+            }
+            using JsonDocument previous = JsonDocument.Parse(File.ReadAllText(path));
+            return previous.RootElement.GetProperty("Functions").EnumerateArray()
+                .Where(row => row.GetProperty(nameof(FunctionRow.Action)).GetString() == AddNoLogTrack)
+                .Select(row => row.GetProperty(nameof(FunctionRow.Id)).GetString()!).ToHashSet(StringComparer.Ordinal);
         }
 
         // 同一类的方法保留完整源码位置，避免重载函数混在一起。
@@ -218,19 +360,16 @@ namespace SetterChecker.Core
             }
         }
 
-        // 从分析时的源码快照制作补丁，只给已证明且没有标签冲突的函数添加标签。
-        private static string ReadPreview(IReadOnlyList<AnnotationMethod> methods, string projectRoot)
+        // 从分析时的源码快照制作补丁，内容与 ApplyNoLogTrack 写入的修改相同。
+        private static string ReadPreview(NoLogTrackEdits edits, string projectRoot)
         {
             StringBuilder patch = new();
-            foreach (var file in methods.Where(method => method.SuggestNoLogTrack).GroupBy(method => method.File).OrderBy(group => group.Key, StringComparer.Ordinal))
+            foreach (NoLogTrackFile file in edits.Files)
             {
-                var declarations = file.Select(method => method.SourceMethod.SourceSymbol!.DeclaringSyntaxReferences.Single().GetSyntax()).ToArray();
-                SourceText original = declarations[0].SyntaxTree.GetText();
-                SourceText updated = original.WithChanges(declarations.Select(node => new TextChange(new TextSpan(node.SpanStart, 0), "[global::KH.NoLogTrack] ")));
-                string path = Path.GetRelativePath(projectRoot, file.Key).Replace('\\', '/');
+                string path = Path.GetRelativePath(projectRoot, file.Path).Replace('\\', '/');
                 patch.Append($"--- a/{path}\n+++ b/{path}\n");
-                string[] oldLines = original.ToString().Split('\n');
-                string[] newLines = updated.ToString().Split('\n');
+                string[] oldLines = file.Original.Split('\n');
+                string[] newLines = file.Updated.Split('\n');
                 patch.Append($"@@ -1,{oldLines.Length - (oldLines[^1].Length == 0 ? 1 : 0)} +1,{newLines.Length - (newLines[^1].Length == 0 ? 1 : 0)} @@\n");
                 AppendLines(patch, oldLines, '-');
                 AppendLines(patch, newLines, '+');
@@ -251,5 +390,15 @@ namespace SetterChecker.Core
                 patch.Append("\\ No newline at end of file\n");
             }
         }
+
+        /// <summary>一个源码文件补标前后的完整内容。</summary>
+        private sealed record NoLogTrackFile(string Path, string Original, string Updated, int Count);
+
+        /// <summary>可写入的补标文件，以及声明上不能直接加特性、需手工处理的函数。</summary>
+        private sealed record NoLogTrackEdits(IReadOnlyList<NoLogTrackFile> Files, IReadOnlyList<AnnotationMethod> Skipped);
+
+        /// <summary>统一格式的单个函数扫描结果。</summary>
+        private sealed record FunctionRow(string Id, string File, int Line, string Class, string Name, string SourceLabel,
+            string Actual, string Decision, string Action, string Detail);
     }
 }

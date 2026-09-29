@@ -101,6 +101,8 @@ namespace SetterChecker.Core
                 {
                     SourceMethod = method,
                     InformationalOnly = informational,
+                    SourceLabel = log && sourceNlt ? "NoLogTrack+LogTrack" : nltClass ? "NLTClass"
+                        : nlt != null ? reason ? "NoLogTrack(Reason)" : "NoLogTrack" : log ? "LogTrack" : string.Empty,
                 });
             }
 
@@ -188,6 +190,9 @@ namespace SetterChecker.Core
 
         /// <summary>可信豁免的行为审计未知或废弃接口无实现，仅提示，不阻塞日志决定。</summary>
         public bool InformationalOnly { get; init; }
+
+        /// <summary>源码现有日志标签：NoLogTrack、NoLogTrack(Reason)、NLTClass、LogTrack、NoLogTrack+LogTrack 或空。</summary>
+        public string SourceLabel { get; init; } = string.Empty;
 
         /// <summary>最终日志决定来自人工基线，Actual 与失败证据仍保留。</summary>
         public bool UsesManualBaseline { get; init; }

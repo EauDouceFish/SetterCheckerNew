@@ -20,14 +20,21 @@ namespace SetterChecker.Cli
             try
             {
                 bool noReport = arguments.Contains("--no-report");
-                (MaterialRequest request, string output, string? saveBaseline) = ParseArguments(arguments.Where(argument => argument != "--no-report").ToArray());
+                bool applyNoLogTrack = arguments.Contains("--apply-nlt");
+                (MaterialRequest request, string output, string? saveBaseline, string? previous) = ParseArguments(arguments
+                    .Where(argument => argument is not ("--no-report" or "--apply-nlt")).ToArray());
                 Stopwatch stopwatch = Stopwatch.StartNew();
                 AnalysisRun run = await new SetterChecker.Core.SetterChecker()
                         .AnalyzeAsync(request, progress: Console.Error.WriteLine);
                 Stopwatch reportWatch = Stopwatch.StartNew();
                 if (!noReport)
                 {
-                    new ReportWriter().Write(run, output);
+                    new ReportWriter().Write(run, output, previous);
+                }
+                if (applyNoLogTrack)
+                {
+                    (int methods, int files) = new ReportWriter().ApplyNoLogTrack(run);
+                    Console.WriteLine($"已补 NoLogTrack：{methods} 个函数，{files} 个文件；报告中的行号是补标前的位置。");
                 }
                 if (saveBaseline != null)
                 {
@@ -46,6 +53,8 @@ namespace SetterChecker.Cli
                 }
                 if (!noReport)
                 {
+                    Console.WriteLine($"判定为 NoLogTrack 但源码缺少标签：{run.Annotations.Methods.Count(method => method.IsReportable && method.SuggestNoLogTrack)}；"
+                        + $"提醒{(previous == null ? "（无对比基准，列出全部）" : "（相比上次新增）")}见 notify.md");
                     Console.WriteLine($"报告目录：{Path.GetFullPath(output)}");
                 }
                 if (!noReport)
@@ -60,18 +69,19 @@ namespace SetterChecker.Cli
             {
                 Console.Error.WriteLine(exception.Message);
 
-                return 1;
+                return 2;
             }
         }
 
-        // 解析项目路径和全程序共用的最大并行数。
-        private static (MaterialRequest Request, string Output, string? SaveBaseline) ParseArguments(string[] arguments)
+        // 解析项目路径、全程序共用的最大并行数和上一次结果。
+        private static (MaterialRequest Request, string Output, string? SaveBaseline, string? Previous) ParseArguments(string[] arguments)
         {
             List<string> projectPaths = new();
             int jobs = 4;
             string output = Path.Combine(Environment.CurrentDirectory, "reports");
             string? baseline = null;
             string? saveBaseline = null;
+            string? previous = null;
             bool reflectionBaseline = false;
 
             for (int index = 0; index < arguments.Length; index++)
@@ -117,6 +127,11 @@ namespace SetterChecker.Cli
                     saveBaseline = ReadValue(arguments, ref index, argument);
                     continue;
                 }
+                if (argument == "--previous")
+                {
+                    previous = ReadValue(arguments, ref index, argument);
+                    continue;
+                }
 
                 if (argument.StartsWith("-j", StringComparison.Ordinal) && argument.Length > 2)
                 {
@@ -129,7 +144,7 @@ namespace SetterChecker.Cli
             }
 
             return (new MaterialRequest(projectPaths.Count != 0 ? projectPaths : throw new AnalysisException("缺少 --project 项目路径。"), jobs)
-            { ManualBaselinePath = baseline, CaptureManualBaseline = saveBaseline != null, UseReflectionBaseline = reflectionBaseline }, output, saveBaseline);
+            { ManualBaselinePath = baseline, CaptureManualBaseline = saveBaseline != null, UseReflectionBaseline = reflectionBaseline }, output, saveBaseline, previous);
         }
 
         // 读取必须紧跟在参数名后的值。
