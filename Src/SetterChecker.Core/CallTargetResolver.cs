@@ -496,7 +496,8 @@ namespace SetterChecker.Core
             int libraryModels = bodies.Values.Count(body => body.BodyKind == MethodBodyKind.LibraryModel);
             sources.Timing.Count("不同函数体读取次数", bodies.Count - libraryModels);
             sources.Timing.Count("外部库模型函数数", libraryModels);
-            sources.Timing.Count("外部库回调目标数", calls.Values.Sum(call => call.Targets.Count(target => target.IsCallback)));            sources.Timing.Count("行为需求状态更新次数", demandUpdates);
+            sources.Timing.Count("外部库回调目标数", calls.Values.Sum(call => call.Targets.Count(target => target.IsCallback)));
+            sources.Timing.Count("行为需求状态更新次数", demandUpdates);
             sources.Timing.Count("行为需求登记及更新访问次数", demandVisits);
             sources.Timing.Count("函数调度请求次数", scheduleRequests);
             sources.Timing.Count("函数实际入队次数", scheduledMethods);
