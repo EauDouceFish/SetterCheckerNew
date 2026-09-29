@@ -1425,9 +1425,14 @@ namespace SetterChecker.Core
             get => ReadChildIndex(true);
         }
 
-        // 完整目录和某个实际调用的候选查询共用同一继承索引。
+        // 完整目录和某个实际调用的候选查询共用同一继承索引；索引只在载入新类型时整体作废，已建成的索引无锁读取。
         private IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> ReadChildIndex(bool interfaces)
         {
+            if ((interfaces ? Volatile.Read(ref this.m_implementingTypesByInterfaceId) : Volatile.Read(ref this.m_derivedTypesByBaseId))
+                is IReadOnlyDictionary<string, IReadOnlyList<TypeEntry>> built)
+            {
+                return built;
+            }
             lock (this.m_loadedTypeLock)
             {
                 RequireClosedDispatchIndex(interfaces);

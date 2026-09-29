@@ -123,10 +123,8 @@ namespace SetterChecker.Core
         internal enum Part { Scheduling, Bodies, Targets, Origins, Effects, Declarations, Dispatch, Reflection, Bindings, Registrations, HierarchyIndex, ImplementationMatch, RegistrationSyntax, ImplementationHierarchy, ImplementationMembers }
         private readonly long[] m_ticks = new long[Enum.GetValues<Part>().Length];
         private readonly long[] m_entries = new long[Enum.GetValues<Part>().Length];
-        private readonly long[] m_allocations = new long[Enum.GetValues<Part>().Length];
         internal Dictionary<string, long> Counts { get; } = new(StringComparer.Ordinal);
         private long m_last = System.Diagnostics.Stopwatch.GetTimestamp();
-        private long m_lastAllocation = GC.GetTotalAllocatedBytes(false);
         private Part m_current;
         private bool m_stopped;
         private readonly TimeSpan m_initialGcPause = GC.GetTotalPauseDuration();
@@ -152,11 +150,8 @@ namespace SetterChecker.Core
         private void Switch(Part part)
         {
             long now = System.Diagnostics.Stopwatch.GetTimestamp();
-            long allocated = GC.GetTotalAllocatedBytes(false);
             this.m_ticks[(int)this.m_current] += now - this.m_last;
-            this.m_allocations[(int)this.m_current] += allocated - this.m_lastAllocation;
             this.m_last = now;
-            this.m_lastAllocation = allocated;
             this.m_current = part;
         }
 
@@ -169,10 +164,6 @@ namespace SetterChecker.Core
                 this.m_stopped = true;
                 this.Counts["分析期间GC暂停毫秒"] = (long)(GC.GetTotalPauseDuration() - this.m_initialGcPause).TotalMilliseconds;
                 this.Counts["分析期间分配字节"] = GC.GetTotalAllocatedBytes(true) - this.m_initialAllocatedBytes;
-                foreach (Part part in Enum.GetValues<Part>())
-                {
-                    this.Counts["阶段分配估计字节/" + part] = this.m_allocations[(int)part];
-                }
             }
         }
 
