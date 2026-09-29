@@ -1904,6 +1904,33 @@ namespace SetterChecker.Core.Tests
             Assert.IsTrue(show.SuggestNoLogTrack);
         }
 
+        // T33：string 形参的运行时类型只能是 string，库函数不会经它回调源码类型的 ToString。
+        /// <summary></summary>
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public Task SealedLibraryParameterDoesNotReachSourceOverrides(bool external) => AssertEntry("""
+            public class Box { private static int s_state; public override string ToString() { s_state++; return "1"; } }
+            public static class Calls { public static int Entry(object[] args) { return int.Parse((string)args[0]); } }
+            """, MethodEffectKind.Getter, external);
+
+        // T34：object 形参仍可能是任何源码对象，库函数经它调用的 ToString 写入不可漏掉。
+        /// <summary></summary>
+        [TestMethod]
+        public Task ObjectLibraryParameterReachesSourceOverrides() => AssertEntry("""
+            public class Box { private static int s_state; public override string ToString() { s_state++; return "1"; } }
+            public static class Calls { public static string Entry() { return System.Convert.ToString((object)new Box()); } }
+            """, MethodEffectKind.Setter);
+
+        // T35：接口形参收窄到实现类型后，实现类从源码基类继承的重写仍是库函数可调用的回调。
+        /// <summary></summary>
+        [TestMethod]
+        public Task InterfaceLibraryParameterKeepsInheritedOverrides() => AssertEntry("""
+            public class Base { private static int s_state; public override string ToString() { s_state++; return "1"; } }
+            public class Order : Base, System.Collections.IComparer { public int Compare(object x, object y) { return 0; } }
+            public static class Calls { public static void Entry() { new System.Collections.ArrayList().Sort(new Order()); } }
+            """, MethodEffectKind.Setter);
+
         // V2 摘要规则：Entry 的真实行为必须与预期一致；源码与 DLL 两种来源各跑一次。
         private static async Task AssertEntry(string body, MethodEffectKind expected, bool external = false)
         {

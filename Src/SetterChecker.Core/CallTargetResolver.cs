@@ -33,7 +33,11 @@ namespace SetterChecker.Core
             Dictionary<(string Method, BehaviorFlowPoint Point), ResolvedCall> calls = new();
             Dictionary<(string Method, BehaviorFlowPoint Point), PendingCall> failures = new();
             DispatchIndex dispatch = new() { Jobs = jobs };
-            Task prepareIndexes = Task.Run(catalog.PrepareDispatchIndexes, cancellationToken);
+            Task prepareIndexes = Task.Run(() =>
+            {
+                catalog.PrepareDispatchIndexes();
+                ReadAssignableSources(catalog, dispatch);
+            }, cancellationToken);
             RegistrationIndex registrations = new(material, catalog, sources.Timing, jobs, cancellationToken);
             Queue<string> ready = new();
             HashSet<string> queued = new(StringComparer.Ordinal);
@@ -492,8 +496,7 @@ namespace SetterChecker.Core
             int libraryModels = bodies.Values.Count(body => body.BodyKind == MethodBodyKind.LibraryModel);
             sources.Timing.Count("不同函数体读取次数", bodies.Count - libraryModels);
             sources.Timing.Count("外部库模型函数数", libraryModels);
-            sources.Timing.Count("外部库回调目标数", calls.Values.Sum(call => call.Targets.Count(target => target.IsCallback)));
-            sources.Timing.Count("行为需求状态更新次数", demandUpdates);
+            sources.Timing.Count("外部库回调目标数", calls.Values.Sum(call => call.Targets.Count(target => target.IsCallback)));            sources.Timing.Count("行为需求状态更新次数", demandUpdates);
             sources.Timing.Count("行为需求登记及更新访问次数", demandVisits);
             sources.Timing.Count("函数调度请求次数", scheduleRequests);
             sources.Timing.Count("函数实际入队次数", scheduledMethods);
@@ -1553,13 +1556,16 @@ namespace SetterChecker.Core
                 HashSet<string> receiverVisible = new(StringComparer.Ordinal) { "System.Object", RuntimeOperations.ReadMetadataName(libraryOwner.LogicalId) };
                 receiverVisible.UnionWith(catalog.ReadInheritedTypes(libraryOwner).Select(relation => RuntimeOperations.ReadMetadataName(relation.Definition.LogicalId)));
                 // 库函数只能经它看得到的静态类型调用虚成员：接收对象按声明类型及其祖先，实参按形参声明类型；object 与泛型形参另含框架据以比较、格式化的协议。
-                IEnumerable<(BehaviorValueReference Value, IReadOnlySet<string> Visible)> visibleValues = libraryTarget.Receiver
-                    .Select(value => (value, (IReadOnlySet<string>)receiverVisible))
+                // 运行时类型必须能赋给库函数看到的静态类型：接收对象按声明类型，实参按形参类型。
+                string? receiverBound = ReadParameterBound(libraryOwner.LogicalId);
+                IEnumerable<(BehaviorValueReference Value, IReadOnlySet<string> Visible, string? Bound)> visibleValues = libraryTarget.Receiver
+                    .Select(value => (value, (IReadOnlySet<string>)receiverVisible, receiverBound))
                     .Concat(libraryTarget.Arguments.SelectMany((values, index) => values.Select(value =>
-                        (value, ReadParameterProtocols(index < libraryMethod.Parameters.Count ? libraryMethod.Parameters[index].TypeId : "System.Object")))))
+                        (value, ReadParameterProtocols(index < libraryMethod.Parameters.Count ? libraryMethod.Parameters[index].TypeId : "System.Object"),
+                            index < libraryMethod.Parameters.Count ? ReadParameterBound(libraryMethod.Parameters[index].TypeId) : null))))
                     .Concat(libraryTarget.Arguments.SelectMany((values, index) => IsObjectArray(index)
-                        ? values.SelectMany(ReadArrayElements).Select(element => (element, ReadParameterProtocols(libraryMethod.Parameters[index].TypeId[..^2])))
-                        : Enumerable.Empty<(BehaviorValueReference, IReadOnlySet<string>)>()));
+                        ? values.SelectMany(ReadArrayElements).Select(element => (element, ReadParameterProtocols(libraryMethod.Parameters[index].TypeId[..^2]), (string?)null))
+                        : Enumerable.Empty<(BehaviorValueReference, IReadOnlySet<string>, string?)>()));
                 // 元素类型为 object 或泛型参数的数组形参（如 params object[]），其元素可能是带源码重写的业务对象。
                 bool IsObjectArray(int index) => index < libraryMethod.Parameters.Count && libraryMethod.Parameters[index].TypeId is var type
                     && type.EndsWith("[]", StringComparison.Ordinal) && (type.StartsWith('!') || RuntimeOperations.ReadMetadataName(type[..^2]) == "System.Object");
@@ -1576,7 +1582,7 @@ namespace SetterChecker.Core
                         return Array.Empty<BehaviorValueReference>();
                     }
                 }
-                foreach (var (value, visible) in visibleValues)
+                foreach (var (value, visible, staticType) in visibleValues)
                 {
                     ValueOrigin[] local = (sources.ReadFixedReceiver(value) is ValueOrigin fixedValue ? new[] { fixedValue }
                         : sources.ReadLocalOrigins(value)).ToArray();
@@ -1638,7 +1644,7 @@ namespace SetterChecker.Core
                             }
                             continue;
                         }
-                        foreach (ResolvedMethodDefinition implementation in ReadFrameworkCallbacks(catalog, origin, visible, dispatch))
+                        foreach (ResolvedMethodDefinition implementation in ReadFrameworkCallbacks(catalog, origin, visible, staticType, dispatch))
                         {
                             if (await AddTarget(Callback(implementation, new[] { value }, null, contents)).ConfigureAwait(false))
                             {
@@ -1683,9 +1689,9 @@ namespace SetterChecker.Core
             }
         }
 
-        // 值的实际类型范围中，重写或实现了库函数可见的外部库虚成员的源码函数。
+        // 值的实际类型范围中，重写或实现了库函数可见的外部库虚成员的源码函数；给出静态类型时只留能赋给它的类型及其祖先上的重写。
         private static IReadOnlyList<ResolvedMethodDefinition> ReadFrameworkCallbacks(MethodCatalogResult catalog, ValueOrigin origin, IReadOnlySet<string> visible,
-            DispatchIndex dispatch)
+            string? bound, DispatchIndex dispatch)
         {
             BehaviorTypeReference? type = origin.Value.Type;
             bool known = type != null && !type.Id.StartsWith('!') && !type.Id.EndsWith(']') && !type.Id.EndsWith('*') && !type.Id.EndsWith('&');
@@ -1693,16 +1699,17 @@ namespace SetterChecker.Core
             IReadOnlyList<TypeIdentityTemplate> arguments = known ? catalog.ReadResolvedTypeArguments(type!) : Array.Empty<TypeIdentityTemplate>();
             bool exact = known && origin.Value.Kind == BehaviorValueKind.NewObject;
             string rangeKey = (exact ? "exact:" : "derived:") + definition.Id + "|" + string.Join(',', arguments.Select(argument => argument.Text));
-            string key = rangeKey + "|" + string.Join(',', visible.Order(StringComparer.Ordinal));
+            string key = rangeKey + "|" + string.Join(',', visible.Order(StringComparer.Ordinal)) + (bound == null ? string.Empty : "|as:" + bound);
             return dispatch.Callbacks.GetOrAdd(key, _ =>
             {
                 IReadOnlyList<(TypeEntry, IReadOnlyList<TypeIdentityTemplate>, IMethodSymbol, IReadOnlySet<string>)> overrides =
                     dispatch.CallbackRanges.GetOrAdd(rangeKey, _ => ReadRangeOverrides(catalog, definition, arguments, exact, dispatch));
+                IReadOnlySet<string>? assignable = bound == null ? null : ReadAssignableSources(catalog, dispatch).GetValueOrDefault(bound) ?? new HashSet<string>();
                 List<ResolvedMethodDefinition> callbacks = new();
                 HashSet<string> seen = new(StringComparer.Ordinal);
                 foreach (var (candidate, candidateArguments, symbol, contracts) in overrides)
                 {
-                    if (!contracts.Overlaps(visible))
+                    if (!contracts.Overlaps(visible) || assignable?.Contains(SourceTypeKey(candidate.SourceSymbol!)) == false)
                     {
                         continue;
                     }
@@ -1812,6 +1819,51 @@ namespace SetterChecker.Core
                 : new HashSet<string>(StringComparer.Ordinal) { "System.Object", name };
         }
 
+        // 库函数看到的非 object 静态类型，值的运行时类型必须能赋给它；泛型参数、数组、指针与按引用类型不据此收窄。
+        private static string? ReadParameterBound(string typeId)
+        {
+            string name = RuntimeOperations.ReadMetadataName(typeId);
+            return typeId.StartsWith('!') || typeId.IndexOfAny(['[', '*', '&']) >= 0 || name == "System.Object" ? null : name;
+        }
+
+        // 跨编译一致的源码类型键：程序集名加元数据全名，引用方看到的基类符号与其声明符号得到同一键。
+        private static string SourceTypeKey(INamedTypeSymbol type) => type.ContainingAssembly.Name + "|" + MetadataName(type);
+
+        // 按类型元数据名列出能赋给该类型的源码类型及其全部祖先（祖先可提供被继承的重写）；源码类型固定，全程只建一次。
+        private static IReadOnlyDictionary<string, HashSet<string>> ReadAssignableSources(MethodCatalogResult catalog, DispatchIndex dispatch)
+        {
+            return LazyInitializer.EnsureInitialized(ref dispatch.AssignableSources, () =>
+            {
+                Dictionary<string, HashSet<string>> result = new(StringComparer.Ordinal);
+                var relations = catalog.Types.Where(type => type.SourceSymbol != null && type.IsCandidate).AsParallel().WithDegreeOfParallelism(dispatch.Jobs)
+                    .Select(type =>
+                    {
+                        INamedTypeSymbol symbol = type.SourceSymbol!;
+                        List<string> keys = new() { SourceTypeKey(symbol) };
+                        List<string> names = new() { MetadataName(symbol) };
+                        for (INamedTypeSymbol? ancestor = symbol.BaseType; ancestor != null; ancestor = ancestor.BaseType)
+                        {
+                            keys.Add(SourceTypeKey(ancestor));
+                            names.Add(MetadataName(ancestor));
+                        }
+                        names.AddRange(symbol.AllInterfaces.Select(MetadataName));
+                        return (Keys: keys, Names: names);
+                    }).ToArray();
+                foreach (var (keys, names) in relations)
+                {
+                    foreach (string name in names)
+                    {
+                        if (!result.TryGetValue(name, out HashSet<string>? assignable))
+                        {
+                            result.Add(name, assignable = new(StringComparer.Ordinal));
+                        }
+                        assignable.UnionWith(keys);
+                    }
+                }
+                return result;
+            });
+        }
+
         /// <summary>候选范围和单个类型的匹配结果分开复用，不保存调用路径。</summary>
         private sealed class DispatchIndex
         {
@@ -1820,6 +1872,7 @@ namespace SetterChecker.Core
             internal ConcurrentDictionary<string, IReadOnlyList<(TypeEntry, IReadOnlyList<TypeIdentityTemplate>, IMethodSymbol, IReadOnlySet<string>)>> CallbackRanges { get; } = new(StringComparer.Ordinal);
             internal ConcurrentDictionary<string, IReadOnlyList<(IMethodSymbol, IReadOnlySet<string>)>> FrameworkOverrides { get; } = new(StringComparer.Ordinal);
             internal object MatchLock { get; } = new();
+            internal IReadOnlyDictionary<string, HashSet<string>>? AssignableSources;
             internal Dictionary<string, TargetCandidates> Ranges { get; } = new(StringComparer.Ordinal);
             internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Starts), TargetCandidates> Traversals { get; } = new();
             internal Dictionary<(string Method, TemplateList TypeArguments, TemplateList MethodArguments, string Type, TemplateList Arguments), ResolvedMethodDefinition?> Implementations { get; } = new();
