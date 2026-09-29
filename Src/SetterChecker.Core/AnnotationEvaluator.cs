@@ -11,7 +11,7 @@ namespace SetterChecker.Core
         // 从真实源码标签和已证明行为生成逐函数决定及最短告警调用过程。
         /// <summary>未知行为和冲突保留失败，依赖函数不进入修改清单。</summary>
         public AnnotationResult Evaluate(MethodCatalogResult catalog, IReadOnlyList<MethodEntry> roots, EffectAnalysisResult effects,
-            CallTargetResolutionResult? calls, CancellationToken cancellationToken = default)
+            CallTargetResolutionResult? calls, CancellationToken cancellationToken = default, IReadOnlyList<MethodEntry>? overrides = null)
         {
             Stopwatch watch = Stopwatch.StartNew();
             Dictionary<string, MethodEffect> facts = effects.Methods.ToDictionary(method => method.MethodId);
@@ -54,6 +54,15 @@ namespace SetterChecker.Core
                 loggedOnly[id] = result;
                 return result;
             }
+            // R11：被重写函数只要有一个源码重写是 Setter 或未证明，它就是子类写入的入口，不建议 NoLogTrack。
+            HashSet<string> setterOverridden = new(StringComparer.Ordinal);
+            foreach (MethodEntry entry in roots.Concat(overrides ?? Array.Empty<MethodEntry>()))
+            {
+                if (entry.SourceSymbol is { IsOverride: true, IsAbstract: false } overriding && facts.GetValueOrDefault(entry.Id)?.Kind != MethodEffectKind.Getter)
+                {
+                    setterOverridden.UnionWith(ReadOverriddenKeys(overriding));
+                }
+            }
             List<AnnotationMethod> methods = new();
             foreach (MethodEntry method in roots.OrderBy(method => method.Id, StringComparer.Ordinal))
             {
@@ -66,7 +75,7 @@ namespace SetterChecker.Core
                 bool reason = nlt?.ConstructorArguments.Any(argument => argument.Type?.SpecialType == SpecialType.System_String
                     && argument.Value is string text && !string.IsNullOrWhiteSpace(text)) == true;
                 bool trustedClass = nltClass && !log;
-                bool traceHook = !sourceNlt && IsTraceHook(symbol);
+                bool traceHook = !sourceNlt && (IsTraceHook(symbol) || setterOverridden.Contains(ReadOverrideKey(symbol)));
                 MethodEffectKind? actual = trustedClass ? MethodEffectKind.Getter : facts.GetValueOrDefault(method.Id)?.Kind;
                 string? failure = log && sourceNlt ? "NoLogTrack 与 LogTrack 冲突"
                     : trustedClass ? null
@@ -143,6 +152,21 @@ namespace SetterChecker.Core
             return symbol.Parameters.Length != 0 && symbol.DeclaringSyntaxReferences.Length == 1
                 && symbol.DeclaringSyntaxReferences[0].GetSyntax() is Microsoft.CodeAnalysis.CSharp.Syntax.MethodDeclarationSyntax
                 { Body.Statements.Count: 0, ExpressionBody: null };
+        }
+
+        // 不同程序集编译得到的同一声明不是同一符号实例，按声明程序集和文档标识对齐。
+        internal static string ReadOverrideKey(IMethodSymbol symbol)
+        {
+            return symbol.ContainingAssembly?.Name + "|" + symbol.OriginalDefinition.GetDocumentationCommentId();
+        }
+
+        // 逐级读取被重写的声明，间接重写同样指向最初的虚函数。
+        internal static IEnumerable<string> ReadOverriddenKeys(IMethodSymbol symbol)
+        {
+            for (IMethodSymbol? slot = symbol.OverriddenMethod; slot != null; slot = slot.OverriddenMethod)
+            {
+                yield return ReadOverrideKey(slot);
+            }
         }
 
         // 类级可信豁免在行为分析前直接闭合；标签冲突仍需进入分析。

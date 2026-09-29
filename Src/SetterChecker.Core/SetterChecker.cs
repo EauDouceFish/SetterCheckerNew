@@ -38,9 +38,16 @@ namespace SetterChecker.Core
                     || method.SourceSymbol is { IsImplicitlyDeclared: false, IsAbstract: false, IsExtern: false } symbol
                         && reportPaths.Contains(method.SourcePath!)
                         && AnnotationEvaluator.FindAttribute(symbol.ContainingType, "KH.NoLogTrackAttribute") != null).ToArray();
-                // 类级豁免只改变该函数自己的日志决定，真实写入仍必须向调用者传播。
-                MethodEntry[] analysisRoots = roots;
-                CallTargetResolutionResult? calls = null;
+                // 类级豁免只改变该函数自己的日志决定，真实写入仍必须向调用者传播；报告函数的源码重写只参与分析，供 R11 使用。
+                HashSet<string> rootIds = roots.Select(method => method.Id).ToHashSet(StringComparer.Ordinal);
+                HashSet<string> rootKeys = roots.Select(method => AnnotationEvaluator.ReadOverrideKey(method.SourceSymbol!)).ToHashSet(StringComparer.Ordinal);
+                MethodEntry[] overrides = catalog.Types.Where(type => type.IsCandidate && type.SourceSymbol != null)
+                    .SelectMany(type => type.SourceSymbol!.GetMembers().OfType<Microsoft.CodeAnalysis.IMethodSymbol>())
+                    .Where(symbol => symbol is { IsOverride: true, IsAbstract: false } && symbol.DeclaringSyntaxReferences.Length != 0
+                        && AnnotationEvaluator.ReadOverriddenKeys(symbol).Any(rootKeys.Contains))
+                    .Select(symbol => catalog.ReadSourceDeclaration(symbol, symbol.DeclaringSyntaxReferences[0].SyntaxTree.FilePath))
+                    .Where(method => !rootIds.Contains(method.Id)).DistinctBy(method => method.Id).ToArray();
+                MethodEntry[] analysisRoots = roots.Concat(overrides).ToArray();                CallTargetResolutionResult? calls = null;
                 EffectAnalysisResult effects = new(Array.Empty<MethodEffect>(), TimeSpan.Zero);
                 string? failure = null;
                 System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
@@ -48,7 +55,7 @@ namespace SetterChecker.Core
                 // 完成分析后生成标签与报告数据，未证明项目始终保留失败。
                 AnalysisRun ReadRun()
                 {
-                    AnnotationResult annotations = new AnnotationEvaluator().Evaluate(catalog, roots, effects, calls, cancellationToken);
+                    AnnotationResult annotations = new AnnotationEvaluator().Evaluate(catalog, roots, effects, calls, cancellationToken, overrides);
                     if (request.ManualBaselinePath != null)
                     {
                         annotations = ManualBaseline.Apply(annotations, material, request.ManualBaselinePath);

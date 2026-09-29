@@ -1839,6 +1839,71 @@ namespace SetterChecker.Core.Tests
             Assert.IsTrue(hook.SuggestNoLogTrack);
         }
 
+        // T31（R11）：空虚函数、抛异常的基类函数被重写成 Setter 时不建议 NoLogTrack；重写都不写时照常建议。
+        /// <summary></summary>
+        [TestMethod]
+        public async Task SetterOverrideKeepsBaseLogging()
+        {
+            using TestProject project = TestProject.Create("""
+                namespace KH
+                {
+                    public class Base
+                    {
+                        public virtual void OnInit() { }
+                        public virtual void SetValue() { throw new System.NotSupportedException(); }
+                        public virtual void OnShow() { }
+                    }
+                    public class Middle : Base { public override void OnShow() { } }
+                    public class Derived : Middle
+                    {
+                        private int m_value;
+                        public override void OnInit() { m_value = 1; }
+                        public override void SetValue() { m_value = 2; }
+                    }
+                }
+                """);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(project.Request(4));
+            AnnotationMethod ReadBase(string name) => run.Annotations.Methods.Single(method => method.Class == "KH.Base" && method.Name == name);
+            foreach (string name in new[] { "OnInit", "SetValue" })
+            {
+                Assert.AreEqual(MethodEffectKind.Getter, ReadBase(name).Actual, name);
+                Assert.AreEqual("ShouldTrack", ReadBase(name).Decision, name);
+                Assert.IsFalse(ReadBase(name).SuggestNoLogTrack, name);
+            }
+            Assert.IsTrue(ReadBase("OnShow").SuggestNoLogTrack);
+        }
+
+        // T32（R11）：khengine 自己不创建的外部子类重写同样要分析，写战斗状态时基类不建议 NoLogTrack。
+        /// <summary></summary>
+        [TestMethod]
+        public async Task ExternalSetterOverrideKeepsBaseLogging()
+        {
+            using TestProject project = TestProject.Create("""
+                namespace KH
+                {
+                    public static class Store { public static int state; }
+                    public class Base
+                    {
+                        public virtual void OnInit() { }
+                        public virtual void OnShow() { }
+                    }
+                }
+                """, registrations: """
+                public class Client : KH.Base
+                {
+                    private int m_shown;
+                    public override void OnInit() { KH.Store.state = 1; }
+                    public override void OnShow() { m_shown = 1; }
+                }
+                """);
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(project.Request(4));
+            AnnotationMethod init = run.Annotations.Methods.Single(method => method.Class == "KH.Base" && method.Name == "OnInit");
+            AnnotationMethod show = run.Annotations.Methods.Single(method => method.Class == "KH.Base" && method.Name == "OnShow");
+            Assert.AreEqual("ShouldTrack", init.Decision);
+            Assert.IsFalse(init.SuggestNoLogTrack);
+            Assert.IsTrue(show.SuggestNoLogTrack);
+        }
+
         // V2 摘要规则：Entry 的真实行为必须与预期一致；源码与 DLL 两种来源各跑一次。
         private static async Task AssertEntry(string body, MethodEffectKind expected, bool external = false)
         {
