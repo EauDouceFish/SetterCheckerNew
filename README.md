@@ -59,7 +59,7 @@ pwsh -File .\Run-Khengine.ps1 -ApplyNlt
 pwsh -NoProfile -File .\Run-Pipeline.ps1 -ProjectRoot D:/KiHan -StateDir D:/SetterChecker-state -Output D:/SetterChecker-report -SvnUpdate -FailOnNotify
 ```
 
-构建机需要 .NET 10 SDK、PowerShell 7、SVN 命令行，以及一份由同版本 Unity 编译过的 KiHan 工作副本（读取 `Library/Bee` 中的编译参数）。普通源码增删不需要重新编译；asmdef 或引用变化后加 `-UnityPath` 让 Unity 先编译一遍。该工作副本不能同时被另一个 Unity 编辑器打开。
+构建机需要 .NET 10 SDK、Windows PowerShell 5.1 或 PowerShell 7、SVN 命令行，以及一份由同版本 Unity 编译过的 KiHan 工作副本（读取 `Library/Bee` 中的编译参数）。普通源码增删不需要重新编译；asmdef 或引用变化后加 `-UnityPath` 让 Unity 先编译一遍。该工作副本不能同时被另一个 Unity 编辑器打开。
 
 ## 人工基线
 
