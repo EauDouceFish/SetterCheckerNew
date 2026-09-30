@@ -53,13 +53,19 @@ pwsh -File .\Run-Khengine.ps1 -ApplyNlt
 
 ## 流水线
 
-`Run-Pipeline.ps1` 供蓝盾脚本步骤调用：可选 SVN 更新（`-SvnUpdate`）与 Unity 批处理编译（`-UnityPath`），然后扫描，并与 `-StateDir` 中上一次的 `functions.json` 对比生成 `notify.md` 与 `notify.json`。首次运行只保存对比基准、不提醒；之后每次运行都更新基准，同一函数只提醒一次。加 `-FailOnNotify` 时有新增即以退出码 3 结束，便于流水线标红；具体通知渠道尚未接入，读取 `notify.json` 即可。
+流水线运行的是 `Publish-Pipeline.ps1` 生成的目录（两个脚本、人工基线及 `bin/` 中自带运行时的工具，约 88 MB），把该目录放到 SVN 后由蓝盾拉取，构建机无需安装 .NET SDK：
 
 ```powershell
-pwsh -NoProfile -File .\Run-Pipeline.ps1 -ProjectRoot D:/KiHan -StateDir D:/SetterChecker-state -Output D:/SetterChecker-report -SvnUpdate -FailOnNotify
+.\Publish-Pipeline.ps1 -Output D:/SetterChecker-package
 ```
 
-构建机需要 .NET 10 SDK、Windows PowerShell 5.1 或 PowerShell 7、SVN 命令行，以及一份由同版本 Unity 编译过的 KiHan 工作副本（读取 `Library/Bee` 中的编译参数）。普通源码增删不需要重新编译；asmdef 或引用变化后加 `-UnityPath` 让 Unity 先编译一遍。该工作副本不能同时被另一个 Unity 编辑器打开。
+目录中的 `Run-Pipeline.ps1` 供蓝盾脚本步骤调用：可选 SVN 更新（`-SvnUpdate`）与 Unity 批处理编译（`-UnityPath`），然后扫描，并与 `-StateDir` 中上一次的 `functions.json` 对比生成 `notify.md` 与 `notify.json`。首次运行只保存对比基准、不提醒；之后每次运行都更新基准，同一函数只提醒一次。加 `-FailOnNotify` 时有新增即以退出码 3 结束，便于流水线标红；具体通知渠道尚未接入，读取 `notify.json` 即可。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File D:/SetterChecker-package/Run-Pipeline.ps1 -ProjectRoot D:/KiHan -StateDir D:/SetterChecker-state -Output D:/SetterChecker-report -SvnUpdate -FailOnNotify
+```
+
+构建机需要 Windows PowerShell 5.1 或 PowerShell 7、SVN 命令行，以及一份由同版本 Unity 编译过的 KiHan 工作副本（读取 `Library/Bee` 中的编译参数）。普通源码增删不需要重新编译；asmdef 或引用变化后加 `-UnityPath` 让 Unity 先编译一遍。该工作副本不能同时被另一个 Unity 编辑器打开。
 
 ## 人工基线
 

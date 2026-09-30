@@ -8,6 +8,7 @@ param(
     [switch]$FailOnNotify
 )
 
+# Runs from the folder made by Publish-Pipeline.ps1.
 # Exit codes: 0 done (see notify.md), 3 new missing labels with -FailOnNotify, others are svn/Unity/build/analysis failures.
 $ErrorActionPreference = 'Stop'
 if ($SvnUpdate) {
@@ -21,14 +22,11 @@ if ($UnityPath) {
         -ArgumentList @('-batchmode', '-quit', '-projectPath', $ProjectRoot, '-logFile', $unityLog)
     if ($unity.ExitCode -ne 0) { Write-Host "Unity script compilation failed, see $unityLog"; exit $unity.ExitCode }
 }
-dotnet restore (Join-Path $PSScriptRoot 'SetterChecker.slnx')
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
 $previous = Join-Path $StateDir 'functions.json'
 $hasPrevious = Test-Path -LiteralPath $previous
 $notifyPath = Join-Path $Output 'notify.json'
 Remove-Item -LiteralPath $notifyPath -ErrorAction SilentlyContinue
-$analysis = @{ Jobs = $Jobs; Output = $Output; ProjectRoot = $ProjectRoot }
+$analysis = @{ Jobs = $Jobs; Output = $Output; ProjectRoot = $ProjectRoot; Tool = Join-Path $PSScriptRoot 'bin/SetterChecker.Cli.exe' }
 if ($hasPrevious) { $analysis.Previous = $previous }
 & (Join-Path $PSScriptRoot 'Run-Khengine.ps1') @analysis
 $code = $LASTEXITCODE

@@ -1,10 +1,14 @@
-param([int]$Jobs = 8, [string]$Output = "$env:TEMP/SetterChecker-khengine", [string]$ProjectRoot = 'D:/KiHan', [string]$Previous, [switch]$ApplyNlt)
+param([int]$Jobs = 8, [string]$Output = "$env:TEMP/SetterChecker-khengine", [string]$ProjectRoot = 'D:/KiHan', [string]$Previous, [switch]$ApplyNlt, [string]$Tool)
 
+# Without -Tool the tool is built from source first; the pipeline package passes its published exe.
 $ErrorActionPreference = 'Stop'
 Push-Location $PSScriptRoot
 try {
-    dotnet build Src/SetterChecker.Cli/SetterChecker.Cli.csproj -c Release --no-restore
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if (-not $Tool) {
+        dotnet build Src/SetterChecker.Cli/SetterChecker.Cli.csproj -c Release --no-restore
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $Tool = Join-Path $PSScriptRoot 'Src/SetterChecker.Cli/bin/Release/net10.0/SetterChecker.Cli.exe'
+    }
     $baseline = Join-Path $PSScriptRoot 'khengine-manual-baseline.json'
     $arguments = @('analyze',
         '--project', "$ProjectRoot/Packages/khengine/Runtime/khengine.runtime.asmdef",
@@ -13,7 +17,7 @@ try {
     if (Test-Path -LiteralPath $baseline) { $arguments += @('--baseline', $baseline) }
     if ($Previous) { $arguments += @('--previous', $Previous) }
     if ($ApplyNlt) { $arguments += '--apply-nlt' }
-    dotnet Src/SetterChecker.Cli/bin/Release/net10.0/SetterChecker.Cli.dll @arguments
+    & $Tool @arguments
     exit $LASTEXITCODE
 }
 finally {
