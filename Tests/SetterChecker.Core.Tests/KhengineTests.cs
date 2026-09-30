@@ -685,6 +685,34 @@ namespace SetterChecker.Core.Tests
                 again.Annotations.Methods.Where(method => method.SourceNoLogTrack).Select(method => method.Name).ToArray());
         }
 
+        // 对应 E:/KiHan 旧版本 dawn 包的 DAWActorSafeZoneInfo.decode：外围源码重写 khengine 虚函数，参数类型来自尚未读取的 DLL。
+        /// <summary>尚未登记的外围重写按所属程序集读取声明，并参与 R11。</summary>
+        [TestMethod]
+        public async Task OuterOverrideWithLibraryParameterIsRead()
+        {
+            using TestProject project = TestProject.Create("""
+                namespace KH
+                {
+                    public class Handler
+                    {
+                        public static int s_handled;
+                        public virtual int Handle(Tools.Payload payload) { return 0; }
+                    }
+                }
+                """, toolSource: "namespace Tools { public class Payload { public int Value; } }", toolAsDll: true, registrations: """
+                public class OuterHandler : KH.Handler
+                {
+                    public override int Handle(Tools.Payload payload) { KH.Handler.s_handled++; return 1; }
+                }
+                """);
+            using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(30));
+            AnalysisRun run = await new SetterChecker().AnalyzeAsync(project.Request(4), deadline.Token);
+            AnnotationMethod handle = run.Annotations.Methods.Single(method => method.Class == "KH.Handler" && method.Name == "Handle");
+            Assert.AreEqual(MethodEffectKind.Getter, handle.Actual);
+            Assert.AreEqual("ShouldTrack", handle.Decision);
+            Assert.IsFalse(handle.SuggestNoLogTrack);
+        }
+
         // 对应 Data/Script/Base/KHScriptData.cs:354，保留反射字段数组、循环和参数读取。
         /// <summary>源码和真实 DLL 中的字段复制都修改已有对象。</summary>
         [TestMethod]

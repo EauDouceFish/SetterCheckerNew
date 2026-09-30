@@ -43,12 +43,13 @@ namespace SetterChecker.Core
                 HashSet<string> rootKeys = roots.Select(method => AnnotationEvaluator.ReadOverrideKey(method.SourceSymbol!)).ToHashSet(StringComparer.Ordinal);
                 MethodEntry[] overrides = catalog.Types.Where(type => type.IsCandidate && type.SourceSymbol != null).AsParallel().AsOrdered()
                     .WithDegreeOfParallelism(request.Jobs)
-                    .SelectMany(type => type.SourceSymbol!.GetMembers().OfType<Microsoft.CodeAnalysis.IMethodSymbol>())
-                    .Where(symbol => symbol is { IsOverride: true, IsAbstract: false } && symbol.DeclaringSyntaxReferences.Length != 0
-                        && AnnotationEvaluator.ReadOverriddenKeys(symbol).Any(rootKeys.Contains)).ToArray()
-                    .Select(symbol => catalog.ReadSourceDeclaration(symbol, symbol.DeclaringSyntaxReferences[0].SyntaxTree.FilePath))
+                    .SelectMany(type => type.SourceSymbol!.GetMembers().OfType<Microsoft.CodeAnalysis.IMethodSymbol>().Select(symbol => (type, symbol)))
+                    .Where(member => member.symbol is { IsOverride: true, IsAbstract: false } && member.symbol.DeclaringSyntaxReferences.Length != 0
+                        && AnnotationEvaluator.ReadOverriddenKeys(member.symbol).Any(rootKeys.Contains)).ToArray()
+                    .Select(member => catalog.ReadSourceDeclaration(member.symbol, member.type.AssemblyPath!))
                     .Where(method => !rootIds.Contains(method.Id)).DistinctBy(method => method.Id).ToArray();
-                MethodEntry[] analysisRoots = roots.Concat(overrides).ToArray();                CallTargetResolutionResult? calls = null;
+                MethodEntry[] analysisRoots = roots.Concat(overrides).ToArray();
+                CallTargetResolutionResult? calls = null;
                 EffectAnalysisResult effects = new(Array.Empty<MethodEffect>(), TimeSpan.Zero);
                 string? failure = null;
                 System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
